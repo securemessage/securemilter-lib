@@ -10,6 +10,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    mod.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+    mod.linkSystemLibrary("crypto", .{});
+    mod.linkSystemLibrary("zmq", .{});
+
     const tests = b.addTest(.{
         .root_module = mod,
     });
