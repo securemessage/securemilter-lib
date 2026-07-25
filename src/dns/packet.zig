@@ -71,11 +71,16 @@ pub fn buildQuery(allocator: Allocator, domain: []const u8, rtype: RecordType, q
 }
 
 /// Encode a domain name in DNS wire format (label-length encoding).
-fn encodeDomainName(buf: *std.ArrayList(u8), allocator: Allocator, domain: []const u8) !void {
+/// Enforces RFC 1035 limits: max 63 bytes per label, max 253 chars total.
+pub fn encodeDomainName(buf: *std.ArrayList(u8), allocator: Allocator, domain: []const u8) !void {
+    if (domain.len > 253) return error.NameTooLong;
+    var label_count: u8 = 0;
     var iter = mem.splitScalar(u8, domain, '.');
     while (iter.next()) |label| {
         if (label.len == 0) continue;
         if (label.len > 63) return error.LabelTooLong;
+        label_count += 1;
+        if (label_count > 127) return error.TooManyLabels;
         try buf.append(allocator, @intCast(label.len));
         try buf.appendSlice(allocator, label);
     }
@@ -160,7 +165,7 @@ fn extractRdata(allocator: Allocator, data: []const u8, pos: usize, rdlength: u1
 
 /// TXT RDATA: one or more character-strings (length-prefixed).
 /// Concatenate them into a single string.
-fn extractTxtRdata(allocator: Allocator, rdata: []const u8) ![]u8 {
+pub fn extractTxtRdata(allocator: Allocator, rdata: []const u8) ![]u8 {
     var result: std.ArrayList(u8) = .{};
     errdefer result.deinit(allocator);
 
@@ -177,24 +182,42 @@ fn extractTxtRdata(allocator: Allocator, rdata: []const u8) ![]u8 {
 }
 
 /// Skip a domain name in wire format (handles compression pointers).
+/// Validates that label lengths don't exceed packet bounds.
 fn skipDomainName(data: []const u8, start: usize) !usize {
     var pos = start;
+    var labels: u8 = 0;
     while (pos < data.len) {
         const len = data[pos];
         if (len == 0) return pos + 1;
-        if (len & 0xC0 == 0xC0) return pos + 2; // Compression pointer
-        pos += 1 + len;
+        if (len & 0xC0 == 0xC0) {
+            if (pos + 1 >= data.len) return error.PacketTooShort;
+            return pos + 2;
+        }
+        if (len > 63) return error.LabelTooLong;
+        labels += 1;
+        if (labels > 127) return error.TooManyLabels;
+        const next = pos + 1 + len;
+        if (next > data.len) return error.PacketTooShort;
+        pos = next;
     }
     return error.PacketTooShort;
 }
 
 /// Decode a domain name from wire format (handles compression pointers).
+///
+/// Security: enforces RFC 1035 limits and detects malicious packets:
+///   - Max 253 characters in decoded name
+///   - Max 127 labels
+///   - Max 10 compression pointer jumps (prevents pointer loops)
+///   - Pointer targets must be within packet bounds
+///   - Labels > 63 bytes rejected
 fn decodeDomainName(allocator: Allocator, data: []const u8, start: usize) ![]u8 {
     var result: std.ArrayList(u8) = .{};
     errdefer result.deinit(allocator);
 
     var pos = start;
     var jumps: u8 = 0;
+    var labels: u8 = 0;
 
     while (pos < data.len) {
         const len = data[pos];
@@ -202,18 +225,25 @@ fn decodeDomainName(allocator: Allocator, data: []const u8, start: usize) ![]u8 
 
         if (len & 0xC0 == 0xC0) {
             if (pos + 1 >= data.len) return error.PacketTooShort;
-            const offset = (@as(u16, len & 0x3F) << 8) | @as(u16, data[pos + 1]);
-            pos = offset;
+            const offset: usize = (@as(u16, len & 0x3F) << 8) | @as(u16, data[pos + 1]);
+            if (offset >= data.len) return error.InvalidPointer;
             jumps += 1;
             if (jumps > 10) return error.TooManyPointers;
+            pos = offset;
             continue;
         }
+
+        if (len > 63) return error.LabelTooLong;
+        labels += 1;
+        if (labels > 127) return error.TooManyLabels;
 
         pos += 1;
         if (pos + len > data.len) return error.PacketTooShort;
         if (result.items.len > 0) try result.append(allocator, '.');
         try result.appendSlice(allocator, data[pos .. pos + len]);
         pos += len;
+
+        if (result.items.len > 253) return error.NameTooLong;
     }
 
     return result.toOwnedSlice(allocator);
