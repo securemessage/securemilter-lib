@@ -266,6 +266,9 @@ pub const Worker = struct {
         switch (result) {
             .packet => |pkt| {
                 self.dispatchPacket(conn, pkt);
+                // Connection may have been removed by dispatchPacket
+                // (e.g., sendResponse write failure → removeConnection)
+                if (self.connections.get(fd) == null) return;
                 conn.reader.consume();
             },
             .incomplete => return,
@@ -287,6 +290,7 @@ pub const Worker = struct {
             switch (next) {
                 .packet => |pkt| {
                     self.dispatchPacket(conn, pkt);
+                    if (self.connections.get(fd) == null) return;
                     conn.reader.consume();
                 },
                 .incomplete => return,

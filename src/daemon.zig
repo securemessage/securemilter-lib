@@ -39,6 +39,21 @@ pub fn removePidFile(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
+/// Raise the file descriptor limit to the system maximum.
+///
+/// Must be called BEFORE dropPrivileges() since setrlimit may require
+/// root to raise above the default soft limit. Sets both soft and hard
+/// limits to the kernel's maximum (typically 1048576 on FreeBSD).
+pub fn raiseFileLimit() void {
+    var lim: c.rlimit = undefined;
+
+    if (c.getrlimit(.NOFILE, &lim) == 0) {
+        lim.cur = lim.max;
+        _ = c.setrlimit(.NOFILE, &lim);
+        std.log.info("file descriptor limit raised to {d}", .{lim.max});
+    }
+}
+
 /// Drop privileges to the specified user.
 ///
 /// Looks up the user by name via getpwnam, then calls setgid + setuid.
