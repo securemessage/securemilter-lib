@@ -105,7 +105,7 @@ pub const Worker = struct {
 
                 if (self.isListenFd(fd)) {
                     self.handleAccept(fd);
-                } else if (ev.flags & c.EV.EOF != 0) {
+                } else if (ev.flags & 0x8000 != 0) { // EV_EOF = 0x8000 on FreeBSD
                     self.removeConnection(fd);
                 } else {
                     self.handleConnectionData(fd);
@@ -320,8 +320,9 @@ pub const Worker = struct {
 };
 
 fn setNonBlocking(fd: posix.fd_t) !void {
-    const flags = try posix.fcntl(fd, posix.F.GETFL);
-    _ = try posix.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(flags)) | posix.O.NONBLOCK);
+    const flags = try posix.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    // O_NONBLOCK = 0x0004 on FreeBSD
+    _ = try posix.fcntl(fd, posix.F.SETFL, flags | 0x0004);
 }
 
 fn stripNull(data: []const u8) []const u8 {
