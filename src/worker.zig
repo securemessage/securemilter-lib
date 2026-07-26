@@ -125,7 +125,8 @@ pub const Worker = struct {
             }
 
             // Use a short timeout during drain so we can check the deadline
-            const timeout: ?posix.timespec = if (self.draining) .{ .sec = 1, .nsec = 0 } else null;
+            const drain_timeout = posix.timespec{ .sec = 1, .nsec = 0 };
+            const timeout: ?*const posix.timespec = if (self.draining) &drain_timeout else null;
             const n = posix.kevent(self.kq, &.{}, &events, timeout) catch |err| {
                 std.log.err("kevent error: {}", .{err});
                 continue;
