@@ -93,8 +93,9 @@ pub const ManagedSignals = struct {
 
         std.log.info("shutdown signal {d} received, draining connections...", .{sig});
 
-        // Write 1 byte to pipe — wakes all workers from kevent()
-        _ = posix.write(shutdown_pipe_wr, &.{1}) catch {};
+        // Close write end — triggers EV_EOF on all worker kqueues
+        // (persistent state, wakes all N workers regardless of timing)
+        posix.close(shutdown_pipe_wr);
     }
 };
 

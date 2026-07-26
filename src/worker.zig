@@ -140,10 +140,12 @@ pub const Worker = struct {
             for (events[0..n]) |ev| {
                 const fd: posix.fd_t = @intCast(ev.ident);
 
-                // Shutdown pipe readable = begin drain
+                // Shutdown pipe EOF (write-end closed) = begin drain
                 if (fd == self.shutdown_pipe) {
-                    if (!self.draining) self.beginDrain();
-                    drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
+                    if (!self.draining) {
+                        self.beginDrain();
+                        drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
+                    }
                 } else if (self.isListenFd(fd)) {
                     if (!self.draining) self.handleAccept(fd);
                 } else if (ev.flags & 0x8000 != 0) { // EV_EOF = 0x8000 on FreeBSD
