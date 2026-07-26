@@ -77,6 +77,43 @@ pub const ManagedSignals = struct {
         _ = c.sigaddset(&set, SIGPIPE);
         _ = c.sigprocmask(c.SIG.BLOCK, &set, null);
     }
+
+    /// Wait for a shutdown signal (SIGTERM/SIGINT) using kqueue EVFILT_SIGNAL.
+    ///
+    /// Blocks until a signal is received, then sets the shutdown flag.
+    /// Call blockForKqueue() before spawning workers so signals are
+    /// delivered via kqueue rather than the default handler.
+    pub fn waitForShutdown(shutdown: *std.atomic.Value(bool)) void {
+        const kq = posix.kqueue() catch return;
+        defer posix.close(kq);
+
+        const events = [_]posix.Kevent{
+            .{
+                .ident = @intCast(SIGTERM),
+                .filter = c.EVFILT.SIGNAL,
+                .flags = c.EV.ADD | c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+                ._ext = .{ 0, 0, 0, 0 },
+            },
+            .{
+                .ident = @intCast(SIGINT),
+                .filter = c.EVFILT.SIGNAL,
+                .flags = c.EV.ADD | c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+                ._ext = .{ 0, 0, 0, 0 },
+            },
+        };
+
+        var out: [2]posix.Kevent = undefined;
+        _ = posix.kevent(kq, &events, &out, null) catch return;
+
+        std.log.info("shutdown signal received, draining connections...", .{});
+        shutdown.store(true, .release);
+    }
 };
 
 test "write and remove pid file" {

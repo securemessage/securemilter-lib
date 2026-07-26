@@ -40,6 +40,9 @@ pub const WorkerPoolConfig = struct {
     allocator: Allocator,
 };
 
+/// Default drain timeout: 30 seconds.
+const DRAIN_TIMEOUT_MS: u64 = 30_000;
+
 /// A single worker thread's state.
 ///
 /// Each worker owns its own kqueue, its own set of SO_REUSEPORT
@@ -52,8 +55,10 @@ pub const Worker = struct {
     connections: std.AutoHashMap(posix.fd_t, *connection_mod.Connection),
     callbacks: Callbacks,
     running: bool,
+    shutdown: *std.atomic.Value(bool),
+    draining: bool,
 
-    pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks) !Worker {
+    pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown: *std.atomic.Value(bool)) !Worker {
         const kq = try posix.kqueue();
 
         var self = Worker{
@@ -63,6 +68,8 @@ pub const Worker = struct {
             .connections = std.AutoHashMap(posix.fd_t, *connection_mod.Connection).init(allocator),
             .callbacks = callbacks,
             .running = true,
+            .shutdown = shutdown,
+            .draining = false,
         };
 
         for (addresses) |addr| {
@@ -90,12 +97,36 @@ pub const Worker = struct {
         posix.close(self.kq);
     }
 
-    /// Run the kqueue event loop. Blocks until self.running is set to false.
+    /// Run the kqueue event loop. Blocks until shutdown completes.
     pub fn run(self: *Worker) void {
         var events: [64]Kevent = undefined;
+        var drain_deadline: ?i64 = null;
 
         while (self.running) {
-            const n = posix.kevent(self.kq, &.{}, &events, null) catch |err| {
+            // Check for shutdown signal
+            if (!self.draining and self.shutdown.load(.acquire)) {
+                self.beginDrain();
+                drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
+            }
+
+            // In drain mode: exit when all connections are done or timeout
+            if (self.draining) {
+                if (self.connections.count() == 0) {
+                    self.running = false;
+                    break;
+                }
+                if (drain_deadline) |deadline| {
+                    if (std.time.milliTimestamp() >= deadline) {
+                        std.log.warn("drain timeout, closing {d} remaining connections", .{self.connections.count()});
+                        self.running = false;
+                        break;
+                    }
+                }
+            }
+
+            // Use a short timeout during drain so we can check the deadline
+            const timeout: ?posix.timespec = if (self.draining) .{ .sec = 1, .nsec = 0 } else null;
+            const n = posix.kevent(self.kq, &.{}, &events, timeout) catch |err| {
                 std.log.err("kevent error: {}", .{err});
                 continue;
             };
@@ -104,13 +135,22 @@ pub const Worker = struct {
                 const fd: posix.fd_t = @intCast(ev.ident);
 
                 if (self.isListenFd(fd)) {
-                    self.handleAccept(fd);
+                    if (!self.draining) self.handleAccept(fd);
                 } else if (ev.flags & 0x8000 != 0) { // EV_EOF = 0x8000 on FreeBSD
                     self.removeConnection(fd);
                 } else {
                     self.handleConnectionData(fd);
                 }
             }
+        }
+    }
+
+    /// Begin graceful drain: close all listener sockets so no new
+    /// connections are accepted, then let in-flight messages complete.
+    fn beginDrain(self: *Worker) void {
+        self.draining = true;
+        for (self.listeners.items) |*lst| {
+            lst.close();
         }
     }
 
@@ -362,27 +402,29 @@ fn stripNull(data: []const u8) []const u8 {
 
 /// Spawn a pool of worker threads.
 ///
-/// Returns the thread handles for join on shutdown.
+/// Returns the thread handles for join on shutdown. The shutdown flag
+/// is shared across all workers — set it to true to begin graceful drain.
 pub fn spawnPool(
     allocator: Allocator,
     num_workers: u32,
     addresses: []const listener_mod.ListenAddress,
     callbacks: Callbacks,
+    shutdown: *std.atomic.Value(bool),
 ) !std.ArrayList(std.Thread) {
     var threads: std.ArrayList(std.Thread) = .{};
 
     const count = if (num_workers == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else num_workers;
 
     for (0..count) |_| {
-        const t = try std.Thread.spawn(.{}, workerEntry, .{ allocator, addresses, callbacks });
+        const t = try std.Thread.spawn(.{}, workerEntry, .{ allocator, addresses, callbacks, shutdown });
         try threads.append(allocator, t);
     }
 
     return threads;
 }
 
-fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks) void {
-    var worker = Worker.init(allocator, addresses, callbacks) catch |err| {
+fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown: *std.atomic.Value(bool)) void {
+    var worker = Worker.init(allocator, addresses, callbacks, shutdown) catch |err| {
         std.log.err("worker init failed: {}", .{err});
         return;
     };
@@ -391,10 +433,12 @@ fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddre
 }
 
 test "worker init and deinit" {
+    var shutdown = std.atomic.Value(bool).init(false);
     var worker = try Worker.init(
         std.testing.allocator,
         &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
         .{},
+        &shutdown,
     );
     defer worker.deinit();
 
