@@ -78,12 +78,12 @@ pub const ManagedSignals = struct {
         _ = c.sigprocmask(c.SIG.BLOCK, &set, null);
     }
 
-    /// Wait for a shutdown signal (SIGTERM/SIGINT) using sigwait.
+    /// Wait for a shutdown signal (SIGTERM/SIGINT) using sigwait,
+    /// then write to the shutdown pipe to wake all worker threads.
     ///
-    /// Blocks until a signal is received, then sets the shutdown flag.
     /// Call blockForKqueue() before spawning workers so signals are
-    /// blocked and delivered via sigwait rather than the default handler.
-    pub fn waitForShutdown(shutdown: *std.atomic.Value(bool)) void {
+    /// blocked in all threads and delivered only via sigwait here.
+    pub fn waitForShutdown(shutdown_pipe_wr: posix.fd_t) void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGTERM);
         _ = c.sigaddset(&set, SIGINT);
@@ -92,7 +92,9 @@ pub const ManagedSignals = struct {
         _ = c.sigwait(&set, &sig);
 
         std.log.info("shutdown signal {d} received, draining connections...", .{sig});
-        shutdown.store(true, .release);
+
+        // Write 1 byte to pipe — wakes all workers from kevent()
+        _ = posix.write(shutdown_pipe_wr, &.{1}) catch {};
     }
 };
 

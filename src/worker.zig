@@ -55,10 +55,10 @@ pub const Worker = struct {
     connections: std.AutoHashMap(posix.fd_t, *connection_mod.Connection),
     callbacks: Callbacks,
     running: bool,
-    shutdown: *std.atomic.Value(bool),
+    shutdown_pipe: posix.fd_t,
     draining: bool,
 
-    pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown: *std.atomic.Value(bool)) !Worker {
+    pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t) !Worker {
         const kq = try posix.kqueue();
 
         var self = Worker{
@@ -68,9 +68,12 @@ pub const Worker = struct {
             .connections = std.AutoHashMap(posix.fd_t, *connection_mod.Connection).init(allocator),
             .callbacks = callbacks,
             .running = true,
-            .shutdown = shutdown,
+            .shutdown_pipe = shutdown_pipe,
             .draining = false,
         };
+
+        // Register shutdown pipe for wakeup on graceful stop
+        try registerRead(&self, shutdown_pipe);
 
         for (addresses) |addr| {
             const bound = try listener_mod.bind(addr);
@@ -100,33 +103,21 @@ pub const Worker = struct {
     /// Run the kqueue event loop. Blocks until shutdown completes.
     pub fn run(self: *Worker) void {
         var events: [64]Kevent = undefined;
-        var drain_deadline: ?i64 = null;
+        var drain_deadline: i64 = 0;
 
         while (self.running) {
-            // Check for shutdown signal
-            if (!self.draining and self.shutdown.load(.acquire)) {
-                self.beginDrain();
-                drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
-            }
-
             // In drain mode: exit when all connections are done or timeout
             if (self.draining) {
-                if (self.connections.count() == 0) {
-                    self.running = false;
+                if (self.connections.count() == 0) break;
+                if (std.time.milliTimestamp() >= drain_deadline) {
+                    std.log.warn("drain timeout, closing {d} remaining connections", .{self.connections.count()});
                     break;
-                }
-                if (drain_deadline) |deadline| {
-                    if (std.time.milliTimestamp() >= deadline) {
-                        std.log.warn("drain timeout, closing {d} remaining connections", .{self.connections.count()});
-                        self.running = false;
-                        break;
-                    }
                 }
             }
 
-            // Use a short timeout during drain so we can check the deadline
-            const drain_timeout = posix.timespec{ .sec = 1, .nsec = 0 };
-            const timeout: ?*const posix.timespec = if (self.draining) &drain_timeout else null;
+            // During drain, use 1s timeout to check deadline; otherwise block
+            const drain_ts = posix.timespec{ .sec = 1, .nsec = 0 };
+            const timeout: ?*const posix.timespec = if (self.draining) &drain_ts else null;
             const n = posix.kevent(self.kq, &.{}, &events, timeout) catch |err| {
                 std.log.err("kevent error: {}", .{err});
                 continue;
@@ -135,7 +126,11 @@ pub const Worker = struct {
             for (events[0..n]) |ev| {
                 const fd: posix.fd_t = @intCast(ev.ident);
 
-                if (self.isListenFd(fd)) {
+                // Shutdown pipe readable = begin drain
+                if (fd == self.shutdown_pipe) {
+                    if (!self.draining) self.beginDrain();
+                    drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
+                } else if (self.isListenFd(fd)) {
                     if (!self.draining) self.handleAccept(fd);
                 } else if (ev.flags & 0x8000 != 0) { // EV_EOF = 0x8000 on FreeBSD
                     self.removeConnection(fd);
@@ -403,29 +398,29 @@ fn stripNull(data: []const u8) []const u8 {
 
 /// Spawn a pool of worker threads.
 ///
-/// Returns the thread handles for join on shutdown. The shutdown flag
-/// is shared across all workers — set it to true to begin graceful drain.
+/// `shutdown_pipe_rd` is the read end of a pipe shared across all workers.
+/// Writing to the write end wakes all workers from kevent() to begin drain.
 pub fn spawnPool(
     allocator: Allocator,
     num_workers: u32,
     addresses: []const listener_mod.ListenAddress,
     callbacks: Callbacks,
-    shutdown: *std.atomic.Value(bool),
+    shutdown_pipe_rd: posix.fd_t,
 ) !std.ArrayList(std.Thread) {
     var threads: std.ArrayList(std.Thread) = .{};
 
     const count = if (num_workers == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else num_workers;
 
     for (0..count) |_| {
-        const t = try std.Thread.spawn(.{}, workerEntry, .{ allocator, addresses, callbacks, shutdown });
+        const t = try std.Thread.spawn(.{}, workerEntry, .{ allocator, addresses, callbacks, shutdown_pipe_rd });
         try threads.append(allocator, t);
     }
 
     return threads;
 }
 
-fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown: *std.atomic.Value(bool)) void {
-    var worker = Worker.init(allocator, addresses, callbacks, shutdown) catch |err| {
+fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t) void {
+    var worker = Worker.init(allocator, addresses, callbacks, shutdown_pipe_rd) catch |err| {
         std.log.err("worker init failed: {}", .{err});
         return;
     };
@@ -434,12 +429,14 @@ fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddre
 }
 
 test "worker init and deinit" {
-    var shutdown = std.atomic.Value(bool).init(false);
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
     var worker = try Worker.init(
         std.testing.allocator,
         &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
         .{},
-        &shutdown,
+        pipe[0],
     );
     defer worker.deinit();
 
