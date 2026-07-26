@@ -171,9 +171,37 @@ pub const Worker = struct {
                 self.dispatchPacket(conn, pkt);
                 conn.reader.consume();
             },
-            .incomplete => {},
-            .closed => self.removeConnection(fd),
-            .err => self.removeConnection(fd),
+            .incomplete => return,
+            .closed => {
+                self.removeConnection(fd);
+                return;
+            },
+            .err => {
+                self.removeConnection(fd);
+                return;
+            },
+        }
+
+        // Process any additional complete packets already buffered
+        // (Postfix often sends multiple commands in one TCP segment)
+        while (true) {
+            if (self.connections.get(fd) == null) return; // connection was removed
+            const next = conn.reader.tryDecode();
+            switch (next) {
+                .packet => |pkt| {
+                    self.dispatchPacket(conn, pkt);
+                    conn.reader.consume();
+                },
+                .incomplete => return,
+                .closed => {
+                    self.removeConnection(fd);
+                    return;
+                },
+                .err => {
+                    self.removeConnection(fd);
+                    return;
+                },
+            }
         }
     }
 

@@ -73,7 +73,7 @@ pub const PacketReader = struct {
     }
 
     /// Attempt to decode a complete packet from buffered data.
-    fn tryDecode(self: *PacketReader) ReadResult {
+    pub fn tryDecode(self: *PacketReader) ReadResult {
         if (self.expected_len == null) {
             if (self.buf.items.len < 4) return .incomplete;
             self.expected_len = mem.readInt(u32, self.buf.items[0..4], .big);
