@@ -5,10 +5,11 @@ const Allocator = mem.Allocator;
 /// DNS record types we need for email authentication.
 pub const RecordType = enum(u16) {
     A = 1,
-    AAAA = 28,
+    CNAME = 5,
+    PTR = 12,
     MX = 15,
     TXT = 16,
-    CNAME = 5,
+    AAAA = 28,
 };
 
 /// DNS response codes.
