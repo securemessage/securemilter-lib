@@ -11,7 +11,6 @@ pub fn build(b: *std.Build) void {
     });
 
     mod.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-    mod.linkSystemLibrary("crypto", .{});
     mod.linkSystemLibrary("zmq", .{});
 
     const tests = b.addTest(.{
