@@ -44,7 +44,7 @@ pub fn removePidFile(path: []const u8) void {
 /// Looks up the user by name via getpwnam, then calls setgid + setuid.
 /// Must be called as root before entering the event loop.
 pub fn dropPrivileges(username: []const u8) !void {
-    var name_buf: [256]u8 = undefined;
+    var name_buf: [256:0]u8 = undefined;
     if (username.len >= name_buf.len) return error.UsernameTooLong;
     @memcpy(name_buf[0..username.len], username);
     name_buf[username.len] = 0;
