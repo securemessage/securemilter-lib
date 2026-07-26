@@ -112,6 +112,11 @@ pub fn loadRsaPublicKeyDer(der_data: []const u8) !*c.EVP_PKEY {
     return pkey;
 }
 
+/// Free an EVP_PKEY returned by loadRsaPublicKeyDer.
+pub fn freePublicKey(pkey: *c.EVP_PKEY) void {
+    c.EVP_PKEY_free(pkey);
+}
+
 /// Ed25519 signing using Zig's std.crypto.
 pub fn ed25519Sign(seed: [32]u8, data: []const u8) ![64]u8 {
     const Ed25519 = std.crypto.sign.Ed25519;

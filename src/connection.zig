@@ -76,9 +76,18 @@ pub const Macros = struct {
 
     /// Reset per-message macros (keep connection-level ones).
     pub fn resetMessage(self: *Macros, allocator: Allocator) void {
-        if (self.mail_from) |v| { allocator.free(v); self.mail_from = null; }
-        if (self.rcpt_to) |v| { allocator.free(v); self.rcpt_to = null; }
-        if (self.queue_id) |v| { allocator.free(v); self.queue_id = null; }
+        if (self.mail_from) |v| {
+            allocator.free(v);
+            self.mail_from = null;
+        }
+        if (self.rcpt_to) |v| {
+            allocator.free(v);
+            self.rcpt_to = null;
+        }
+        if (self.queue_id) |v| {
+            allocator.free(v);
+            self.queue_id = null;
+        }
     }
 };
 
@@ -103,6 +112,7 @@ pub const Connection = struct {
     helo_name: ?[]const u8,
     mail_from_raw: ?[]const u8,
     recipients: std.ArrayList([]const u8),
+    body_chunks: std.ArrayList([]const u8),
     listener_index: usize,
 
     pub fn init(allocator: Allocator, fd: posix.fd_t, listener_index: usize) Connection {
@@ -116,6 +126,7 @@ pub const Connection = struct {
             .helo_name = null,
             .mail_from_raw = null,
             .recipients = .{},
+            .body_chunks = .{},
             .listener_index = listener_index,
         };
     }
@@ -130,14 +141,20 @@ pub const Connection = struct {
         if (self.mail_from_raw) |m| self.allocator.free(m);
         self.freeRecipients();
         self.recipients.deinit(self.allocator);
+        self.freeBodyChunks();
+        self.body_chunks.deinit(self.allocator);
     }
 
     /// Reset per-message state (called on ABORT or after EOM).
     pub fn resetMessage(self: *Connection) void {
         self.macros.resetMessage(self.allocator);
         self.freeHeaders();
-        if (self.mail_from_raw) |m| { self.allocator.free(m); self.mail_from_raw = null; }
+        if (self.mail_from_raw) |m| {
+            self.allocator.free(m);
+            self.mail_from_raw = null;
+        }
         self.freeRecipients();
+        self.freeBodyChunks();
         self.state = .connected;
     }
 
@@ -180,6 +197,41 @@ pub const Connection = struct {
             self.allocator.free(r);
         }
         self.recipients.clearRetainingCapacity();
+    }
+
+    /// Append a body chunk from SMFIC_BODY.
+    pub fn appendBody(self: *Connection, data: []const u8) !void {
+        const dup = try self.allocator.dupe(u8, data);
+        try self.body_chunks.append(self.allocator, dup);
+    }
+
+    /// Get the accumulated body as a single contiguous slice.
+    pub fn getBody(self: *Connection) []const u8 {
+        if (self.body_chunks.items.len == 0) return "";
+        if (self.body_chunks.items.len == 1) return self.body_chunks.items[0];
+        // Concatenate all chunks
+        var total: usize = 0;
+        for (self.body_chunks.items) |chunk| total += chunk.len;
+        const buf = self.allocator.alloc(u8, total) catch return "";
+        var pos: usize = 0;
+        for (self.body_chunks.items) |chunk| {
+            @memcpy(buf[pos..][0..chunk.len], chunk);
+            pos += chunk.len;
+        }
+        // Replace chunks with single buffer
+        self.freeBodyChunks();
+        self.body_chunks.append(self.allocator, buf) catch {
+            self.allocator.free(buf);
+            return "";
+        };
+        return buf;
+    }
+
+    fn freeBodyChunks(self: *Connection) void {
+        for (self.body_chunks.items) |chunk| {
+            self.allocator.free(chunk);
+        }
+        self.body_chunks.clearRetainingCapacity();
     }
 };
 
