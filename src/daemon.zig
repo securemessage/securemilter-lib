@@ -53,8 +53,8 @@ pub fn dropPrivileges(username: []const u8) !void {
     if (pw == null) return error.UserNotFound;
 
     const passwd = pw.?;
-    if (c.setgid(passwd.pw_gid) != 0) return error.SetgidFailed;
-    if (c.setuid(passwd.pw_uid) != 0) return error.SetuidFailed;
+    if (c.setgid(passwd.gid) != 0) return error.SetgidFailed;
+    if (c.setuid(passwd.uid) != 0) return error.SetuidFailed;
 }
 
 /// Signal set for kqueue-based signal handling.
