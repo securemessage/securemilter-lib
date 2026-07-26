@@ -48,6 +48,9 @@ const DRAIN_TIMEOUT_MS: u64 = 30_000;
 /// Each worker owns its own kqueue, its own set of SO_REUSEPORT
 /// listener sockets, and its own connection pool. Workers share
 /// nothing with each other — no locks, no contention.
+/// Maximum staged changelist entries. Flushed on next kevent() call.
+const MAX_PENDING: usize = 128;
+
 pub const Worker = struct {
     allocator: Allocator,
     kq: i32,
@@ -57,6 +60,8 @@ pub const Worker = struct {
     running: bool,
     shutdown_pipe: posix.fd_t,
     draining: bool,
+    pending: [MAX_PENDING]Kevent,
+    pending_len: usize,
 
     pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t) !Worker {
         const kq = try posix.kqueue();
@@ -70,14 +75,16 @@ pub const Worker = struct {
             .running = true,
             .shutdown_pipe = shutdown_pipe,
             .draining = false,
+            .pending = undefined,
+            .pending_len = 0,
         };
 
-        // Register shutdown pipe for wakeup on graceful stop
-        try registerRead(&self, shutdown_pipe);
+        // Stage initial registrations — flushed on first kevent() call
+        self.stageRead(shutdown_pipe);
 
         for (addresses) |addr| {
             const bound = try listener_mod.bind(addr);
-            try registerRead(&self, bound.fd);
+            self.stageRead(bound.fd);
             try self.listeners.append(allocator, bound);
         }
 
@@ -101,6 +108,10 @@ pub const Worker = struct {
     }
 
     /// Run the kqueue event loop. Blocks until shutdown completes.
+    ///
+    /// Uses kqueue's combined changelist+eventlist pattern: pending fd
+    /// registrations are batched and submitted alongside the wait call
+    /// in a single syscall (no separate registration calls).
     pub fn run(self: *Worker) void {
         var events: [64]Kevent = undefined;
         var drain_deadline: i64 = 0;
@@ -115,13 +126,16 @@ pub const Worker = struct {
                 }
             }
 
-            // During drain, use 1s timeout to check deadline; otherwise block
+            // Single kevent() call: flush staged changes AND wait for events
             const drain_ts = posix.timespec{ .sec = 1, .nsec = 0 };
             const timeout: ?*const posix.timespec = if (self.draining) &drain_ts else null;
-            const n = posix.kevent(self.kq, &.{}, &events, timeout) catch |err| {
+            const changelist = self.pending[0..self.pending_len];
+            const n = posix.kevent(self.kq, changelist, &events, timeout) catch |err| {
                 std.log.err("kevent error: {}", .{err});
+                self.pending_len = 0;
                 continue;
             };
+            self.pending_len = 0; // changes applied
 
             for (events[0..n]) |ev| {
                 const fd: posix.fd_t = @intCast(ev.ident);
@@ -139,6 +153,29 @@ pub const Worker = struct {
                 }
             }
         }
+    }
+
+    /// Stage a READ registration for the next kevent() call.
+    /// If the buffer is full, flush immediately (rare — only under
+    /// extreme accept bursts exceeding 128 simultaneous new connections).
+    fn stageRead(self: *Worker, fd: posix.fd_t) void {
+        if (self.pending_len >= MAX_PENDING) self.flushPending();
+        self.pending[self.pending_len] = .{
+            .ident = @intCast(fd),
+            .filter = c.EVFILT.READ,
+            .flags = c.EV.ADD | c.EV.CLEAR, // edge-triggered
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+            ._ext = .{ 0, 0, 0, 0 },
+        };
+        self.pending_len += 1;
+    }
+
+    /// Emergency flush when pending buffer is full (standalone syscall).
+    fn flushPending(self: *Worker) void {
+        _ = posix.kevent(self.kq, self.pending[0..self.pending_len], &.{}, null) catch {};
+        self.pending_len = 0;
     }
 
     /// Begin graceful drain: close all listener sockets so no new
@@ -192,9 +229,7 @@ pub const Worker = struct {
                 continue;
             };
 
-            registerRead(self, conn_fd) catch {
-                self.removeConnection(conn_fd);
-            };
+            self.stageRead(conn_fd);
         }
     }
 
@@ -367,19 +402,6 @@ pub const Worker = struct {
             kv.value.deinit();
             self.allocator.destroy(kv.value);
         }
-    }
-
-    fn registerRead(self: *Worker, fd: posix.fd_t) !void {
-        const ev = Kevent{
-            .ident = @intCast(fd),
-            .filter = c.EVFILT.READ,
-            .flags = c.EV.ADD | c.EV.ENABLE,
-            .fflags = 0,
-            .data = 0,
-            .udata = 0,
-            ._ext = .{ 0, 0, 0, 0 },
-        };
-        _ = try posix.kevent(self.kq, &.{ev}, &.{}, null);
     }
 };
 
