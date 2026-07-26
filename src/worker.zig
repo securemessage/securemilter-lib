@@ -11,6 +11,7 @@ const codec = @import("milter/codec.zig");
 const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
 const responses = @import("milter/responses.zig");
+const reload_mod = @import("reload.zig");
 
 /// Callback interface that product milters implement.
 ///
@@ -27,6 +28,10 @@ pub const Callbacks = struct {
     on_body: ?*const fn (*connection_mod.Connection, []const u8) u8 = null,
     on_eom: ?*const fn (*connection_mod.Connection) u8 = null,
     on_abort: ?*const fn (*connection_mod.Connection) void = null,
+
+    /// Called per-worker when config_generation advances (SIGHUP reload).
+    /// Product milters use this to flush LRU caches or re-read thread-local state.
+    on_reload: ?*const fn () void = null,
 
     required_actions: negotiate.ActionFlags = .{ .add_headers = true },
     skip_flags: negotiate.ProtocolFlags = .{},
@@ -62,8 +67,14 @@ pub const Worker = struct {
     draining: bool,
     pending: [MAX_PENDING]Kevent,
     pending_len: usize,
+    config_gen: ?*const reload_mod.ConfigGeneration,
+    local_generation: u64,
 
     pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t) !Worker {
+        return initWithReload(allocator, addresses, callbacks, shutdown_pipe, null);
+    }
+
+    pub fn initWithReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration) !Worker {
         const kq = try posix.kqueue();
 
         var self = Worker{
@@ -77,6 +88,8 @@ pub const Worker = struct {
             .draining = false,
             .pending = undefined,
             .pending_len = 0,
+            .config_gen = config_gen,
+            .local_generation = if (config_gen) |cg| cg.load() else 0,
         };
 
         // Stage initial registrations — flushed on first kevent() call
@@ -123,6 +136,17 @@ pub const Worker = struct {
                 if (std.time.milliTimestamp() >= drain_deadline) {
                     std.log.warn("drain timeout, closing {d} remaining connections", .{self.connections.count()});
                     break;
+                }
+            }
+
+            // Check for config reload (SIGHUP): compare local generation
+            // to global. If stale, notify the product via on_reload callback
+            // (e.g., flush LRU key cache) and advance local snapshot.
+            if (self.config_gen) |cg| {
+                const current = cg.load();
+                if (current != self.local_generation) {
+                    self.local_generation = current;
+                    if (self.callbacks.on_reload) |cb| cb();
                 }
             }
 
@@ -431,20 +455,36 @@ pub fn spawnPool(
     callbacks: Callbacks,
     shutdown_pipe_rd: posix.fd_t,
 ) !std.ArrayList(std.Thread) {
+    return spawnPoolWithReload(allocator, num_workers, addresses, callbacks, shutdown_pipe_rd, null);
+}
+
+/// Spawn a pool of worker threads with config reload support.
+///
+/// `config_gen` is a pointer to the global ConfigGeneration counter.
+/// Workers poll it each event loop iteration and call callbacks.on_reload
+/// when the generation advances.
+pub fn spawnPoolWithReload(
+    allocator: Allocator,
+    num_workers: u32,
+    addresses: []const listener_mod.ListenAddress,
+    callbacks: Callbacks,
+    shutdown_pipe_rd: posix.fd_t,
+    config_gen: ?*const reload_mod.ConfigGeneration,
+) !std.ArrayList(std.Thread) {
     var threads: std.ArrayList(std.Thread) = .{};
 
     const count = if (num_workers == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else num_workers;
 
     for (0..count) |_| {
-        const t = try std.Thread.spawn(.{}, workerEntry, .{ allocator, addresses, callbacks, shutdown_pipe_rd });
+        const t = try std.Thread.spawn(.{}, workerEntryReload, .{ allocator, addresses, callbacks, shutdown_pipe_rd, config_gen });
         try threads.append(allocator, t);
     }
 
     return threads;
 }
 
-fn workerEntry(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t) void {
-    var worker = Worker.init(allocator, addresses, callbacks, shutdown_pipe_rd) catch |err| {
+fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration) void {
+    var worker = Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen) catch |err| {
         std.log.err("worker init failed: {}", .{err});
         return;
     };

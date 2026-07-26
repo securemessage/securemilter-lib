@@ -7,6 +7,7 @@ pub const worker = @import("worker.zig");
 pub const dns = @import("dns.zig");
 pub const auth_results = @import("auth_results.zig");
 pub const zmq = @import("zmq.zig");
+pub const reload = @import("reload.zig");
 
 test {
     _ = config;
@@ -18,4 +19,5 @@ test {
     _ = dns;
     _ = auth_results;
     _ = zmq;
+    _ = reload;
 }

@@ -97,6 +97,34 @@ pub const ManagedSignals = struct {
         // (persistent state, wakes all N workers regardless of timing)
         posix.close(shutdown_pipe_wr);
     }
+
+    /// Signal loop that handles both SIGHUP (reload) and SIGTERM/SIGINT (shutdown).
+    ///
+    /// On SIGHUP: calls the reload callback, then continues waiting.
+    /// On SIGTERM/SIGINT: closes the shutdown pipe and returns.
+    ///
+    /// This replaces waitForShutdown() when live reload is desired.
+    /// Call blockForKqueue() before spawning workers.
+    pub fn signalLoop(shutdown_pipe_wr: posix.fd_t, reload_fn: ?*const fn () void) void {
+        var set = std.mem.zeroes(c.sigset_t);
+        _ = c.sigaddset(&set, SIGTERM);
+        _ = c.sigaddset(&set, SIGINT);
+        _ = c.sigaddset(&set, SIGHUP);
+
+        while (true) {
+            var sig: c_int = 0;
+            _ = c.sigwait(&set, &sig);
+
+            if (sig == SIGHUP) {
+                std.log.info("SIGHUP received, reloading configuration...", .{});
+                if (reload_fn) |cb| cb();
+            } else {
+                std.log.info("shutdown signal {d} received, draining connections...", .{sig});
+                posix.close(shutdown_pipe_wr);
+                return;
+            }
+        }
+    }
 };
 
 test "write and remove pid file" {
