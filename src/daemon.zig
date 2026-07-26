@@ -78,40 +78,20 @@ pub const ManagedSignals = struct {
         _ = c.sigprocmask(c.SIG.BLOCK, &set, null);
     }
 
-    /// Wait for a shutdown signal (SIGTERM/SIGINT) using kqueue EVFILT_SIGNAL.
+    /// Wait for a shutdown signal (SIGTERM/SIGINT) using sigwait.
     ///
     /// Blocks until a signal is received, then sets the shutdown flag.
     /// Call blockForKqueue() before spawning workers so signals are
-    /// delivered via kqueue rather than the default handler.
+    /// blocked and delivered via sigwait rather than the default handler.
     pub fn waitForShutdown(shutdown: *std.atomic.Value(bool)) void {
-        const kq = posix.kqueue() catch return;
-        defer posix.close(kq);
+        var set = std.mem.zeroes(c.sigset_t);
+        _ = c.sigaddset(&set, SIGTERM);
+        _ = c.sigaddset(&set, SIGINT);
 
-        const events = [_]posix.Kevent{
-            .{
-                .ident = @intCast(SIGTERM),
-                .filter = c.EVFILT.SIGNAL,
-                .flags = c.EV.ADD | c.EV.ENABLE,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-                ._ext = .{ 0, 0, 0, 0 },
-            },
-            .{
-                .ident = @intCast(SIGINT),
-                .filter = c.EVFILT.SIGNAL,
-                .flags = c.EV.ADD | c.EV.ENABLE,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-                ._ext = .{ 0, 0, 0, 0 },
-            },
-        };
+        var sig: c_int = 0;
+        _ = c.sigwait(&set, &sig);
 
-        var out: [2]posix.Kevent = undefined;
-        _ = posix.kevent(kq, &events, &out, null) catch return;
-
-        std.log.info("shutdown signal received, draining connections...", .{});
+        std.log.info("shutdown signal {d} received, draining connections...", .{sig});
         shutdown.store(true, .release);
     }
 };
