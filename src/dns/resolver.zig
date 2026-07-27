@@ -44,17 +44,24 @@ pub const TxtIterator = struct {
 const CacheEntry = struct {
     answers: []packet.Answer,
     expires_at: i64,
+    is_negative: bool,
 };
 
-/// Per-worker DNS cache with TTL expiry.
+/// Per-worker DNS cache with TTL expiry, max size, negative caching, and FIFO eviction.
 pub const Cache = struct {
     entries: std.StringHashMap(CacheEntry),
+    insertion_order: std.ArrayListUnmanaged([]u8),
     allocator: Allocator,
+    max_entries: u32,
+    negative_ttl: u32,
 
-    pub fn init(allocator: Allocator) Cache {
+    pub fn init(allocator: Allocator, max_entries: u32, negative_ttl: u32) Cache {
         return .{
             .entries = std.StringHashMap(CacheEntry).init(allocator),
+            .insertion_order = .{},
             .allocator = allocator,
+            .max_entries = if (max_entries == 0) 1000 else max_entries,
+            .negative_ttl = if (negative_ttl == 0) 60 else negative_ttl,
         };
     }
 
@@ -65,17 +72,22 @@ pub const Cache = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.entries.deinit();
+        for (self.insertion_order.items) |key| {
+            _ = key; // Keys already freed above via entries iterator
+        }
+        self.insertion_order.deinit(self.allocator);
     }
 
-    pub fn get(self: *Cache, key: []const u8) ?[]const packet.Answer {
-        const entry = self.entries.get(key) orelse return null;
+    pub fn get(self: *Cache, key: []const u8) ?*const CacheEntry {
+        const entry = self.entries.getPtr(key) orelse return null;
         const now = std.time.timestamp();
         if (now >= entry.expires_at) {
             return null; // Expired
         }
-        return entry.answers;
+        return entry;
     }
 
+    /// Cache a successful DNS response.
     pub fn put(self: *Cache, domain: []const u8, rtype: packet.RecordType, answers: []const packet.Answer) !void {
         if (answers.len == 0) return;
 
@@ -83,32 +95,41 @@ pub const Cache = struct {
         for (answers[1..]) |ans| {
             if (ans.ttl < min_ttl) min_ttl = ans.ttl;
         }
-        if (min_ttl < 30) min_ttl = 30; // Floor at 30 seconds
-        if (min_ttl > 86400) min_ttl = 86400; // Cap at 1 day
+        if (min_ttl < 30) min_ttl = 30;
+        if (min_ttl > 86400) min_ttl = 86400;
 
         const key = try self.makeCacheKey(domain, rtype);
         errdefer self.allocator.free(key);
 
         const duped = try self.dupeAnswers(answers);
 
-        const result = try self.entries.getOrPut(key);
-        if (result.found_existing) {
-            self.freeEntry(result.value_ptr.*);
-            self.allocator.free(key);
-        }
-
-        result.value_ptr.* = .{
+        try self.evictIfFull();
+        try self.insertEntry(key, .{
             .answers = duped,
             .expires_at = std.time.timestamp() + @as(i64, min_ttl),
-        };
+            .is_negative = false,
+        });
     }
 
-    fn makeCacheKey(self: *Cache, domain: []const u8, rtype: packet.RecordType) ![]u8 {
+    /// Cache a negative result (NXDOMAIN, SERVFAIL, or empty response).
+    pub fn putNegative(self: *Cache, domain: []const u8, rtype: packet.RecordType) !void {
+        const key = try self.makeCacheKey(domain, rtype);
+        errdefer self.allocator.free(key);
+
+        try self.evictIfFull();
+        try self.insertEntry(key, .{
+            .answers = &.{},
+            .expires_at = std.time.timestamp() + @as(i64, self.negative_ttl),
+            .is_negative = true,
+        });
+    }
+
+    pub fn makeCacheKey(self: *Cache, domain: []const u8, rtype: packet.RecordType) ![]u8 {
         const type_int = @intFromEnum(rtype);
         return std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ domain, type_int });
     }
 
-    fn dupeAnswers(self: *Cache, answers: []const packet.Answer) ![]packet.Answer {
+    pub fn dupeAnswers(self: *Cache, answers: []const packet.Answer) ![]packet.Answer {
         const duped = try self.allocator.alloc(packet.Answer, answers.len);
         for (answers, 0..) |ans, i| {
             duped[i] = .{
@@ -119,6 +140,50 @@ pub const Cache = struct {
             };
         }
         return duped;
+    }
+
+    fn insertEntry(self: *Cache, key: []u8, entry: CacheEntry) !void {
+        const result = try self.entries.getOrPut(key);
+        if (result.found_existing) {
+            if (!result.value_ptr.is_negative) self.freeEntry(result.value_ptr.*);
+            self.allocator.free(key);
+        } else {
+            try self.insertion_order.append(self.allocator, key);
+        }
+        result.value_ptr.* = entry;
+    }
+
+    fn evictIfFull(self: *Cache) !void {
+        if (self.entries.count() < self.max_entries) return;
+
+        // First pass: evict expired entries
+        const now = std.time.timestamp();
+        var i: usize = 0;
+        while (i < self.insertion_order.items.len) {
+            const key = self.insertion_order.items[i];
+            if (self.entries.get(key)) |entry| {
+                if (now >= entry.expires_at) {
+                    self.removeByIndex(i, key);
+                    if (self.entries.count() < self.max_entries) return;
+                    continue; // Don't increment i, array shifted
+                }
+            }
+            i += 1;
+        }
+
+        // Still full: evict oldest (FIFO)
+        if (self.insertion_order.items.len > 0) {
+            const oldest_key = self.insertion_order.items[0];
+            self.removeByIndex(0, oldest_key);
+        }
+    }
+
+    fn removeByIndex(self: *Cache, idx: usize, key: []u8) void {
+        if (self.entries.fetchRemove(key)) |kv| {
+            if (!kv.value.is_negative) self.freeEntry(kv.value);
+            self.allocator.free(kv.key);
+        }
+        _ = self.insertion_order.orderedRemove(idx);
     }
 
     fn freeEntry(self: *Cache, entry: CacheEntry) void {
@@ -139,6 +204,8 @@ pub const ResolverConfig = struct {
     port: u16 = 53,
     timeout_ms: u32 = 5000,
     retries: u8 = 2,
+    cache_size: u32 = 1000,
+    negative_ttl: u32 = 60,
 };
 
 /// Synchronous DNS resolver with per-worker caching and multi-server
@@ -172,7 +239,7 @@ pub const Resolver = struct {
         return .{
             .allocator = allocator,
             .config = config,
-            .cache = Cache.init(allocator),
+            .cache = Cache.init(allocator, config.cache_size, config.negative_ttl),
             .next_id = @truncate(@as(u64, @bitCast(std.time.milliTimestamp()))),
             .addrs = addrs,
             .rr_index = 0,
@@ -194,8 +261,9 @@ pub const Resolver = struct {
         const cache_key = try self.cache.makeCacheKey(domain, rtype);
         defer self.allocator.free(cache_key);
 
-        if (self.cache.get(cache_key)) |cached| {
-            const duped = try self.cache.dupeAnswers(cached);
+        if (self.cache.get(cache_key)) |entry| {
+            if (entry.is_negative) return error.DnsError;
+            const duped = try self.cache.dupeAnswers(entry.answers);
             return .{ .answers = duped, .allocator = self.allocator };
         }
 
@@ -204,16 +272,24 @@ pub const Resolver = struct {
         const query_pkt = try packet.buildQuery(self.allocator, domain, rtype, query_id);
         defer self.allocator.free(query_pkt);
 
-        const response_data = try self.sendAndReceive(query_pkt);
+        const response_data = self.sendAndReceive(query_pkt) catch |err| {
+            // Cache negative result on timeout (transient failure)
+            if (err == error.DnsTimeout) self.cache.putNegative(domain, rtype) catch {};
+            return err;
+        };
         defer self.allocator.free(response_data);
 
         var response = try packet.parseResponse(self.allocator, response_data);
         defer response.deinit(self.allocator);
 
         if (response.id != query_id) return error.IdMismatch;
-        if (response.rcode != .no_error) return error.DnsError;
+        if (response.rcode != .no_error) {
+            // Cache NXDOMAIN/SERVFAIL as negative
+            self.cache.putNegative(domain, rtype) catch {};
+            return error.DnsError;
+        }
 
-        // Cache the result
+        // Cache the positive result
         self.cache.put(domain, rtype, response.answers.items) catch {};
 
         // Return owned copy
@@ -301,7 +377,7 @@ fn parseNameserver(host: []const u8, port: u16) !net.Address {
 }
 
 test "cache put and get" {
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
     defer cache.deinit();
 
     const answers = &[_]packet.Answer{.{
@@ -317,17 +393,56 @@ test "cache put and get" {
     defer std.testing.allocator.free(key);
     const cached = cache.get(key);
     try std.testing.expect(cached != null);
-    try std.testing.expectEqual(@as(usize, 1), cached.?.len);
-    try std.testing.expectEqualStrings("v=spf1 -all", cached.?[0].data);
+    try std.testing.expectEqual(@as(usize, 1), cached.?.answers.len);
+    try std.testing.expectEqualStrings("v=spf1 -all", cached.?.answers[0].data);
+    try std.testing.expect(!cached.?.is_negative);
 }
 
 test "cache miss returns null" {
-    var cache = Cache.init(std.testing.allocator);
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
     defer cache.deinit();
 
     const key = try cache.makeCacheKey("nonexistent.com", .TXT);
     defer std.testing.allocator.free(key);
     try std.testing.expect(cache.get(key) == null);
+}
+
+test "cache negative entry" {
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
+    defer cache.deinit();
+
+    try cache.putNegative("nxdomain.com", .TXT);
+
+    const key = try cache.makeCacheKey("nxdomain.com", .TXT);
+    defer std.testing.allocator.free(key);
+    const cached = cache.get(key);
+    try std.testing.expect(cached != null);
+    try std.testing.expect(cached.?.is_negative);
+}
+
+test "cache eviction when full" {
+    var cache = Cache.init(std.testing.allocator, 3, 60);
+    defer cache.deinit();
+
+    const answer = &[_]packet.Answer{.{
+        .name = "a.com",
+        .record_type = @intFromEnum(packet.RecordType.TXT),
+        .ttl = 3600,
+        .data = "data",
+    }};
+
+    try cache.put("a.com", .TXT, answer);
+    try cache.put("b.com", .TXT, answer);
+    try cache.put("c.com", .TXT, answer);
+    try cache.put("d.com", .TXT, answer); // Should evict a.com
+
+    const key_a = try cache.makeCacheKey("a.com", .TXT);
+    defer std.testing.allocator.free(key_a);
+    try std.testing.expect(cache.get(key_a) == null); // Evicted
+
+    const key_d = try cache.makeCacheKey("d.com", .TXT);
+    defer std.testing.allocator.free(key_d);
+    try std.testing.expect(cache.get(key_d) != null); // Present
 }
 
 test "resolver init and deinit" {
