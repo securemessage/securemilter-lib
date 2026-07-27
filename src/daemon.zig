@@ -39,19 +39,32 @@ pub fn removePidFile(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
-/// Raise the file descriptor limit to the system maximum.
+/// Raise the file descriptor soft limit to the specified value.
 ///
-/// Must be called BEFORE dropPrivileges() since setrlimit may require
-/// root to raise above the default soft limit. Sets both soft and hard
-/// limits to the kernel's maximum (typically 1048576 on FreeBSD).
-pub fn raiseFileLimit() void {
+/// Must be called BEFORE dropPrivileges() since setrlimit requires root
+/// to raise above the default soft limit. If the requested value exceeds
+/// the hard limit, it is clamped to the hard limit.
+///
+/// Use calculateFdNeed() to compute the value from MaxConnections config.
+pub fn raiseFileLimit(needed: u64) void {
     var lim: c.rlimit = undefined;
 
     if (c.getrlimit(.NOFILE, &lim) == 0) {
-        lim.cur = lim.max;
+        const target = @min(needed, lim.max);
+        lim.cur = target;
         _ = c.setrlimit(.NOFILE, &lim);
-        std.log.info("file descriptor limit raised to {d}", .{lim.max});
+        std.log.info("file descriptor limit set to {d} (requested {d}, hard max {d})", .{ target, needed, lim.max });
     }
+}
+
+/// Calculate the file descriptor budget from worker count and max connections.
+///
+/// Formula: num_workers × (max_conn_per_worker + listeners + kqueue + pipe + dns_socket) + margin
+/// Each worker needs: max_conn fds + 1 kqueue + N listeners + 1 pipe read-end + 1 DNS UDP socket
+/// Plus global margin for: stdin/stdout/stderr(closed), PID file, config file, etc.
+pub fn calculateFdNeed(num_workers: u32, max_connections: u32, num_listeners: u32) u64 {
+    const per_worker: u64 = @as(u64, max_connections) + @as(u64, num_listeners) + 3; // +3 = kqueue + pipe + dns
+    return @as(u64, num_workers) * per_worker + 64; // +64 margin for global fds
 }
 
 /// Drop privileges to the specified user.

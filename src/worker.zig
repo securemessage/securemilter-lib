@@ -48,6 +48,9 @@ pub const WorkerPoolConfig = struct {
 /// Default drain timeout: 30 seconds.
 const DRAIN_TIMEOUT_MS: u64 = 30_000;
 
+/// Default max connections per worker if not configured.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
+
 /// A single worker thread's state.
 ///
 /// Each worker owns its own kqueue, its own set of SO_REUSEPORT
@@ -69,12 +72,13 @@ pub const Worker = struct {
     pending_len: usize,
     config_gen: ?*const reload_mod.ConfigGeneration,
     local_generation: u64,
+    max_connections: u32,
 
     pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t) !Worker {
-        return initWithReload(allocator, addresses, callbacks, shutdown_pipe, null);
+        return initWithReload(allocator, addresses, callbacks, shutdown_pipe, null, DEFAULT_MAX_CONNECTIONS);
     }
 
-    pub fn initWithReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration) !Worker {
+    pub fn initWithReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_conn: u32) !Worker {
         const kq = try posix.kqueue();
 
         var self = Worker{
@@ -90,6 +94,7 @@ pub const Worker = struct {
             .pending_len = 0,
             .config_gen = config_gen,
             .local_generation = if (config_gen) |cg| cg.load() else 0,
+            .max_connections = max_conn,
         };
 
         // Stage initial registrations — flushed on first kevent() call
@@ -238,6 +243,13 @@ pub const Worker = struct {
             };
 
             const conn_fd = conn_result.stream.handle;
+
+            // Backpressure: reject connection if at capacity
+            if (self.connections.count() >= self.max_connections) {
+                posix.close(conn_fd);
+                continue;
+            }
+
             setNonBlocking(conn_fd) catch {
                 posix.close(conn_fd);
                 continue;
@@ -459,7 +471,7 @@ pub fn spawnPool(
     callbacks: Callbacks,
     shutdown_pipe_rd: posix.fd_t,
 ) !std.ArrayList(std.Thread) {
-    return spawnPoolWithReload(allocator, num_workers, addresses, callbacks, shutdown_pipe_rd, null);
+    return spawnPoolWithReload(allocator, num_workers, addresses, callbacks, shutdown_pipe_rd, null, DEFAULT_MAX_CONNECTIONS);
 }
 
 /// Spawn a pool of worker threads with config reload support.
@@ -467,6 +479,7 @@ pub fn spawnPool(
 /// `config_gen` is a pointer to the global ConfigGeneration counter.
 /// Workers poll it each event loop iteration and call callbacks.on_reload
 /// when the generation advances.
+/// `max_connections` is the per-worker connection limit for backpressure.
 pub fn spawnPoolWithReload(
     allocator: Allocator,
     num_workers: u32,
@@ -474,21 +487,22 @@ pub fn spawnPoolWithReload(
     callbacks: Callbacks,
     shutdown_pipe_rd: posix.fd_t,
     config_gen: ?*const reload_mod.ConfigGeneration,
+    max_connections: u32,
 ) !std.ArrayList(std.Thread) {
     var threads: std.ArrayList(std.Thread) = .{};
 
     const count = if (num_workers == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else num_workers;
 
     for (0..count) |_| {
-        const t = try std.Thread.spawn(.{}, workerEntryReload, .{ allocator, addresses, callbacks, shutdown_pipe_rd, config_gen });
+        const t = try std.Thread.spawn(.{}, workerEntryReload, .{ allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections });
         try threads.append(allocator, t);
     }
 
     return threads;
 }
 
-fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration) void {
-    var worker = Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen) catch |err| {
+fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_connections: u32) void {
+    var worker = Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections) catch |err| {
         std.log.err("worker init failed: {}", .{err});
         return;
     };
