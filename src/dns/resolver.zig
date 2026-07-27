@@ -4,6 +4,7 @@ const posix = std.posix;
 const net = std.net;
 const Allocator = mem.Allocator;
 const packet = @import("packet.zig");
+const log_mod = @import("../log.zig");
 
 /// DNS resolution result.
 pub const Result = struct {
@@ -262,17 +263,26 @@ pub const Resolver = struct {
         defer self.allocator.free(cache_key);
 
         if (self.cache.get(cache_key)) |entry| {
-            if (entry.is_negative) return error.DnsError;
+            if (entry.is_negative) {
+                log_mod.debug("dns: cache negative hit {s}", .{domain});
+                return error.DnsError;
+            }
+            log_mod.debug("dns: cache hit {s}", .{domain});
             const duped = try self.cache.dupeAnswers(entry.answers);
             return .{ .answers = duped, .allocator = self.allocator };
         }
+
+        log_mod.debug("dns: cache miss {s}", .{domain});
 
         // Build and send query
         const query_id = self.nextId();
         const query_pkt = try packet.buildQuery(self.allocator, domain, rtype, query_id);
         defer self.allocator.free(query_pkt);
 
+        const query_start = std.time.nanoTimestamp();
         const response_data = self.sendAndReceive(query_pkt) catch |err| {
+            const query_elapsed = @divFloor(std.time.nanoTimestamp() - query_start, 1_000_000);
+            log_mod.debug("dns: query {s} failed err={} elapsed={d}ms", .{ domain, err, query_elapsed });
             // Cache negative result on timeout (transient failure)
             if (err == error.DnsTimeout) self.cache.putNegative(domain, rtype) catch {};
             return err;
