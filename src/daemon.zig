@@ -3,6 +3,8 @@ const posix = std.posix;
 const c = std.c;
 const log_mod = @import("log.zig");
 
+extern "c" fn setgroups(ngroups: c_int, gidset: ?[*]const c.gid_t) c_int;
+
 /// Daemonize the current process (double-fork, setsid, close fds).
 ///
 /// After this call, the process is running as a background daemon
@@ -70,7 +72,9 @@ pub fn calculateFdNeed(num_workers: u32, max_connections: u32, num_listeners: u3
 
 /// Drop privileges to the specified user.
 ///
-/// Looks up the user by name via getpwnam, then calls setgid + setuid.
+/// Looks up the user by name via getpwnam, then calls setgroups (clear
+/// supplementary groups) + setgid + setuid. Order matters: setgroups
+/// requires root, so it must come before setuid.
 /// Must be called as root before entering the event loop.
 pub fn dropPrivileges(username: []const u8) !void {
     var name_buf: [256:0]u8 = undefined;
@@ -82,6 +86,9 @@ pub fn dropPrivileges(username: []const u8) !void {
     if (pw == null) return error.UserNotFound;
 
     const passwd = pw.?;
+
+    // Clear supplementary groups — prevents inheriting root's group memberships
+    if (setgroups(0, null) != 0) return error.SetgroupsFailed;
     if (c.setgid(passwd.gid) != 0) return error.SetgidFailed;
     if (c.setuid(passwd.uid) != 0) return error.SetuidFailed;
 }

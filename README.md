@@ -15,15 +15,17 @@ securemilter-lib provides the common infrastructure used by all four SecureMilte
 
 | Module | Description |
 |--------|-------------|
-| `milter` | Sendmail milter protocol v6 codec — packet framing, OPTNEG negotiation, command/response types |
+| `milter` | Sendmail milter protocol v6 codec — packet framing, OPTNEG, command/response types |
 | `listener` | TCP and Unix domain socket listener creation with SO_REUSEPORT |
 | `worker` | Thread-per-core worker pool with per-worker kqueue event loop |
-| `connection` | Per-connection milter state machine and buffered I/O |
-| `dns` | Async DNS resolver integrated with kqueue (TXT, A, AAAA, MX, with TTL caching) |
+| `connection` | Per-connection milter state machine, buffered I/O, peer address tracking |
+| `dns` | Blocking DNS resolver with TTL cache, negative caching, FIFO eviction |
+| `dns.health` | Proactive DNS health monitor — background probe thread, atomic flags |
 | `auth_results` | RFC 8601 Authentication-Results header generation and parsing |
-| `config` | INI-style config parser with `[section]` support |
-| `crypto` | RSA-SHA256 via OpenSSL, Ed25519 via std.crypto, PEM key loading, base64 |
-| `daemon` | Process daemonization, PID file, privilege drop, signal handling |
+| `config` | INI-style config parser with `[global]` and `[section:name]` support |
+| `daemon` | Process daemonization (double-fork, setsid), PID file, privilege drop |
+| `reload` | SIGHUP config reload via atomic ConfigGeneration counter |
+| `log` | HAProxy-style non-blocking UDP syslog — per-worker threadlocal, stack buffer |
 | `zmq` | ZMQ PUB socket for fire-and-forget event publishing |
 
 ## Usage
@@ -32,7 +34,15 @@ Add as a dependency in your `build.zig.zon`:
 
 ```zig
 .securemilter = .{
-    .url = "https://pacyworld.dev/securemessage/securemilter-lib/archive/v0.1.0.tar.gz",
+    .path = "../securemilter-lib",  // for local development
+},
+```
+
+Or pin to a release:
+
+```zig
+.securemilter = .{
+    .url = "https://pacyworld.dev/securemessage/securemilter-lib/archive/v0.3.0.tar.gz",
     .hash = "...",
 },
 ```
@@ -41,7 +51,6 @@ Add as a dependency in your `build.zig.zon`:
 
 - Zig 0.15.x
 - FreeBSD (kqueue/kevent)
-- OpenSSL (`libcrypto`)
 - libzmq4
 
 ## License
