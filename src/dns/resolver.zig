@@ -130,47 +130,43 @@ pub const Cache = struct {
     }
 };
 
+const health_mod = @import("health.zig");
+pub const HealthMonitor = health_mod.HealthMonitor;
+
 /// DNS resolver configuration.
 pub const ResolverConfig = struct {
     nameservers: []const []const u8 = &.{"127.0.0.1"},
     port: u16 = 53,
     timeout_ms: u32 = 5000,
     retries: u8 = 2,
-    health_cooldown_s: u32 = 30,
-    max_failures: u8 = 3,
 };
 
-/// Per-server health state for failover tracking.
-const ServerHealth = struct {
-    consecutive_failures: u8 = 0,
-    last_failure_time: i64 = 0,
-};
-
-/// Synchronous DNS resolver with per-worker caching, multi-server
-/// round-robin, failover, and health monitoring.
+/// Synchronous DNS resolver with per-worker caching and multi-server
+/// round-robin with proactive health monitoring.
 ///
-/// Sends UDP queries and waits for responses with a timeout.
-/// Tries servers in round-robin order, skipping unhealthy ones
-/// unless all are down (then retries after a cooldown period).
+/// Uses a shared HealthMonitor (background probe thread) to skip
+/// unhealthy servers with zero delay. If no HealthMonitor is set,
+/// falls back to trying all servers with timeout-based failover.
 pub const Resolver = struct {
     allocator: Allocator,
     config: ResolverConfig,
     cache: Cache,
     next_id: u16,
     addrs: []net.Address,
-    health: []ServerHealth,
     rr_index: usize,
+    health_monitor: ?*const HealthMonitor,
 
     pub fn init(allocator: Allocator, config: ResolverConfig) Resolver {
+        return initWithMonitor(allocator, config, null);
+    }
+
+    pub fn initWithMonitor(allocator: Allocator, config: ResolverConfig, monitor: ?*const HealthMonitor) Resolver {
         const addrs = allocator.alloc(net.Address, config.nameservers.len) catch
             @panic("DNS resolver: failed to allocate server addresses");
-        const health = allocator.alloc(ServerHealth, config.nameservers.len) catch
-            @panic("DNS resolver: failed to allocate health state");
 
         for (config.nameservers, 0..) |ns, i| {
             addrs[i] = parseNameserver(ns, config.port) catch
                 @panic("DNS resolver: invalid nameserver address");
-            health[i] = .{};
         }
 
         return .{
@@ -179,15 +175,14 @@ pub const Resolver = struct {
             .cache = Cache.init(allocator),
             .next_id = @truncate(@as(u64, @bitCast(std.time.milliTimestamp()))),
             .addrs = addrs,
-            .health = health,
             .rr_index = 0,
+            .health_monitor = monitor,
         };
     }
 
     pub fn deinit(self: *Resolver) void {
         self.cache.deinit();
         self.allocator.free(self.addrs);
-        self.allocator.free(self.health);
     }
 
     /// Resolve a domain name for the given record type.
@@ -239,6 +234,13 @@ pub const Resolver = struct {
     }
 
     fn sendAndReceive(self: *Resolver, query: []const u8) ![]u8 {
+        const num_servers = self.addrs.len;
+
+        // Fast path: if health monitor reports ALL servers down, fail immediately.
+        if (self.health_monitor) |monitor| {
+            if (monitor.healthyCount() == 0) return error.DnsTimeout;
+        }
+
         const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
         defer posix.close(sock);
 
@@ -247,20 +249,15 @@ pub const Resolver = struct {
         const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = @intCast(timeout_usec) };
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv));
 
-        const num_servers = self.addrs.len;
-        const now = std.time.timestamp();
-
-        // Try each server starting from round-robin index.
-        // First pass: skip unhealthy servers. Second pass: try unhealthy ones past cooldown.
+        // Try each server starting from round-robin index, skipping
+        // servers the health monitor has marked unhealthy.
         var tried: usize = 0;
-        while (tried < num_servers * 2) : (tried += 1) {
+        while (tried < num_servers) : (tried += 1) {
             const idx = (self.rr_index + tried) % num_servers;
-            const h = &self.health[idx];
 
-            // Skip unhealthy servers on first pass (tried < num_servers)
-            if (tried < num_servers and h.consecutive_failures >= self.config.max_failures) {
-                const elapsed = now - h.last_failure_time;
-                if (elapsed < @as(i64, self.config.health_cooldown_s)) continue;
+            // Skip servers marked unhealthy by the proactive monitor (zero delay)
+            if (self.health_monitor) |monitor| {
+                if (!monitor.isHealthy(idx)) continue;
             }
 
             const addr = self.addrs[idx];
@@ -277,15 +274,10 @@ pub const Resolver = struct {
 
                 if (n < 12) continue;
 
-                // Success — mark server healthy, advance round-robin
-                h.consecutive_failures = 0;
+                // Success — advance round-robin
                 self.rr_index = (idx + 1) % num_servers;
                 return try self.allocator.dupe(u8, buf[0..n]);
             }
-
-            // All retries exhausted for this server — mark failure
-            h.consecutive_failures +|= 1;
-            h.last_failure_time = now;
         }
 
         return error.DnsTimeout;
