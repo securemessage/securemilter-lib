@@ -261,6 +261,7 @@ pub const Worker = struct {
                 continue;
             };
             conn.* = connection_mod.Connection.init(self.allocator, conn_fd, listener_index);
+            conn.setPeerAddr(conn_result.address);
 
             self.connections.put(conn_fd, conn) catch {
                 conn.deinit();

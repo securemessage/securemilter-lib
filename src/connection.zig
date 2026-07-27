@@ -114,6 +114,10 @@ pub const Connection = struct {
     recipients: std.ArrayList([]const u8),
     body_chunks: std.ArrayList([]const u8),
     listener_index: usize,
+    /// Peer IP address of the milter TCP connection (the Postfix instance).
+    /// Format: bare IP string (e.g., "10.99.0.1") or "local" for Unix sockets.
+    peer_addr: [64]u8 = undefined,
+    peer_addr_len: u8 = 0,
 
     pub fn init(allocator: Allocator, fd: posix.fd_t, listener_index: usize) Connection {
         return .{
@@ -129,6 +133,36 @@ pub const Connection = struct {
             .body_chunks = .{},
             .listener_index = listener_index,
         };
+    }
+
+    /// Set the peer address from an accepted connection's address.
+    /// For TCP: formats the IP. For Unix/unknown: stores "local".
+    pub fn setPeerAddr(self: *Connection, addr: std.net.Address) void {
+        var buf: [64]u8 = undefined;
+        const ip_str = switch (addr.any.family) {
+            posix.AF.INET => blk: {
+                const bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
+                break :blk std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch "unknown";
+            },
+            posix.AF.INET6 => std.fmt.bufPrint(&buf, "{any}", .{addr.in6}) catch "unknown",
+            else => "local",
+        };
+        const len: u8 = @intCast(@min(ip_str.len, 64));
+        @memcpy(self.peer_addr[0..len], ip_str[0..len]);
+        self.peer_addr_len = len;
+    }
+
+    /// Get the peer address string. Returns "local" if not set.
+    pub fn getPeerAddr(self: *const Connection) []const u8 {
+        if (self.peer_addr_len == 0) return "local";
+        return self.peer_addr[0..self.peer_addr_len];
+    }
+
+    /// Format the peer field for logging: "{daemon_name}[{ip}]" or "unknown[{ip}]" or "local".
+    pub fn getPeerDisplay(self: *const Connection) struct { name: []const u8, ip: []const u8 } {
+        const ip = self.getPeerAddr();
+        const name = self.macros.daemon_name orelse "unknown";
+        return .{ .name = name, .ip = ip };
     }
 
     pub fn deinit(self: *Connection) void {
