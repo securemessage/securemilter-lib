@@ -12,6 +12,7 @@ const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
 const responses = @import("milter/responses.zig");
 const reload_mod = @import("reload.zig");
+const log_mod = @import("log.zig");
 
 /// Callback interface that product milters implement.
 ///
@@ -139,7 +140,7 @@ pub const Worker = struct {
             if (self.draining) {
                 if (self.connections.count() == 0) break;
                 if (std.time.milliTimestamp() >= drain_deadline) {
-                    std.log.warn("drain timeout, closing {d} remaining connections", .{self.connections.count()});
+                    log_mod.warn("drain timeout, closing {d} remaining connections", .{self.connections.count()});
                     break;
                 }
             }
@@ -160,7 +161,7 @@ pub const Worker = struct {
             const timeout: ?*const posix.timespec = if (self.draining) &drain_ts else null;
             const changelist = self.pending[0..self.pending_len];
             const n = posix.kevent(self.kq, changelist, &events, timeout) catch |err| {
-                std.log.err("kevent error: {}", .{err});
+                log_mod.err("kevent error: {}", .{err});
                 self.pending_len = 0;
                 continue;
             };
@@ -238,7 +239,7 @@ pub const Worker = struct {
         while (true) {
             const conn_result = self.listeners.items[listener_index].accept() catch |err| {
                 if (err == error.WouldBlock) break;
-                std.log.err("accept error: {}", .{err});
+                log_mod.err("accept error: {}", .{err});
                 break;
             };
 
@@ -502,8 +503,11 @@ pub fn spawnPoolWithReload(
 }
 
 fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_connections: u32) void {
+    log_mod.initThread();
+    defer log_mod.deinitThread();
+
     var worker = Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections) catch |err| {
-        std.log.err("worker init failed: {}", .{err});
+        log_mod.err("worker init failed: {}", .{err});
         return;
     };
     defer worker.deinit();

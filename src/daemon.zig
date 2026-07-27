@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
+const log_mod = @import("log.zig");
 
 /// Daemonize the current process (double-fork, setsid, close fds).
 ///
@@ -53,7 +54,7 @@ pub fn raiseFileLimit(needed: u64) void {
         const target = @min(needed, lim.max);
         lim.cur = target;
         _ = c.setrlimit(.NOFILE, &lim);
-        std.log.info("file descriptor limit set to {d} (requested {d}, hard max {d})", .{ target, needed, lim.max });
+        log_mod.info("file descriptor limit set to {d} (requested {d}, hard max {d})", .{ target, needed, lim.max });
     }
 }
 
@@ -119,7 +120,7 @@ pub const ManagedSignals = struct {
         var sig: c_int = 0;
         _ = c.sigwait(&set, &sig);
 
-        std.log.info("shutdown signal {d} received, draining connections...", .{sig});
+        log_mod.info("shutdown signal {d} received, draining connections...", .{sig});
 
         // Close write end — triggers EV_EOF on all worker kqueues
         // (persistent state, wakes all N workers regardless of timing)
@@ -144,10 +145,10 @@ pub const ManagedSignals = struct {
             _ = c.sigwait(&set, &sig);
 
             if (sig == SIGHUP) {
-                std.log.info("SIGHUP received, reloading configuration...", .{});
+                log_mod.info("SIGHUP received, reloading configuration...", .{});
                 if (reload_fn) |cb| cb();
             } else {
-                std.log.info("shutdown signal {d} received, draining connections...", .{sig});
+                log_mod.info("shutdown signal {d} received, draining connections...", .{sig});
                 posix.close(shutdown_pipe_wr);
                 return;
             }
