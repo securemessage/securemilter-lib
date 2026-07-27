@@ -356,7 +356,7 @@ test "parse response with SERVFAIL" {
 test "live TXT query to local resolver" {
     // Only run if we can reach the local DNS
     const resolver = @import("resolver.zig");
-    var res = resolver.Resolver.init(alloc, .{ .nameserver = "127.0.0.1", .timeout_ms = 2000 });
+    var res = resolver.Resolver.init(alloc, .{ .nameservers = &.{"127.0.0.1"}, .timeout_ms = 2000 });
     defer res.deinit();
 
     // Query bambania.com which has a local Unbound entry

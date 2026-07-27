@@ -132,34 +132,62 @@ pub const Cache = struct {
 
 /// DNS resolver configuration.
 pub const ResolverConfig = struct {
-    nameserver: []const u8 = "127.0.0.1",
+    nameservers: []const []const u8 = &.{"127.0.0.1"},
     port: u16 = 53,
     timeout_ms: u32 = 5000,
     retries: u8 = 2,
+    health_cooldown_s: u32 = 30,
+    max_failures: u8 = 3,
 };
 
-/// Synchronous DNS resolver with per-worker caching.
+/// Per-server health state for failover tracking.
+const ServerHealth = struct {
+    consecutive_failures: u8 = 0,
+    last_failure_time: i64 = 0,
+};
+
+/// Synchronous DNS resolver with per-worker caching, multi-server
+/// round-robin, failover, and health monitoring.
 ///
 /// Sends UDP queries and waits for responses with a timeout.
-/// In the full async architecture, the UDP socket fd is registered
-/// in the worker's kqueue and responses are handled as events.
+/// Tries servers in round-robin order, skipping unhealthy ones
+/// unless all are down (then retries after a cooldown period).
 pub const Resolver = struct {
     allocator: Allocator,
     config: ResolverConfig,
     cache: Cache,
     next_id: u16,
+    addrs: []net.Address,
+    health: []ServerHealth,
+    rr_index: usize,
 
     pub fn init(allocator: Allocator, config: ResolverConfig) Resolver {
+        const addrs = allocator.alloc(net.Address, config.nameservers.len) catch
+            @panic("DNS resolver: failed to allocate server addresses");
+        const health = allocator.alloc(ServerHealth, config.nameservers.len) catch
+            @panic("DNS resolver: failed to allocate health state");
+
+        for (config.nameservers, 0..) |ns, i| {
+            addrs[i] = parseNameserver(ns, config.port) catch
+                @panic("DNS resolver: invalid nameserver address");
+            health[i] = .{};
+        }
+
         return .{
             .allocator = allocator,
             .config = config,
             .cache = Cache.init(allocator),
             .next_id = @truncate(@as(u64, @bitCast(std.time.milliTimestamp()))),
+            .addrs = addrs,
+            .health = health,
+            .rr_index = 0,
         };
     }
 
     pub fn deinit(self: *Resolver) void {
         self.cache.deinit();
+        self.allocator.free(self.addrs);
+        self.allocator.free(self.health);
     }
 
     /// Resolve a domain name for the given record type.
@@ -211,29 +239,53 @@ pub const Resolver = struct {
     }
 
     fn sendAndReceive(self: *Resolver, query: []const u8) ![]u8 {
-        const addr = try parseNameserver(self.config.nameserver, self.config.port);
-
         const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
         defer posix.close(sock);
 
-        // Set receive timeout
         const timeout_sec = self.config.timeout_ms / 1000;
         const timeout_usec = (self.config.timeout_ms % 1000) * 1000;
         const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = @intCast(timeout_usec) };
         try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv));
 
-        var attempts: u8 = 0;
-        while (attempts <= self.config.retries) : (attempts += 1) {
-            _ = try posix.sendto(sock, query, 0, &addr.any, addr.getOsSockLen());
+        const num_servers = self.addrs.len;
+        const now = std.time.timestamp();
 
-            var buf: [4096]u8 = undefined;
-            const n = posix.recvfrom(sock, &buf, 0, null, null) catch |err| {
-                if (err == error.WouldBlock) continue; // Timeout, retry
-                return err;
-            };
+        // Try each server starting from round-robin index.
+        // First pass: skip unhealthy servers. Second pass: try unhealthy ones past cooldown.
+        var tried: usize = 0;
+        while (tried < num_servers * 2) : (tried += 1) {
+            const idx = (self.rr_index + tried) % num_servers;
+            const h = &self.health[idx];
 
-            if (n < 12) continue;
-            return try self.allocator.dupe(u8, buf[0..n]);
+            // Skip unhealthy servers on first pass (tried < num_servers)
+            if (tried < num_servers and h.consecutive_failures >= self.config.max_failures) {
+                const elapsed = now - h.last_failure_time;
+                if (elapsed < @as(i64, self.config.health_cooldown_s)) continue;
+            }
+
+            const addr = self.addrs[idx];
+
+            var attempts: u8 = 0;
+            while (attempts <= self.config.retries) : (attempts += 1) {
+                _ = posix.sendto(sock, query, 0, &addr.any, addr.getOsSockLen()) catch continue;
+
+                var buf: [4096]u8 = undefined;
+                const n = posix.recvfrom(sock, &buf, 0, null, null) catch |err| {
+                    if (err == error.WouldBlock) continue;
+                    continue;
+                };
+
+                if (n < 12) continue;
+
+                // Success — mark server healthy, advance round-robin
+                h.consecutive_failures = 0;
+                self.rr_index = (idx + 1) % num_servers;
+                return try self.allocator.dupe(u8, buf[0..n]);
+            }
+
+            // All retries exhausted for this server — mark failure
+            h.consecutive_failures +|= 1;
+            h.last_failure_time = now;
         }
 
         return error.DnsTimeout;
@@ -287,7 +339,16 @@ test "cache miss returns null" {
 }
 
 test "resolver init and deinit" {
-    var resolver = Resolver.init(std.testing.allocator, .{});
-    defer resolver.deinit();
-    try std.testing.expect(resolver.next_id != 0);
+    var r = Resolver.init(std.testing.allocator, .{});
+    defer r.deinit();
+    try std.testing.expect(r.next_id != 0);
+    try std.testing.expectEqual(@as(usize, 1), r.addrs.len);
+}
+
+test "resolver multi-server init" {
+    const servers: []const []const u8 = &.{ "8.8.8.8", "1.1.1.1", "9.9.9.9" };
+    var r = Resolver.init(std.testing.allocator, .{ .nameservers = servers });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 3), r.addrs.len);
+    try std.testing.expectEqual(@as(usize, 0), r.rr_index);
 }
