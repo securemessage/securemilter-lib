@@ -6,6 +6,7 @@ pub const daemon = @import("daemon.zig");
 pub const worker = @import("worker.zig");
 pub const dns = @import("dns.zig");
 pub const auth_results = @import("auth_results.zig");
+pub const auth_stamp = @import("auth_stamp.zig");
 pub const header_scrub = @import("header_scrub.zig");
 pub const zmq = @import("zmq.zig");
 pub const reload = @import("reload.zig");
@@ -21,6 +22,7 @@ test {
     _ = worker;
     _ = dns;
     _ = auth_results;
+    _ = auth_stamp;
     _ = header_scrub;
     _ = zmq;
     _ = reload;
