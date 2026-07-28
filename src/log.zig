@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 const mem = std.mem;
+const escape = @import("escape.zig");
 
 /// Syslog severity levels (RFC 5424 §6.2.1).
 pub const Level = enum(u3) {
@@ -156,6 +157,22 @@ pub const Logger = struct {
 
         var buf: [1024]u8 = undefined;
         const msg = self.format(&buf, level, fmt, args);
+
+        // Backstop for audit X-5: one log line per log call, unconditionally.
+        //
+        // Attacker-derived values are supposed to reach this function already
+        // rendered through `escape.logField`, which keeps each one to a single
+        // bare token. That has to be applied per value at every call site, and a
+        // site added later -- or one missed today -- would silently reopen log
+        // forgery, where an embedded newline writes a second, plausible line
+        // attributing an action to another host.
+        //
+        // Scrubbing the assembled message here makes that impossible regardless
+        // of the call site. It cannot replace `logField`: by this point the
+        // spaces separating fields are indistinguishable from a space inside a
+        // value, so this deliberately leaves spaces alone and only guarantees
+        // that the line is one line.
+        escape.scrubControlBytes(buf[0..msg.len]);
 
         if (self.config.use_syslog) {
             self.sendSyslog(msg);
@@ -326,6 +343,29 @@ test "Logger format output" {
 
     // PRI for mail(2) + info(6) = 2*8+6 = 22
     try std.testing.expect(mem.startsWith(u8, msg, "<22>test[12345]: hello world 42"));
+}
+
+// X-5: a call site that forgets `escape.logField` still cannot forge a log line.
+test "the assembled message can never contain a line break" {
+    var cfg = LogConfig.init(false, .mail, .debug, "test");
+    var log_inst = Logger{
+        .fd = Logger.NO_FD,
+        .config = &cfg,
+        .pid = 1,
+    };
+
+    // Deliberately interpolated raw, the way a missed call site would.
+    const hostile = "victim.example\nJul 28 18:00:00 host securespf[1]: from=attacker.example result=pass";
+
+    var buf: [1024]u8 = undefined;
+    const msg = log_inst.format(&buf, .info, "from={s}", .{hostile});
+    escape.scrubControlBytes(buf[0..msg.len]);
+
+    try std.testing.expect(mem.indexOfScalar(u8, msg, '\n') == null);
+    try std.testing.expect(mem.indexOfScalar(u8, msg, '\r') == null);
+
+    // Still one syslog line, so the forged second line is inert text within it.
+    try std.testing.expectEqual(@as(usize, 1), mem.count(u8, msg, "<22>test[1]:"));
 }
 
 test "Logger level check skips disabled levels" {

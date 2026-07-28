@@ -7,6 +7,7 @@ const Kevent = posix.Kevent;
 
 const listener_mod = @import("listener.zig");
 const connection_mod = @import("connection.zig");
+const escape = @import("escape.zig");
 const codec = @import("milter/codec.zig");
 const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
@@ -456,8 +457,13 @@ pub const Worker = struct {
             if (first_overflow and conn.headers_overflow) {
                 const peer = conn.getPeerDisplay();
                 log_mod.warn(
-                    "header limit reached ({d} headers, {d} bytes) from {s}[{s}]: message will not be authenticated",
-                    .{ conn.headers.items.len, conn.header_bytes, peer.name, peer.ip },
+                    "header limit reached ({d} headers, {d} bytes) from {f}[{f}]: message will not be authenticated",
+                    .{
+                        conn.headers.items.len,
+                        conn.header_bytes,
+                        escape.logField(peer.name),
+                        escape.logField(peer.ip),
+                    },
                 );
             } else if (e != error.TooManyHeaders) {
                 // Allocation failure rather than a cap. The list is short by at
@@ -503,9 +509,16 @@ pub const Worker = struct {
         // message can be delivered.
         if (conn.headers_overflow) {
             const peer = conn.getPeerDisplay();
+            // The peer name comes from rDNS the sender may control, so it is
+            // rendered as a single bare token (audit X-5).
             log_mod.warn(
-                "tempfail: header block from {s}[{s}] exceeded MaxHeaders={d}/MaxHeaderBytes={d} and could not be inspected in full",
-                .{ peer.name, peer.ip, conn.limits.max_headers, conn.limits.max_header_bytes },
+                "tempfail: header block from {f}[{f}] exceeded MaxHeaders={d}/MaxHeaderBytes={d} and could not be inspected in full",
+                .{
+                    escape.logField(peer.name),
+                    escape.logField(peer.ip),
+                    conn.limits.max_headers,
+                    conn.limits.max_header_bytes,
+                },
             );
             self.sendResponse(conn, @intFromEnum(responses.Code.tempfail));
             conn.resetMessage();
