@@ -55,8 +55,13 @@ pub const BoundListener = struct {
         return self.fd;
     }
 
+    /// Close the listening socket. Idempotent: the drain path closes
+    /// listeners before Worker.deinit() runs, and a second close would
+    /// hit EBADF in posix.close (unreachable → abort).
     pub fn close(self: *BoundListener) void {
+        if (self.fd < 0) return;
         self.server.stream.close();
+        self.fd = -1;
     }
 
     /// Accept a connection (non-blocking).
