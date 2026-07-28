@@ -15,7 +15,13 @@ pub const Packet = struct {
 /// Result of a readPacket attempt on a non-blocking socket.
 pub const ReadResult = union(enum) {
     packet: Packet,
+    /// More bytes are needed to complete the current packet; they may
+    /// already be sitting in the kernel buffer, so the caller should
+    /// feed again before returning to the event loop.
     incomplete,
+    /// The socket has no more buffered bytes; the caller should return
+    /// to the event loop.
+    would_block,
     closed,
     err: anyerror,
 };
@@ -60,7 +66,7 @@ pub const PacketReader = struct {
 
         const n = posix.read(fd, &read_buf) catch |e| {
             return switch (e) {
-                error.WouldBlock => .incomplete,
+                error.WouldBlock => .would_block,
                 else => .{ .err = e },
             };
         };

@@ -276,38 +276,41 @@ pub const Worker = struct {
     fn handleConnectionData(self: *Worker, fd: posix.fd_t) void {
         const conn = self.connections.get(fd) orelse return;
 
-        const result = conn.reader.feed(fd);
-        switch (result) {
-            .packet => |pkt| {
-                self.dispatchPacket(conn, pkt);
-                // Connection may have been removed by dispatchPacket
-                // (e.g., sendResponse write failure → removeConnection)
-                if (self.connections.get(fd) == null) return;
-                conn.reader.consume();
-            },
-            .incomplete => return,
-            .closed => {
-                self.removeConnection(fd);
-                return;
-            },
-            .err => {
-                self.removeConnection(fd);
-                return;
-            },
-        }
-
-        // Process any additional complete packets already buffered
-        // (Postfix often sends multiple commands in one TCP segment)
+        // Drain the socket and every buffered packet. A partial packet
+        // (.incomplete) means the rest may already sit in the kernel
+        // buffer, so keep feeding; feed() reports .would_block only once
+        // the socket is actually drained. Yielding to the event loop on a
+        // partial packet would wait for a kqueue edge that never arrives
+        // once the peer's send window fills.
         while (true) {
             if (self.connections.get(fd) == null) return; // connection was removed
-            const next = conn.reader.tryDecode();
-            switch (next) {
+
+            switch (conn.reader.feed(fd)) {
                 .packet => |pkt| {
                     self.dispatchPacket(conn, pkt);
                     if (self.connections.get(fd) == null) return;
                     conn.reader.consume();
+                    // More complete packets may already be buffered
+                    // (Postfix pipelines commands); tryDecode without
+                    // another read() before looping back to feed().
+                    while (self.connections.get(fd) != null) {
+                        switch (conn.reader.tryDecode()) {
+                            .packet => |next| {
+                                self.dispatchPacket(conn, next);
+                                if (self.connections.get(fd) == null) return;
+                                conn.reader.consume();
+                            },
+                            .incomplete => break,
+                            .would_block => break,
+                            .closed, .err => {
+                                self.removeConnection(fd);
+                                return;
+                            },
+                        }
+                    }
                 },
-                .incomplete => return,
+                .incomplete => continue,
+                .would_block => return,
                 .closed => {
                     self.removeConnection(fd);
                     return;
