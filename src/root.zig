@@ -9,6 +9,7 @@ pub const auth_results = @import("auth_results.zig");
 pub const header_scrub = @import("header_scrub.zig");
 pub const zmq = @import("zmq.zig");
 pub const reload = @import("reload.zig");
+pub const rcu = @import("rcu.zig");
 pub const log = @import("log.zig");
 
 test {
@@ -23,5 +24,6 @@ test {
     _ = header_scrub;
     _ = zmq;
     _ = reload;
+    _ = rcu;
     _ = log;
 }

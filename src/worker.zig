@@ -74,12 +74,18 @@ pub const Worker = struct {
     config_gen: ?*const reload_mod.ConfigGeneration,
     local_generation: u64,
     max_connections: u32,
+    /// Index of this worker's quiescent-state slot in `config_gen`.
+    worker_index: usize,
+    /// Read end of this worker's wakeup pipe, or -1. A byte here means only
+    /// "wake up": it exists so a reload can pull an otherwise idle worker to
+    /// the top of its loop, where it announces quiescence.
+    wakeup_fd: posix.fd_t,
 
     pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t) !Worker {
-        return initWithReload(allocator, addresses, callbacks, shutdown_pipe, null, DEFAULT_MAX_CONNECTIONS);
+        return initWithReload(allocator, addresses, callbacks, shutdown_pipe, null, DEFAULT_MAX_CONNECTIONS, 0, -1);
     }
 
-    pub fn initWithReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_conn: u32) !Worker {
+    pub fn initWithReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_conn: u32, worker_index: usize, wakeup_fd: posix.fd_t) !Worker {
         const kq = try posix.kqueue();
 
         var self = Worker{
@@ -96,10 +102,13 @@ pub const Worker = struct {
             .config_gen = config_gen,
             .local_generation = if (config_gen) |cg| cg.load() else 0,
             .max_connections = max_conn,
+            .worker_index = worker_index,
+            .wakeup_fd = wakeup_fd,
         };
 
         // Stage initial registrations — flushed on first kevent() call
         self.stageRead(shutdown_pipe);
+        if (wakeup_fd >= 0) self.stageRead(wakeup_fd);
 
         for (addresses) |addr| {
             const bound = try listener_mod.bind(addr);
@@ -123,6 +132,7 @@ pub const Worker = struct {
         }
         self.listeners.deinit(self.allocator);
 
+        if (self.wakeup_fd >= 0) posix.close(self.wakeup_fd);
         posix.close(self.kq);
     }
 
@@ -145,10 +155,24 @@ pub const Worker = struct {
                 }
             }
 
-            // Check for config reload (SIGHUP): compare local generation
-            // to global. If stale, notify the product via on_reload callback
-            // (e.g., flush LRU key cache) and advance local snapshot.
+            // Top of the loop is the quiescent point: every reference this
+            // worker took to shared configuration while handling the previous
+            // batch of events has been dropped, and it has not yet acquired
+            // one for the next. Announcing it here — and only here — is what
+            // lets the main thread free retired configuration without racing
+            // us (audit X-2; see reload.zig and rcu.zig).
+            //
+            // This must stay above the kevent() call. Announcing after the
+            // wait would leave the slot stale for as long as the worker sits
+            // idle, which delays reclamation; announcing mid-batch would be
+            // worse than useless, since it would licence freeing memory a
+            // half-finished message is still reading.
             if (self.config_gen) |cg| {
+                cg.quiesce(self.worker_index);
+
+                // Then the reload notification: compare local generation to
+                // global and, if stale, let the product drop thread-local
+                // caches (e.g. its DNS resolver).
                 const current = cg.load();
                 if (current != self.local_generation) {
                     self.local_generation = current;
@@ -176,6 +200,14 @@ pub const Worker = struct {
                         self.beginDrain();
                         drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
                     }
+                } else if (self.wakeup_fd >= 0 and fd == self.wakeup_fd) {
+                    // Waking was the whole point; the quiescent announcement
+                    // happens at the top of the next iteration. Just drain the
+                    // byte so the pipe does not stay readable.
+                    var sink: [64]u8 = undefined;
+                    while (posix.read(self.wakeup_fd, &sink)) |got| {
+                        if (got < sink.len) break;
+                    } else |_| {}
                 } else if (self.isListenFd(fd)) {
                     if (!self.draining) self.handleAccept(fd);
                 } else if (ev.flags & 0x8000 != 0) { // EV_EOF = 0x8000 on FreeBSD
@@ -486,32 +518,47 @@ pub fn spawnPool(
 /// Workers poll it each event loop iteration and call callbacks.on_reload
 /// when the generation advances.
 /// `max_connections` is the per-worker connection limit for backpressure.
+///
+/// This is also where the quiescent-state slots are allocated, because this is
+/// the first point at which the real worker count is known (`num_workers` of 0
+/// means "one per CPU"). Allocating here rather than in each daemon keeps the
+/// slot count and the thread count impossible to disagree about — a worker
+/// without a slot would silently never be waited for, and configuration could
+/// be freed while it was reading.
 pub fn spawnPoolWithReload(
     allocator: Allocator,
     num_workers: u32,
     addresses: []const listener_mod.ListenAddress,
     callbacks: Callbacks,
     shutdown_pipe_rd: posix.fd_t,
-    config_gen: ?*const reload_mod.ConfigGeneration,
+    config_gen: ?*reload_mod.ConfigGeneration,
     max_connections: u32,
 ) !std.ArrayList(std.Thread) {
     var threads: std.ArrayList(std.Thread) = .{};
 
     const count = if (num_workers == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else num_workers;
 
-    for (0..count) |_| {
-        const t = try std.Thread.spawn(.{}, workerEntryReload, .{ allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections });
+    var wakeup_rd: []posix.fd_t = &.{};
+    defer if (wakeup_rd.len != 0) allocator.free(wakeup_rd);
+    if (config_gen) |cg| {
+        try cg.initSlots(allocator, count);
+        wakeup_rd = try cg.initWakeup(allocator, count);
+    }
+
+    for (0..count) |index| {
+        const wake_fd: posix.fd_t = if (index < wakeup_rd.len) wakeup_rd[index] else -1;
+        const t = try std.Thread.spawn(.{}, workerEntryReload, .{ allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections, index, wake_fd });
         try threads.append(allocator, t);
     }
 
     return threads;
 }
 
-fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_connections: u32) void {
+fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe_rd: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_connections: u32, worker_index: usize, wakeup_fd: posix.fd_t) void {
     log_mod.initThread();
     defer log_mod.deinitThread();
 
-    var worker = Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections) catch |err| {
+    var worker = Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections, worker_index, wakeup_fd) catch |err| {
         log_mod.err("worker init failed: {}", .{err});
         return;
     };
