@@ -41,11 +41,54 @@ pub const TxtIterator = struct {
     }
 };
 
+/// Why a name produced no usable answer.
+///
+/// SPF cannot reconstruct this distinction after the fact and needs it:
+/// RFC 7208 §4.6.4 counts an authoritative "no such name" as a *void lookup*
+/// and lets evaluation continue, whereas a SERVFAIL or a timeout is transient
+/// and must become `temperror`. Collapsing the two into one error made a
+/// momentary nameserver hiccup look like proof that a mechanism did not match,
+/// which is how a legitimate sender ends up rejected by a `-all`.
+pub const NegativeKind = enum {
+    /// RCODE 3. The name itself does not exist.
+    name_error,
+    /// RCODE 2, or any other server-side refusal.
+    server_failure,
+    /// No usable reply arrived within the timeout.
+    timeout,
+
+    pub fn toError(self: NegativeKind) anyerror {
+        return switch (self) {
+            .name_error => error.DnsNameError,
+            .server_failure => error.DnsServerFailure,
+            .timeout => error.DnsTimeout,
+        };
+    }
+
+    /// True when the name is known not to exist, as opposed to the answer being
+    /// merely unavailable right now.
+    pub fn isAuthoritative(self: NegativeKind) bool {
+        return self == .name_error;
+    }
+};
+
+/// Classify a resolver error for callers that must distinguish "there is no such
+/// name" from "ask again later".
+///
+/// Anything that is not an authoritative name error is treated as transient,
+/// which is the safe direction: reporting `temperror` for a permanent condition
+/// costs a retry, while reporting a verdict for a transient one can reject mail
+/// that would otherwise have been delivered.
+pub fn isTransientError(err: anyerror) bool {
+    return err != error.DnsNameError;
+}
+
 /// TTL-aware DNS cache entry.
 const CacheEntry = struct {
     answers: []packet.Answer,
     expires_at: i64,
-    is_negative: bool,
+    /// Null for a positive entry; otherwise why the lookup produced nothing.
+    negative: ?NegativeKind,
 };
 
 /// Per-worker DNS cache with TTL expiry, max size, negative caching, and FIFO eviction.
@@ -108,12 +151,21 @@ pub const Cache = struct {
         try self.insertEntry(key, .{
             .answers = duped,
             .expires_at = std.time.timestamp() + @as(i64, min_ttl),
-            .is_negative = false,
+            .negative = null,
         });
     }
 
-    /// Cache a negative result (NXDOMAIN, SERVFAIL, or empty response).
-    pub fn putNegative(self: *Cache, domain: []const u8, rtype: packet.RecordType) !void {
+    /// Cache a negative result, remembering *why* it was negative.
+    ///
+    /// The kind has to be stored, not just the fact: a cached timeout that came
+    /// back as an authoritative-looking failure would let one dropped packet
+    /// suppress a domain for the whole negative TTL.
+    pub fn putNegative(
+        self: *Cache,
+        domain: []const u8,
+        rtype: packet.RecordType,
+        kind: NegativeKind,
+    ) !void {
         const key = try self.makeCacheKey(domain, rtype);
         errdefer self.allocator.free(key);
 
@@ -121,7 +173,7 @@ pub const Cache = struct {
         try self.insertEntry(key, .{
             .answers = &.{},
             .expires_at = std.time.timestamp() + @as(i64, self.negative_ttl),
-            .is_negative = true,
+            .negative = kind,
         });
     }
 
@@ -146,7 +198,7 @@ pub const Cache = struct {
     fn insertEntry(self: *Cache, key: []u8, entry: CacheEntry) !void {
         const result = try self.entries.getOrPut(key);
         if (result.found_existing) {
-            if (!result.value_ptr.is_negative) self.freeEntry(result.value_ptr.*);
+            if (result.value_ptr.negative == null) self.freeEntry(result.value_ptr.*);
             self.allocator.free(key);
         } else {
             try self.insertion_order.append(self.allocator, key);
@@ -181,7 +233,7 @@ pub const Cache = struct {
 
     fn removeByIndex(self: *Cache, idx: usize, key: []u8) void {
         if (self.entries.fetchRemove(key)) |kv| {
-            if (!kv.value.is_negative) self.freeEntry(kv.value);
+            if (kv.value.negative == null) self.freeEntry(kv.value);
             self.allocator.free(kv.key);
         }
         _ = self.insertion_order.orderedRemove(idx);
@@ -263,9 +315,9 @@ pub const Resolver = struct {
         defer self.allocator.free(cache_key);
 
         if (self.cache.get(cache_key)) |entry| {
-            if (entry.is_negative) {
-                log_mod.debug("dns: cache negative hit {s}", .{domain});
-                return error.DnsError;
+            if (entry.negative) |kind| {
+                log_mod.debug("dns: cache negative hit {s} kind={s}", .{ domain, @tagName(kind) });
+                return kind.toError();
             }
             log_mod.debug("dns: cache hit {s}", .{domain});
             const duped = try self.cache.dupeAnswers(entry.answers);
@@ -283,8 +335,13 @@ pub const Resolver = struct {
         const response_data = self.sendAndReceive(query_pkt) catch |err| {
             const query_elapsed = @divFloor(std.time.nanoTimestamp() - query_start, 1_000_000);
             log_mod.debug("dns: query {s} failed err={} elapsed={d}ms", .{ domain, err, query_elapsed });
-            // Cache negative result on timeout (transient failure)
-            if (err == error.DnsTimeout) self.cache.putNegative(domain, rtype) catch {};
+            // Remember a timeout so a dead nameserver is not re-hammered for
+            // every message, but remember it *as* a timeout: replaying it as a
+            // generic failure would let one dropped packet look like an
+            // authoritative answer for the whole negative TTL.
+            if (err == error.DnsTimeout) {
+                self.cache.putNegative(domain, rtype, .timeout) catch {};
+            }
             return err;
         };
         defer self.allocator.free(response_data);
@@ -294,9 +351,15 @@ pub const Resolver = struct {
 
         if (response.id != query_id) return error.IdMismatch;
         if (response.rcode != .no_error) {
-            // Cache NXDOMAIN/SERVFAIL as negative
-            self.cache.putNegative(domain, rtype) catch {};
-            return error.DnsError;
+            // RCODE 3 is the only one that says anything permanent about the
+            // name. Everything else is the server declining to answer, and is
+            // classified transient so a caller cannot mistake it for a verdict.
+            const kind: NegativeKind = if (response.rcode == .name_error)
+                .name_error
+            else
+                .server_failure;
+            self.cache.putNegative(domain, rtype, kind) catch {};
+            return kind.toError();
         }
 
         // Cache the positive result
@@ -405,7 +468,7 @@ test "cache put and get" {
     try std.testing.expect(cached != null);
     try std.testing.expectEqual(@as(usize, 1), cached.?.answers.len);
     try std.testing.expectEqualStrings("v=spf1 -all", cached.?.answers[0].data);
-    try std.testing.expect(!cached.?.is_negative);
+    try std.testing.expect(cached.?.negative == null);
 }
 
 test "cache miss returns null" {
@@ -421,13 +484,36 @@ test "cache negative entry" {
     var cache = Cache.init(std.testing.allocator, 1000, 60);
     defer cache.deinit();
 
-    try cache.putNegative("nxdomain.com", .TXT);
+    try cache.putNegative("nxdomain.com", .TXT, .name_error);
 
     const key = try cache.makeCacheKey("nxdomain.com", .TXT);
     defer std.testing.allocator.free(key);
     const cached = cache.get(key);
     try std.testing.expect(cached != null);
-    try std.testing.expect(cached.?.is_negative);
+    try std.testing.expectEqual(NegativeKind.name_error, cached.?.negative.?);
+}
+
+test "a cached timeout does not masquerade as a name error" {
+    // One dropped packet must not suppress a domain for the whole negative TTL
+    // by looking like an authoritative "no such name". SPF reads that difference
+    // to decide between temperror and a verdict.
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
+    defer cache.deinit();
+
+    try cache.putNegative("slow.example", .A, .timeout);
+    const key = try cache.makeCacheKey("slow.example", .A);
+    defer std.testing.allocator.free(key);
+
+    const kind = cache.get(key).?.negative.?;
+    try std.testing.expectEqual(NegativeKind.timeout, kind);
+    try std.testing.expectEqual(error.DnsTimeout, kind.toError());
+    try std.testing.expect(!kind.isAuthoritative());
+    try std.testing.expect(isTransientError(kind.toError()));
+
+    // And the authoritative case is the only one that is not transient.
+    try std.testing.expect(NegativeKind.name_error.isAuthoritative());
+    try std.testing.expect(!isTransientError(error.DnsNameError));
+    try std.testing.expect(isTransientError(error.DnsServerFailure));
 }
 
 test "cache eviction when full" {
