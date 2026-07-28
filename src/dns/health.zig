@@ -4,6 +4,7 @@ const posix = std.posix;
 const net = std.net;
 const Allocator = mem.Allocator;
 const packet = @import("packet.zig");
+const daemon_mod = @import("../daemon.zig");
 
 /// Maximum number of nameservers supported.
 pub const MAX_SERVERS = 8;
@@ -99,6 +100,26 @@ pub const HealthMonitor = struct {
     }
 
     fn probeLoop(self: *HealthMonitor) void {
+        // Block the daemon-managed signals in this thread before doing anything
+        // else.
+        //
+        // A thread inherits its signal mask from whoever spawned it, and the
+        // daemons all block these signals in main() only just before spawning
+        // their worker pool — which is *after* this monitor starts. That left
+        // this thread as the only one in the process with SIGHUP unblocked
+        // (audit X-7). The main thread normally wins a SIGHUP because it is
+        // parked in sigwait(), but while it is away running the reload callback
+        // it is not a candidate, and the kernel then delivers to the first
+        // thread that does not block the signal — this one — where the default
+        // action for SIGHUP is to terminate the process. SIGHUP does not dump
+        // core, so the daemon vanished with no core and no kernel log line.
+        //
+        // Fixing the call order in the daemons is the real fix and is done, but
+        // that correctness then depends on four separate main() functions
+        // keeping two statements in the right order forever. Blocking here as
+        // well makes the invariant belong to the thread that needs it.
+        daemon_mod.ManagedSignals.blockForKqueue();
+
         // Initial probe immediately on startup
         self.probeAll();
 

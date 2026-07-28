@@ -104,7 +104,17 @@ pub const ManagedSignals = struct {
     pub const SIGINT = 2;
     pub const SIGPIPE = 13;
 
-    /// Block signals so they're delivered via kqueue EVFILT_SIGNAL.
+    /// Block the managed signals in the calling thread so they can only be
+    /// taken by `sigwait` in the signal loop.
+    ///
+    /// Call this before spawning *any* thread, not merely before the worker
+    /// pool. `sigprocmask` affects one thread, and a new thread inherits the
+    /// mask in force when it is created, so every thread spawned before this
+    /// call keeps the signals unblocked. That is not cosmetic: while the main
+    /// thread is away from `sigwait` running a reload, the kernel delivers a
+    /// SIGHUP to the first thread that does not block it, and the default
+    /// action there terminates the process — with no core and no kernel log
+    /// line, because SIGHUP does not dump core (audit X-7).
     pub fn blockForKqueue() void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGHUP);
@@ -117,8 +127,8 @@ pub const ManagedSignals = struct {
     /// Wait for a shutdown signal (SIGTERM/SIGINT) using sigwait,
     /// then write to the shutdown pipe to wake all worker threads.
     ///
-    /// Call blockForKqueue() before spawning workers so signals are
-    /// blocked in all threads and delivered only via sigwait here.
+    /// Call blockForKqueue() before spawning any thread so signals are
+    /// blocked in all of them and delivered only via sigwait here.
     pub fn waitForShutdown(shutdown_pipe_wr: posix.fd_t) void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGTERM);
@@ -140,7 +150,11 @@ pub const ManagedSignals = struct {
     /// On SIGTERM/SIGINT: closes the shutdown pipe and returns.
     ///
     /// This replaces waitForShutdown() when live reload is desired.
-    /// Call blockForKqueue() before spawning workers.
+    ///
+    /// Call blockForKqueue() before spawning any thread. Note that this loop is
+    /// only a sigwait candidate while it is actually parked in sigwait: for as
+    /// long as `reload_fn` is running, a signal arriving must go to some other
+    /// thread, and any thread that does not block it will act on it.
     pub fn signalLoop(shutdown_pipe_wr: posix.fd_t, reload_fn: ?*const fn () void) void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGTERM);
