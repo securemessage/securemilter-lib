@@ -353,6 +353,7 @@ pub const Worker = struct {
             self.removeConnection(conn.fd);
             return;
         };
+        conn.negotiated_actions = negotiate.grantedActions(self.callbacks.required_actions, offer);
         const resp = negotiate.buildResponse(self.callbacks.required_actions, self.callbacks.skip_flags, offer);
         codec.writePacket(conn.fd, &resp) catch {
             self.removeConnection(conn.fd);

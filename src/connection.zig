@@ -4,6 +4,7 @@ const posix = std.posix;
 const Allocator = mem.Allocator;
 const codec = @import("milter/codec.zig");
 const commands = @import("milter/commands.zig");
+const negotiate = @import("milter/negotiate.zig");
 
 /// Milter conversation state — tracks where we are in the SMTP lifecycle.
 pub const State = enum {
@@ -114,6 +115,9 @@ pub const Connection = struct {
     recipients: std.ArrayList([]const u8),
     body_chunks: std.ArrayList([]const u8),
     listener_index: usize,
+    /// Actions the MTA granted during OPTNEG. A milter must not send a
+    /// modification packet for an action that was not negotiated.
+    negotiated_actions: negotiate.ActionFlags = .{},
     /// Peer IP address of the milter TCP connection (the Postfix instance).
     /// Format: bare IP string (e.g., "10.99.0.1") or "local" for Unix sockets.
     peer_addr: [64]u8 = undefined,
@@ -198,6 +202,17 @@ pub const Connection = struct {
         errdefer self.allocator.free(name_dup);
         const value_dup = try self.allocator.dupe(u8, value);
         try self.headers.append(self.allocator, .{ .name = name_dup, .value = value_dup });
+    }
+
+    /// Drop a header from the accumulated list, preserving the order of the
+    /// rest. Used after telling the MTA to delete it, so that product logic
+    /// running later in the same end-of-message pass cannot read a header the
+    /// delivered message will not contain.
+    pub fn removeHeader(self: *Connection, index: usize) void {
+        if (index >= self.headers.items.len) return;
+        const hdr = self.headers.orderedRemove(index);
+        self.allocator.free(hdr.name);
+        self.allocator.free(hdr.value);
     }
 
     /// Store envelope sender from SMFIC_MAIL.

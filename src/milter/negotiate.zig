@@ -57,6 +57,15 @@ pub const MtaOffer = struct {
     protocol: ProtocolFlags,
 };
 
+/// Resolve which actions the milter may actually perform: the intersection of
+/// what it asked for and what the MTA offered. Sending a modification packet
+/// for an action outside this set is a protocol violation.
+pub fn grantedActions(requested: ActionFlags, mta_offer: MtaOffer) ActionFlags {
+    const offered: u32 = @bitCast(mta_offer.actions);
+    const wanted: u32 = @bitCast(requested);
+    return @bitCast(offered & wanted);
+}
+
 /// Build an OPTNEG response payload for the milter.
 ///
 /// The milter MUST only set flags that the MTA offered.
@@ -72,9 +81,8 @@ pub fn buildResponse(
 
     std.mem.writeInt(u32, buf[1..5], MILTER_VERSION, .big);
 
-    const offered_actions: u32 = @bitCast(mta_offer.actions);
-    const wanted_actions: u32 = @bitCast(requested_actions);
-    std.mem.writeInt(u32, buf[5..9], offered_actions & wanted_actions, .big);
+    const granted: u32 = @bitCast(grantedActions(requested_actions, mta_offer));
+    std.mem.writeInt(u32, buf[5..9], granted, .big);
 
     const offered_protocol: u32 = @bitCast(mta_offer.protocol);
     const wanted_protocol: u32 = @bitCast(requested_protocol);
