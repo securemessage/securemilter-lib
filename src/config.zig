@@ -39,6 +39,19 @@ pub const Config = struct {
             return std.fmt.parseInt(T, val, 10) catch default;
         }
 
+        /// Read a byte count, accepting an optional K/M/G suffix.
+        ///
+        /// Message size limits are naturally written as "10M", not 10485760;
+        /// Postfix-adjacent configuration is where operators set these, so the
+        /// spelling should match. Suffixes are binary multiples and
+        /// case-insensitive, a trailing "B" is allowed ("10MB"), and anything
+        /// unparseable or overflowing falls back to `default` rather than
+        /// silently becoming a smaller number.
+        pub fn getSize(self: *const Section, key: []const u8, default: usize) usize {
+            const raw = self.entries.get(key) orelse return default;
+            return parseSize(raw) orelse default;
+        }
+
         fn deinit(self: *Section, allocator: Allocator) void {
             var it = self.entries.iterator();
             while (it.next()) |entry| {
@@ -202,6 +215,80 @@ fn parseBool(val: []const u8) ?bool {
         return null;
     };
     return lower;
+}
+
+/// Parse a byte count with an optional binary K/M/G suffix.
+///
+/// Returns null on anything it cannot represent exactly, including overflow.
+/// Callers fall back to their default in that case: quietly wrapping a size
+/// limit round to a small number would turn a typo into an outage.
+fn parseSize(val: []const u8) ?usize {
+    var s = std.mem.trim(u8, val, " \t");
+    if (s.len == 0) return null;
+
+    // Optional trailing "B", so "10M", "10MB" and "512B" all work. A plain
+    // byte count never ends in B, so this is unconditional.
+    if (s.len >= 2 and (s[s.len - 1] == 'b' or s[s.len - 1] == 'B')) {
+        s = s[0 .. s.len - 1];
+    }
+
+    var multiplier: usize = 1;
+    if (s.len >= 2) {
+        switch (s[s.len - 1]) {
+            'k', 'K' => multiplier = 1024,
+            'm', 'M' => multiplier = 1024 * 1024,
+            'g', 'G' => multiplier = 1024 * 1024 * 1024,
+            else => {},
+        }
+        if (multiplier != 1) s = s[0 .. s.len - 1];
+    }
+
+    const base = std.fmt.parseInt(usize, std.mem.trim(u8, s, " \t"), 10) catch return null;
+    if (multiplier == 1) return base;
+    return std.math.mul(usize, base, multiplier) catch null;
+}
+
+test "parseSize accepts plain byte counts" {
+    try std.testing.expectEqual(@as(?usize, 0), parseSize("0"));
+    try std.testing.expectEqual(@as(?usize, 10485760), parseSize("10485760"));
+    try std.testing.expectEqual(@as(?usize, 512), parseSize("  512  "));
+}
+
+test "parseSize accepts binary suffixes" {
+    try std.testing.expectEqual(@as(?usize, 1024), parseSize("1K"));
+    try std.testing.expectEqual(@as(?usize, 1024), parseSize("1k"));
+    try std.testing.expectEqual(@as(?usize, 10 * 1024 * 1024), parseSize("10M"));
+    try std.testing.expectEqual(@as(?usize, 10 * 1024 * 1024), parseSize("10MB"));
+    try std.testing.expectEqual(@as(?usize, 2 * 1024 * 1024 * 1024), parseSize("2g"));
+    try std.testing.expectEqual(@as(?usize, 25 * 1024 * 1024), parseSize(" 25 M "));
+    // A bare "B" suffix is a byte count, not a rejected unit.
+    try std.testing.expectEqual(@as(?usize, 512), parseSize("512B"));
+    try std.testing.expectEqual(@as(?usize, 1), parseSize("1b"));
+}
+
+test "parseSize rejects rather than truncates" {
+    try std.testing.expectEqual(@as(?usize, null), parseSize(""));
+    try std.testing.expectEqual(@as(?usize, null), parseSize("M"));
+    try std.testing.expectEqual(@as(?usize, null), parseSize("10X"));
+    try std.testing.expectEqual(@as(?usize, null), parseSize("ten"));
+    try std.testing.expectEqual(@as(?usize, null), parseSize("-1"));
+    try std.testing.expectEqual(@as(?usize, null), parseSize("1.5M"));
+    // Overflow must not wrap into a small, silently-enforced limit.
+    try std.testing.expectEqual(@as(?usize, null), parseSize("99999999999999999999G"));
+}
+
+test "getSize falls back to the default on a bad value" {
+    const source =
+        \\MaxBodyBytes = 25M
+        \\MaxHeaderBytes = bogus
+    ;
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    const global = cfg.global().?;
+
+    try std.testing.expectEqual(@as(usize, 25 * 1024 * 1024), global.getSize("MaxBodyBytes", 1));
+    try std.testing.expectEqual(@as(usize, 4096), global.getSize("MaxHeaderBytes", 4096));
+    try std.testing.expectEqual(@as(usize, 7), global.getSize("NotPresent", 7));
 }
 
 test "parse empty config" {

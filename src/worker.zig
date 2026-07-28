@@ -36,6 +36,12 @@ pub const Callbacks = struct {
 
     required_actions: negotiate.ActionFlags = .{ .add_headers = true },
     skip_flags: negotiate.ProtocolFlags = .{},
+
+    /// Caps applied to every connection this pool accepts. Carried here beside
+    /// `required_actions` and `skip_flags` — the worker behaviour a product
+    /// milter chooses — so the daemons already building this struct need no new
+    /// plumbing to set them.
+    limits: connection_mod.Limits = .{},
 };
 
 /// Configuration for the worker pool.
@@ -292,7 +298,7 @@ pub const Worker = struct {
                 posix.close(conn_fd);
                 continue;
             };
-            conn.* = connection_mod.Connection.init(self.allocator, conn_fd, listener_index);
+            conn.* = connection_mod.Connection.init(self.allocator, conn_fd, listener_index, self.callbacks.limits);
             conn.setPeerAddr(conn_result.address);
 
             self.connections.put(conn_fd, conn) catch {
@@ -441,7 +447,25 @@ pub const Worker = struct {
             self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
-        conn.addHeader(hdr.name, hdr.value) catch {};
+        // Report the first rejection only: a flood would otherwise turn one
+        // abusive message into thousands of log lines, which is its own denial
+        // of service. `addHeader` latches the flag, so end-of-message still
+        // knows the list is incomplete however many headers followed.
+        const first_overflow = !conn.headers_overflow;
+        conn.addHeader(hdr.name, hdr.value) catch |e| {
+            if (first_overflow and conn.headers_overflow) {
+                const peer = conn.getPeerDisplay();
+                log_mod.warn(
+                    "header limit reached ({d} headers, {d} bytes) from {s}[{s}]: message will not be authenticated",
+                    .{ conn.headers.items.len, conn.header_bytes, peer.name, peer.ip },
+                );
+            } else if (e != error.TooManyHeaders) {
+                // Allocation failure rather than a cap. The list is short by at
+                // least one header, so the same rule applies.
+                conn.headers_overflow = true;
+                log_mod.err("header accumulation failed: {}", .{e});
+            }
+        };
         conn.state = .headers;
         const resp = if (self.callbacks.on_header) |cb| cb(conn, hdr.name, hdr.value) else @intFromEnum(responses.Code.@"continue");
         self.sendResponse(conn, resp);
@@ -461,6 +485,33 @@ pub const Worker = struct {
 
     fn handleEom(self: *Worker, conn: *connection_mod.Connection) void {
         conn.state = .end_of_message;
+
+        // A header block we did not see in full must not be delivered.
+        //
+        // Enforced here rather than left to each product callback because
+        // getting it wrong is silent. Every daemon in this suite strips
+        // Authentication-Results headers that forge its own authserv-id (audit
+        // X-1), and it can only strip headers it accumulated: with the cap in
+        // place, a sender who pads past `max_headers` and then appends a forged
+        // `spf=pass` would have it pass through uninspected. Tempfail is the only
+        // response that cannot leak it — the MTA holds the message and the
+        // sender may retry within the limits.
+        //
+        // Body overflow is deliberately not treated this way. There the header
+        // block was seen in full and scrubbed; only the hash is unavailable, so
+        // the callback can still return a truthful temperror result and the
+        // message can be delivered.
+        if (conn.headers_overflow) {
+            const peer = conn.getPeerDisplay();
+            log_mod.warn(
+                "tempfail: header block from {s}[{s}] exceeded MaxHeaders={d}/MaxHeaderBytes={d} and could not be inspected in full",
+                .{ peer.name, peer.ip, conn.limits.max_headers, conn.limits.max_header_bytes },
+            );
+            self.sendResponse(conn, @intFromEnum(responses.Code.tempfail));
+            conn.resetMessage();
+            return;
+        }
+
         const resp = if (self.callbacks.on_eom) |cb| cb(conn) else @intFromEnum(responses.Code.accept);
         self.sendResponse(conn, resp);
         conn.resetMessage();
