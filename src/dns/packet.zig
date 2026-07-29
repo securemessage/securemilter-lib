@@ -156,10 +156,36 @@ pub fn parseResponse(allocator: Allocator, data: []const u8) !Response {
 }
 
 /// Extract RDATA based on record type.
-/// For TXT records, concatenates all character-strings.
+///
+/// TXT records have their character-strings concatenated. Records whose RDATA
+/// *is* a domain name (CNAME, PTR) or *contains* one (MX, after a 2-octet
+/// preference) are decoded to presentation form, so `Answer.data` is a name a
+/// caller can query.
+///
+/// **The decoding has to happen here and cannot be left to the caller.** RFC 1035
+/// §4.1.4 allows a name in RDATA to end in a compression pointer, and a pointer
+/// is an offset into the whole message. MX and PTR RDATA is where servers use
+/// compression most, since the exchange usually shares a suffix with the owner
+/// name. Once the RDATA has been copied out of the packet, that offset refers to
+/// a buffer the caller does not have, so a compressed name is not merely
+/// inconvenient to decode later -- it is unrecoverable.
+///
+/// The MX preference is dropped rather than reported. No caller needs it: RFC 7208
+/// §5.4 checks every host in the MX set regardless of preference. A caller that
+/// needs it will have to extend `Answer`.
 fn extractRdata(allocator: Allocator, data: []const u8, pos: usize, rdlength: u16, record_type: u16) ![]u8 {
     if (record_type == @intFromEnum(RecordType.TXT)) {
         return extractTxtRdata(allocator, data[pos .. pos + rdlength]);
+    }
+    if (record_type == @intFromEnum(RecordType.CNAME) or
+        record_type == @intFromEnum(RecordType.PTR))
+    {
+        return decodeDomainName(allocator, data, pos);
+    }
+    if (record_type == @intFromEnum(RecordType.MX)) {
+        // MX RDATA is PREFERENCE (2 octets) then EXCHANGE.
+        if (rdlength < 3) return error.PacketTooShort;
+        return decodeDomainName(allocator, data, pos + 2);
     }
     return allocator.dupe(u8, data[pos .. pos + rdlength]);
 }
