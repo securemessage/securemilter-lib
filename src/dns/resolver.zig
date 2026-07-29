@@ -75,12 +75,26 @@ pub const NegativeKind = enum {
 /// Classify a resolver error for callers that must distinguish "there is no such
 /// name" from "ask again later".
 ///
-/// Anything that is not an authoritative name error is treated as transient,
-/// which is the safe direction: reporting `temperror` for a permanent condition
-/// costs a retry, while reporting a verdict for a transient one can reject mail
-/// that would otherwise have been delivered.
+/// The default is transient, which is the safe direction: reporting `temperror`
+/// for a permanent condition costs a retry, while reporting a verdict for a
+/// transient one can reject mail that would otherwise have been delivered.
+///
+/// The exceptions are the conditions where retrying is provably useless because
+/// the name never reached the wire. A name with an empty or over-long label cannot
+/// be encoded as a question at all, so no nameserver will ever answer it, and RFC
+/// 7208 §4.3 groups a malformed domain with NXDOMAIN for exactly that reason -- to
+/// a caller the two are the same fact. Classifying these as transient turned a
+/// malformed record into `temperror` and asked the sender to try again forever.
 pub fn isTransientError(err: anyerror) bool {
-    return err != error.DnsNameError;
+    return switch (err) {
+        error.DnsNameError => false,
+        error.EmptyLabel,
+        error.LabelTooLong,
+        error.NameTooLong,
+        error.TooManyLabels,
+        => false,
+        else => true,
+    };
 }
 
 /// TTL-aware DNS cache entry.

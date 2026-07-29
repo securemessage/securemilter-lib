@@ -75,10 +75,30 @@ pub fn buildQuery(allocator: Allocator, domain: []const u8, rtype: RecordType, q
 /// Enforces RFC 1035 limits: max 63 bytes per label, max 253 chars total.
 pub fn encodeDomainName(buf: *std.ArrayList(u8), allocator: Allocator, domain: []const u8) !void {
     if (domain.len > 253) return error.NameTooLong;
+
+    // One leading or trailing dot is tolerated. A trailing dot is simply how a
+    // fully-qualified name is written, and a leading one is stripped for callers
+    // that concatenate a prefix onto a domain.
+    //
+    // An *interior* empty label is a different thing and must not be repaired.
+    // RFC 7208 §4.3 lists a zero-length label among the conditions that make a
+    // domain malformed, and collapsing one queries a name nobody wrote: `a:
+    // mail.example...com` was being sent to the wire as `mail.example.com`, so a
+    // record naming a malformed host matched a perfectly real one.
+    var name = domain;
+    if (name.len > 0 and name[0] == '.') name = name[1..];
+    if (name.len > 0 and name[name.len - 1] == '.') name = name[0 .. name.len - 1];
+
+    // The root, which has no labels at all.
+    if (name.len == 0) {
+        try buf.append(allocator, 0);
+        return;
+    }
+
     var label_count: u8 = 0;
-    var iter = mem.splitScalar(u8, domain, '.');
+    var iter = mem.splitScalar(u8, name, '.');
     while (iter.next()) |label| {
-        if (label.len == 0) continue;
+        if (label.len == 0) return error.EmptyLabel;
         if (label.len > 63) return error.LabelTooLong;
         label_count += 1;
         if (label_count > 127) return error.TooManyLabels;
