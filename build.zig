@@ -20,4 +20,26 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    addLintStep(b);
+}
+
+/// Enforce the 400-line-per-file requirement as a build step.
+///
+/// The checker lives here rather than in each product repo because the products
+/// already depend on this package, and a rule copied into five build files is the
+/// exact shape of defect this audit spent its time on.
+pub fn addLintStep(b: *std.Build) void {
+    const lint = b.addSystemCommand(&.{"sh"});
+    lint.addFileArg(b.path("tools/check-line-limit.sh"));
+    lint.addArg("src");
+    lint.addArg(".line-limit-allow");
+    if (b.args) |args| lint.addArgs(args);
+
+    // The line count is a property of the working tree, not of any build input,
+    // so the result must never be served from cache.
+    lint.has_side_effects = true;
+
+    const step = b.step("lint", "Fail on source files over the 400-line limit");
+    step.dependOn(&lint.step);
 }

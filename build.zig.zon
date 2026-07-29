@@ -7,6 +7,10 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        // Exported so dependent repos share ONE copy of the line-limit checker
+        // rather than each carrying its own. The rule is shared, so the
+        // implementation of the rule should be too.
+        "tools",
         "LICENSE",
         "README.md",
     },
