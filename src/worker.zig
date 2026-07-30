@@ -630,6 +630,83 @@ fn workerEntryReload(allocator: Allocator, addresses: []const listener_mod.Liste
     worker.run();
 }
 
+/// Records what `on_body` was handed, so a test can assert the whole payload arrived.
+var test_body_len: usize = 0;
+
+fn recordBodyLen(conn: *connection_mod.Connection, data: []const u8) u8 {
+    _ = conn;
+    test_body_len = data.len;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+test "X-6: a packet larger than the read chunk is assembled without yielding to the event loop" {
+    // THE PROPERTY: `feed` reads at most 8192 bytes per call, so a larger packet
+    // necessarily returns `.incomplete` several times before it completes.
+    // `handleConnectionData` must keep feeding on `.incomplete` rather than returning
+    // to the event loop, because the rest of the packet may already be in the kernel
+    // buffer -- in which case no new data arrives, no new kqueue edge fires, and the
+    // connection hangs. That was X-6.
+    //
+    // Until now this was documented only in a comment inside the function. The
+    // refactor plan lists this function as the riskiest in the codebase, so the test
+    // is written FIRST, against the unmodified implementation.
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &fds,
+    );
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    const worker_end = fds[0];
+    const peer_end = fds[1];
+    defer posix.close(peer_end);
+
+    // FreeBSD's default net.local.stream.sendspace is 8192, which is smaller than the
+    // packet under test, so an unbuffered write would block with nothing reading yet.
+    const bufsize: c_int = 262144;
+    _ = std.c.setsockopt(peer_end, posix.SOL.SOCKET, posix.SO.SNDBUF, &bufsize, @sizeOf(c_int));
+    _ = std.c.setsockopt(worker_end, posix.SOL.SOCKET, posix.SO.RCVBUF, &bufsize, @sizeOf(c_int));
+
+    try setNonBlocking(worker_end);
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    test_body_len = 0;
+    var worker = try Worker.init(
+        std.testing.allocator,
+        &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .{ .on_body = recordBodyLen },
+        pipe[0],
+    );
+    // Closes `worker_end` and frees the connection below.
+    defer worker.deinit();
+
+    const conn = try std.testing.allocator.create(connection_mod.Connection);
+    conn.* = connection_mod.Connection.init(std.testing.allocator, worker_end, 0, .{});
+    try worker.connections.put(worker_end, conn);
+
+    // One SMFIC_BODY packet, deliberately more than three read chunks.
+    const payload_len: usize = 8192 * 3 + 17;
+    const packet = try std.testing.allocator.alloc(u8, 4 + 1 + payload_len);
+    defer std.testing.allocator.free(packet);
+    std.mem.writeInt(u32, packet[0..4], @intCast(1 + payload_len), .big);
+    packet[4] = @intFromEnum(commands.Code.body);
+    @memset(packet[5..], 'x');
+
+    var written: usize = 0;
+    while (written < packet.len) {
+        written += try posix.write(peer_end, packet[written..]);
+    }
+
+    // Exactly one call, as one kqueue readability edge would produce.
+    worker.handleConnectionData(worker_end);
+
+    try std.testing.expectEqual(payload_len, test_body_len);
+}
+
 test "worker init and deinit" {
     const pipe = try posix.pipe();
     defer posix.close(pipe[0]);

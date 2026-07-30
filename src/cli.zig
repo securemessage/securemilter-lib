@@ -109,7 +109,7 @@ test "writeAll drains a buffer larger than one write is obliged to take" {
     // Exercised against a pipe, because a pipe is where a short write actually
     // happens and where the conformance harnesses put the checkers' stdout.
     const fds = try posix.pipe();
-    defer posix.close(fds[1]);
+    defer posix.close(fds[0]);
 
     // Comfortably under the pipe buffer so the test cannot block on a full pipe;
     // the property under test is that every byte handed over is accounted for.
@@ -117,6 +117,8 @@ test "writeAll drains a buffer larger than one write is obliged to take" {
     for (&payload, 0..) |*b, i| b.* = @intCast('a' + (i % 26));
 
     writeAll(fds[1], &payload);
+    // Closed here rather than by `defer`, because the read loop below needs the EOF
+    // to terminate. A `defer` as well would close it twice and abort the runner.
     posix.close(fds[1]);
 
     var got: [4096]u8 = undefined;
@@ -126,7 +128,6 @@ test "writeAll drains a buffer larger than one write is obliged to take" {
         if (n == 0) break;
         total += n;
     }
-    posix.close(fds[0]);
 
     try testing.expectEqual(payload.len, total);
     try testing.expectEqualSlices(u8, &payload, got[0..total]);
