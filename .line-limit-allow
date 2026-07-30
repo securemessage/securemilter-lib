@@ -51,6 +51,19 @@
 #   commit: a finding fix and a structural refactor should be reviewable apart. The
 #   next commit moves the pool out and brings this back under 657.
 #
+#   PAID, 2026-07-30. `pool.zig` now holds spawnPool, spawnPoolWithReload, the thread
+#   entry point and the two X-15 tests; worker.zig is 722 -> 601, which is under both
+#   657 and the 659 from stage 3.1 above. Nothing changed in the move -- the ownership
+#   rules were written against a measured leak, so they were transcribed rather than
+#   rewritten, and the tests moved with the code they test. Callers name the seam:
+#   `securemilter.pool.spawnPoolWithReload`, inline rather than aliased, because one
+#   call site does not earn a module alias and an alias would have cost each daemon a
+#   line for nothing.
+#
+#   Worth keeping as a precedent: the raise was recorded WITH the obligation to undo
+#   it and a number to hit. That is the only reason it got undone rather than becoming
+#   the new normal.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -65,4 +78,4 @@
 # An empty list below means every file meets the goal.
 430 src/connection.zig
 464 src/dns/resolver.zig
-722 src/worker.zig
+601 src/worker.zig

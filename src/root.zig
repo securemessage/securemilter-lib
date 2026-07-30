@@ -6,6 +6,7 @@ pub const connection = @import("connection.zig");
 pub const daemon = @import("daemon.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const worker = @import("worker.zig");
+pub const pool = @import("pool.zig");
 pub const dns = @import("dns.zig");
 pub const auth_results = @import("auth_results.zig");
 pub const auth_stamp = @import("auth_stamp.zig");
