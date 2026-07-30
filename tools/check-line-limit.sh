@@ -54,6 +54,32 @@ list_sources() {
     find "$SRCDIR" -name '*.zig' ! -name '*_test.zig' | sort
 }
 
+# Count PRODUCTION lines: everything outside a top-level `test` block.
+#
+# Excluding test FILES while counting test BLOCKS was a loophole, and it was
+# walked through three times on 2026-07-29. The same test counted against
+# main.zig and counted for nothing in main_test.zig, so the cheapest way to
+# "reduce" a file was to relocate its tests -- which changes no production line
+# and makes the code harder to read, since Zig's convention is to keep a test
+# beside the thing it tests. securedkim/src/main.zig went 1305 -> 1140 that way
+# and its production size was 1107 before and after.
+#
+# The rule is now uniform: TESTS NEVER COUNT, wherever they live. That removes
+# the incentive to move them and makes the number mean what it claims to --
+# the size of the logic a reader has to hold in their head.
+#
+# `zig fmt` guarantees a top-level closing brace at column 0, which is what
+# makes this safe to do with a line scan rather than a parser.
+prod_lines() {
+    awk '
+        !intest && /^test[ \t{"]/ { intest = 1; next }
+        intest && /^\}/          { intest = 0; next }
+        intest                    { next }
+                                  { n++ }
+        END                       { print n + 0 }
+    ' "$1"
+}
+
 # The first line of the generated header. Everything above it in an existing
 # allowlist is operator-written and must survive a rewrite; this marker is the
 # boundary between the two.
@@ -100,7 +126,7 @@ write_allowlist() {
     } >> "$tmp"
 
     list_sources | while IFS= read -r f; do
-        n=$(grep -c "" "$f")
+        n=$(prod_lines "$f")
         [ "$n" -gt "$GOAL" ] && echo "$n $f" >> "$tmp"
     done
     mv "$tmp" "$ALLOWLIST"
@@ -117,7 +143,7 @@ newly_over=0
 progress=0
 
 for f in $(list_sources); do
-    n=$(grep -c "" "$f")
+    n=$(prod_lines "$f")
     ceiling=$(ceiling_for "$f")
 
     if [ -z "$ceiling" ]; then

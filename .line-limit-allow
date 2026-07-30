@@ -5,7 +5,10 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-415 src/config.zig
-657 src/connection.zig
-571 src/dns/resolver.zig
-647 src/worker.zig
+#
+# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
+# preserved when the list is rewritten; this header and the entries
+# under it are regenerated every time a ceiling moves.
+442 src/connection.zig
+471 src/dns/resolver.zig
+632 src/worker.zig
