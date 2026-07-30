@@ -25,6 +25,37 @@
 #   limitation recorded in 11.31. The rest is two signatures and their doc comments,
 #   bought with three levels of nesting and four unexplained repetitions.
 #
+# 2026-07-30, X-15: worker.zig 657 -> 722, RAISED DELIBERATELY AND EXPECTED TO FALL.
+#
+#   A worker that could not initialise used to log and return from inside its own
+#   thread, which is the only thing a thread entry point can do. The pool had
+#   already reported success, so the daemon ran with fewer workers than it claimed
+#   -- or none -- and, worse, that worker's quiescent-state slot was never written
+#   again. Because the safe generation is the MINIMUM across slots, one frozen slot
+#   pins reclamation for the whole process: every SIGHUP then retires a
+#   configuration that can never be freed. An unbounded leak on a daemon that
+#   looks healthy. See rcu.zig's test "a worker that never quiesces pins
+#   reclamation permanently", which measures exactly that.
+#
+#   The fix is a RELOCATION, not a barrier: every worker is now constructed on the
+#   calling thread, where `try` still works, and threads are spawned only once all
+#   of them exist. No cross-thread signalling was added. What cost the 65 lines is
+#   the ownership bookkeeping that relocation makes explicit -- which worker owns
+#   its wakeup pipe read end, and which are still ours to tear down on each error
+#   path. That was previously "free" only because a leaked fd inside a dying thread
+#   is invisible.
+#
+#   THIS RAISE SHOULD NOT SURVIVE. There is a real seam here -- worker.zig is one
+#   worker's event loop, and pool construction/ownership is a separate concern, the
+#   same split as daemon.zig vs bootstrap.zig. It is deliberately NOT done in this
+#   commit: a finding fix and a structural refactor should be reviewable apart. The
+#   next commit moves the pool out and brings this back under 657.
+#
+# WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
+#
+# From here down is regenerated whenever a ceiling moves. A comment
+# above that line is preserved; one below it is reported and then lost.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -32,10 +63,6 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-#
-# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
-# preserved when the list is rewritten; this header and the entries
-# under it are regenerated every time a ceiling moves.
 430 src/connection.zig
 464 src/dns/resolver.zig
-657 src/worker.zig
+722 src/worker.zig

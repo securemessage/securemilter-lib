@@ -263,6 +263,49 @@ test "an idle worker defers reclamation without blocking or losing memory" {
     try std.testing.expectEqual(@as(u32, 5), freed);
 }
 
+// X-15, the reason a worker that fails to start must be fatal.
+//
+// The test above ends by draining the backlog, because an *idle* worker is
+// still going to reach its quiescent point eventually -- and `wake()` exists to
+// make "eventually" prompt. A worker that died during init is different in kind:
+// there is no thread left to reach a quiescent point and nothing for `wake()` to
+// wake, so its slot holds the spawn-time generation for the life of the process.
+//
+// Because the safe bound is the *minimum* across slots, that one frozen slot
+// pins reclamation for every worker. Every reload then retires a configuration
+// stamped at a generation strictly greater than the bound, so `sweep` can never
+// free any of it: an unbounded leak of one configuration per SIGHUP, on a daemon
+// that looks healthy and is still answering on its surviving workers.
+//
+// This is what makes X-15 a leak rather than an untidy thread, and it is why the
+// fix refuses to start the pool at all rather than letting one worker drop out.
+test "X-15: a worker that never quiesces pins reclamation permanently" {
+    const allocator = std.testing.allocator;
+    var gen = try reload.ConfigGeneration.initWithWorkers(allocator, 3);
+    defer gen.deinit(allocator);
+
+    var freed: u32 = 0;
+    var rcu = Rcu(TestValue).init(allocator, freeTestValue);
+    defer rcu.deinit();
+
+    try rcu.publish(&gen, try makeValue(allocator, 0, &freed));
+
+    // Workers 0 and 1 are healthy and quiesce on every pass. Worker 2 died in
+    // init, so its slot is never written again.
+    var i: u32 = 1;
+    while (i <= 20) : (i += 1) {
+        gen.quiesce(0);
+        gen.quiesce(1);
+        try rcu.publish(&gen, try makeValue(allocator, i, &freed));
+    }
+
+    // Growth is unbounded and monotonic: 20 reloads, 20 configurations held, not
+    // one byte reclaimed, however busy the surviving workers are.
+    try std.testing.expectEqual(@as(u32, 0), freed);
+    try std.testing.expectEqual(@as(usize, 20), rcu.retiredCount());
+    try std.testing.expectEqual(@as(u64, 0), gen.minObserved());
+}
+
 test "deinit frees the live value and any backlog" {
     const allocator = std.testing.allocator;
     var gen = try reload.ConfigGeneration.initWithWorkers(allocator, 1);
