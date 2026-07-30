@@ -54,17 +54,51 @@ list_sources() {
     find "$SRCDIR" -name '*.zig' ! -name '*_test.zig' | sort
 }
 
+# The first line of the generated header. Everything above it in an existing
+# allowlist is operator-written and must survive a rewrite; this marker is the
+# boundary between the two.
+HEADER_MARK="# Files currently over the "
+
 write_allowlist() {
     tmp=$(mktemp)
+
+    # Carry over the operator's rationale.
+    #
+    # This function used to regenerate the file from scratch, which DELETED every
+    # comment it did not itself emit -- and not only under --update: the
+    # self-tightening path below calls it too, so a note explaining a ceiling was
+    # one shrinking commit away from being lost. That happened twice on 2026-07-29
+    # and was recovered from git both times; the second time it took an 11-line
+    # block explaining three RFC 8617 ceilings with it.
+    #
+    # A ceiling without its reason is just a number, and the number is the part a
+    # reader can already get from `wc -l`. The reason is the whole value of the
+    # file, so the tool must not be the thing that removes it.
+    #
+    # Only comment and blank lines are carried, and only those above the marker,
+    # so an entry line can never survive into the regenerated list and be counted
+    # twice.
+    if [ -f "$ALLOWLIST" ]; then
+        awk -v mark="$HEADER_MARK" '
+            index($0, mark) == 1 { exit }
+            /^#/ || /^[ \t]*$/   { print }
+        ' "$ALLOWLIST" > "$tmp"
+    fi
+
     {
-        echo "# Files currently over the ${GOAL}-line goal, with the ceiling each"
+        echo "${HEADER_MARK}${GOAL}-line goal, with the ceiling each"
         echo "# may not exceed. Ceilings tighten by themselves as files shrink; a"
         echo "# file that reaches the goal drops off this list entirely."
         echo "#"
         echo "# Adding an entry by hand is how you knowingly accept a long file:"
         echo "#   zig build lint -- --update"
         echo "# An empty list below means every file meets the goal."
-    } > "$tmp"
+        echo "#"
+        echo "# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are"
+        echo "# preserved when the list is rewritten; this header and the entries"
+        echo "# under it are regenerated every time a ceiling moves."
+    } >> "$tmp"
+
     list_sources | while IFS= read -r f; do
         n=$(grep -c "" "$f")
         [ "$n" -gt "$GOAL" ] && echo "$n $f" >> "$tmp"
