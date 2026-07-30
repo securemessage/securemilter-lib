@@ -6,8 +6,48 @@ const Allocator = mem.Allocator;
 const packet = @import("packet.zig");
 const daemon_mod = @import("../daemon.zig");
 
+const log_mod = @import("../log.zig");
+
 /// Maximum number of nameservers supported.
 pub const MAX_SERVERS = 8;
+
+/// Probe defaults, previously written as bare 53/5/2000 at four call sites.
+const PROBE_PORT = 53;
+const PROBE_INTERVAL_S = 5;
+const PROBE_TIMEOUT_MS = 2000;
+
+/// Start the proactive monitor, or return null having said why.
+///
+/// Null is a SUPPORTED MODE, not a failure: `Resolver.initWithMonitor(.., null)` falls
+/// back to trying every server with timeout-based failover, which is slower but correct.
+/// So neither branch here is fatal, and both are warnings.
+///
+/// Note the asymmetry, which is deliberate and was in all four copies of this: if
+/// `init` fails there is no monitor and null is the only answer, but if only `start`
+/// fails the monitor object is still returned. It holds the health flags, every
+/// resolver reads them, and they default to healthy — so a monitor whose thread never
+/// came up behaves exactly like no monitor, whereas dropping it here would lose the
+/// pointer that the rest of the daemon expects to hand to each resolver.
+///
+/// Call from `Options.spawn_threads`, which is the point in the bootstrap where
+/// creating a thread is safe: after the fork, and after the managed signals are blocked.
+pub fn startMonitor(allocator: Allocator, nameservers: []const []const u8) ?*HealthMonitor {
+    const monitor = HealthMonitor.init(
+        allocator,
+        nameservers,
+        PROBE_PORT,
+        PROBE_INTERVAL_S,
+        PROBE_TIMEOUT_MS,
+    ) catch |err| {
+        log_mod.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
+        return null;
+    };
+
+    monitor.start() catch |err| {
+        log_mod.warn("DNS health monitor thread failed: {}", .{err});
+    };
+    return monitor;
+}
 
 /// Shared DNS server health state, probed by a background thread.
 ///

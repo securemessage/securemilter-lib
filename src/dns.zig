@@ -11,6 +11,7 @@ pub const HealthMonitor = resolver.HealthMonitor;
 pub const Cache = resolver.Cache;
 pub const NegativeKind = resolver.NegativeKind;
 pub const isTransientError = resolver.isTransientError;
+pub const startMonitor = health.startMonitor;
 
 test {
     _ = packet;
