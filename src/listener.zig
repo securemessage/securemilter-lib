@@ -2,6 +2,8 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 const mem = std.mem;
+const log_mod = @import("log.zig");
+const escape = @import("escape.zig");
 
 /// Parsed listener address from config.
 ///
@@ -18,13 +20,23 @@ pub const ListenAddress = union(enum) {
     },
 
     /// Parse a listener address string from config.
+    ///
+    /// Every value this accepts must be one `bind` can bind. That is not a
+    /// nicety: a value accepted here and refused there escapes the config
+    /// parser, and the refusal then surfaces inside a worker thread during
+    /// startup where the only response available is to log and die. So the
+    /// checks below are performed with the *same functions* `bind` calls,
+    /// rather than with an independent reimplementation that can drift
+    /// (X-14 was precisely this pair disagreeing: `inet:8891@localhost`
+    /// parsed cleanly, failed at bind, and left a live daemon listening on
+    /// nothing while its startup log said `listeners=1`).
     pub fn parse(spec: []const u8) !ListenAddress {
         if (mem.startsWith(u8, spec, "inet:")) {
             return parseTcp(spec[5..]);
         } else if (mem.startsWith(u8, spec, "unix:")) {
-            return .{ .unix = .{ .path = spec[5..] } };
+            return parseUnix(spec[5..]);
         } else if (mem.startsWith(u8, spec, "/")) {
-            return .{ .unix = .{ .path = spec } };
+            return parseUnix(spec);
         } else {
             return parseTcp(spec);
         }
@@ -36,13 +48,72 @@ pub const ListenAddress = union(enum) {
             const port_str = spec[0..pos];
             const host = spec[pos + 1 ..];
             const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
+
+            // `bind` resolves the host with parseIpAddress and nothing else --
+            // no DNS, deliberately. A name would therefore always fail there,
+            // so reject it here where the operator can be told which line of
+            // which config file is wrong.
+            _ = parseIpAddress(host, port) catch return error.InvalidHost;
+
             return .{ .tcp = .{ .host = host, .port = port } };
         }
 
+        // No host given: the default is a literal, so there is nothing to validate.
         const port = std.fmt.parseInt(u16, spec, 10) catch return error.InvalidPort;
         return .{ .tcp = .{ .host = "0.0.0.0", .port = port } };
     }
+
+    fn parseUnix(path: []const u8) !ListenAddress {
+        // Same reasoning as the host check: sun_path is a fixed-size field, so
+        // an over-long path fails in initUnix at bind time. Checked with
+        // initUnix itself so the limit cannot be duplicated wrongly here.
+        _ = net.Address.initUnix(path) catch return error.InvalidPath;
+
+        return .{ .unix = .{ .path = path } };
+    }
 };
+
+/// Resolve one `[listener:*]` section's `Socket` value, or fail loudly.
+///
+/// X-14. All four daemons previously wrote this as
+///
+///     const socket_str = section.get("Socket") orelse continue;
+///     const addr = ListenAddress.parse(socket_str) catch continue;
+///
+/// which discards an explicit operator instruction without a single word to
+/// syslog. Two things then made that unsafe rather than merely untidy:
+///
+///  1. If the discarded section was the *only* listener, the caller's
+///     "no listener sections" fallback fires and binds the loopback default
+///     instead. So the daemon does not fail to listen -- it listens somewhere
+///     else, having been told plainly where to listen. In the two daemons that
+///     carry a per-listener `Mode`, the fallback also supplies the *global*
+///     mode, so a mistyped `verify` listener can come up in whatever mode
+///     `[global] Mode` names. X-13's own note beside that fallback asks for a
+///     wide bind to be "written down deliberately, not inherited from an
+///     omitted config section" -- a typo made the section omitted.
+///  2. If it was one of several, that listener simply does not exist, and under
+///     Postfix's `milter_default_action = accept` an unreachable milter means
+///     mail is delivered unfiltered. Nothing distinguishes that from success.
+///
+/// So this refuses instead, and names the section and the value. There is no
+/// deployment that depends on a typo being ignored, and no man page promises a
+/// fallback for a malformed value -- the documented default covers an *absent*
+/// listener section, which the caller still honours.
+pub fn parseListenerSocket(section_name: []const u8, spec: ?[]const u8) !ListenAddress {
+    const value = spec orelse {
+        log_mod.err("config: [{f}] has no Socket setting -- a listener section must name an address", .{escape.logField(section_name)});
+        return error.MissingListenerSocket;
+    };
+
+    return ListenAddress.parse(value) catch |err| {
+        log_mod.err(
+            "config: [{f}] Socket={f} is not a valid listen address ({}) -- expected inet:port@ip or unix:/path",
+            .{ escape.logField(section_name), escape.logField(value), err },
+        );
+        return error.InvalidListenerSocket;
+    };
+}
 
 /// A bound, listening socket ready for accept().
 pub const BoundListener = struct {
@@ -181,6 +252,54 @@ test "parse inet with IPv6" {
             try std.testing.expectEqual(@as(u16, 8891), tcp.port);
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+// X-14. `parse` used to accept any host string while `bind` accepts only a
+// literal IP, so a hostname passed config validation and then failed at bind --
+// by which point the failure had left the config parser and become a dead
+// worker thread. These pin the two halves to the same contract: if `parse`
+// accepts it, `bind` must be able to bind it.
+test "parse rejects a hostname, because bind cannot resolve one" {
+    // The obvious thing an operator writes, and the exact value that produced
+    // a live daemon with no listener.
+    try std.testing.expectError(error.InvalidHost, ListenAddress.parse("inet:8891@localhost"));
+    try std.testing.expectError(error.InvalidHost, ListenAddress.parse("inet:8891@mail.example.com"));
+}
+
+test "parse rejects a misspelled scheme rather than reinterpreting it" {
+    // Each of these used to reach parseTcp as a whole and fail on the port,
+    // which is the right answer for the wrong reason -- and the caller
+    // discarded it silently either way. `inet6:` is the one an operator
+    // actually reaches for.
+    try std.testing.expectError(error.InvalidPort, ListenAddress.parse("inet6:8891@::1"));
+    try std.testing.expectError(error.InvalidPort, ListenAddress.parse("tcp:8891"));
+    try std.testing.expectError(error.InvalidPort, ListenAddress.parse("unxi:/var/run/m.sock"));
+    try std.testing.expectError(error.InvalidPort, ListenAddress.parse(""));
+}
+
+test "parse still accepts every form bind supports" {
+    // The other direction. A stricter parser that rejected a legitimate
+    // address would break deployments, so pin the accepted set too.
+    _ = try ListenAddress.parse("inet:8891@0.0.0.0");
+    _ = try ListenAddress.parse("inet:8891@127.0.0.1");
+    _ = try ListenAddress.parse("inet:8891@::1");
+    _ = try ListenAddress.parse("inet:8891@::");
+    _ = try ListenAddress.parse("8891");
+    _ = try ListenAddress.parse("unix:/var/run/m.sock");
+    _ = try ListenAddress.parse("/var/run/m.sock");
+}
+
+test "every address parse accepts, bind accepts" {
+    // The contract itself, checked end to end on port 0 so it is
+    // hermetic. This is the assertion that would have caught X-14.
+    for ([_][]const u8{ "inet:0@127.0.0.1", "inet:0@::1", "0" }) |spec| {
+        const addr = try ListenAddress.parse(spec);
+        var listener = bind(addr) catch |err| {
+            std.debug.print("parse accepted '{s}' but bind rejected it: {}\n", .{ spec, err });
+            return error.ParseBindContractBroken;
+        };
+        listener.close();
     }
 }
 

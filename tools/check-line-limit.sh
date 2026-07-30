@@ -47,11 +47,18 @@ ceiling_for() {
                       END { if (!found) print "" }' "$ALLOWLIST"
 }
 
-# Test files are excluded: a table-driven test legitimately grows with the number
-# of cases it covers, and splitting one to satisfy a goal aimed at the readability
-# of production logic would be cargo-culting the rule against its own purpose.
+# EVERY .zig file is measured, including *_test.zig.
+#
+# Skipping those files entirely was the last of the relocation loophole, and it
+# survived the 2026-07-29 fix below because that fix only addressed test BLOCKS.
+# A test's explanation lives ABOVE the `test` line, so it was production in
+# main.zig and invisible in main_test.zig -- moving a well-commented test still
+# moved the number. Measuring every file removes the difference; `prod_lines`
+# already discards the tests themselves wherever they are, so a test file
+# contributes only its imports and helpers, which is exactly right: those ARE
+# logic a reader has to hold.
 list_sources() {
-    find "$SRCDIR" -name '*.zig' ! -name '*_test.zig' | sort
+    find "$SRCDIR" -name '*.zig' | sort
 }
 
 # Count PRODUCTION lines: everything outside a top-level `test` block.
@@ -68,14 +75,25 @@ list_sources() {
 # the incentive to move them and makes the number mean what it claims to --
 # the size of the logic a reader has to hold in their head.
 #
+# A TEST'S LEADING COMMENT BLOCK IS PART OF THE TEST. Comments and blank lines
+# are held back and only charged when real code follows them; a `test` line
+# discards whatever is held. Without this the rule above is false in the way
+# that matters most -- an explanation of what a test defends against is exactly
+# the thing worth writing, and charging it as production made the cheapest way
+# to satisfy the gate "delete the reasoning" or "move the test to a file the
+# checker skips". A metric that bills you for documenting a regression test is
+# steering away from the behaviour it exists to encourage.
+#
 # `zig fmt` guarantees a top-level closing brace at column 0, which is what
 # makes this safe to do with a line scan rather than a parser.
 prod_lines() {
     awk '
-        !intest && /^test[ \t{"]/ { intest = 1; next }
+        !intest && /^test[ \t{"]/ { intest = 1; pending = 0; next }
         intest && /^\}/          { intest = 0; next }
         intest                    { next }
-                                  { n++ }
+        /^[ \t]*\/\//             { pending++; next }
+        /^[ \t]*$/                { pending++; next }
+                                  { n += pending; pending = 0; n++ }
         END                       { print n + 0 }
     ' "$1"
 }
