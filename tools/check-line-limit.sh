@@ -101,7 +101,37 @@ prod_lines() {
 # The first line of the generated header. Everything above it in an existing
 # allowlist is operator-written and must survive a rewrite; this marker is the
 # boundary between the two.
-HEADER_MARK="# Files currently over the "
+#
+# THE BOUNDARY MUST BE STATED AT THE BOUNDARY. An earlier version of this header
+# closed with "WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER" -- eight lines
+# BELOW this marker, and therefore inside the region that is thrown away. The
+# entries are at the bottom of the file, so a reader arrives from the bottom and
+# meets that sentence first, writes immediately above it as instructed, and loses
+# the note on the next rewrite with a zero exit status. That is exactly the
+# failure the carry-over below was added to prevent, reintroduced by the
+# documentation instead of the code. The rule is now carried BY the marker line,
+# which is the only place it cannot drift away from what it describes -- and note
+# that it could not simply be moved next to the old marker: the boundary is the
+# first generated line, so anything emitted above it would be carried over as
+# prose on the next rewrite AND re-emitted, growing a duplicate header every run.
+HEADER_MARK="# WRITE THE REASON FOR A CEILING ABOVE THIS LINE."
+
+# The boundary used before the marker carried the rule. Still recognised so an
+# allowlist written by that version migrates in one rewrite instead of having its
+# old header preserved as prose and duplicated.
+HEADER_MARK_LEGACY="# Files currently over the "
+
+# Everything from the first of either marker is generated, so `below` is set --
+# not `exit` -- when the caller wants the tail rather than the head.
+split_at_marker() {
+    awk -v mark="$HEADER_MARK" -v legacy="$HEADER_MARK_LEGACY" -v want="$1" '
+        {
+            if (!below && (index($0, mark) == 1 || index($0, legacy) == 1)) below = 1
+            if (want == "below") { if (below) print }
+            else if (!below) print
+        }
+    ' "$2"
+}
 
 write_allowlist() {
     tmp=$(mktemp)
@@ -123,30 +153,42 @@ write_allowlist() {
     # so an entry line can never survive into the regenerated list and be counted
     # twice.
     if [ -f "$ALLOWLIST" ]; then
-        awk -v mark="$HEADER_MARK" '
-            index($0, mark) == 1 { exit }
-            /^#/ || /^[ \t]*$/   { print }
-        ' "$ALLOWLIST" > "$tmp"
+        split_at_marker above "$ALLOWLIST" | grep -e '^#' -e '^[[:space:]]*$' > "$tmp"
     fi
 
     {
-        echo "${HEADER_MARK}${GOAL}-line goal, with the ceiling each"
+        echo "$HEADER_MARK"
+        echo "#"
+        echo "# From here down is regenerated whenever a ceiling moves. A comment"
+        echo "# above that line is preserved; one below it is reported and then lost."
+        echo "#"
+        echo "# Files currently over the ${GOAL}-line goal, with the ceiling each"
         echo "# may not exceed. Ceilings tighten by themselves as files shrink; a"
         echo "# file that reaches the goal drops off this list entirely."
         echo "#"
         echo "# Adding an entry by hand is how you knowingly accept a long file:"
         echo "#   zig build lint -- --update"
         echo "# An empty list below means every file meets the goal."
-        echo "#"
-        echo "# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are"
-        echo "# preserved when the list is rewritten; this header and the entries"
-        echo "# under it are regenerated every time a ceiling moves."
     } >> "$tmp"
 
     list_sources | while IFS= read -r f; do
         n=$(prod_lines "$f")
         [ "$n" -gt "$GOAL" ] && echo "$n $f" >> "$tmp"
     done
+
+    # Say what is being thrown away.
+    #
+    # The carry-over above cannot rescue a comment written BELOW the boundary,
+    # and the previous header invited exactly that. Losing operator prose is bad;
+    # losing it with a zero exit status and no output is what let it happen
+    # twice. Anything dropped is echoed here, so the worst case is a paste back
+    # into the right place rather than a trip through the reflog.
+    if [ -f "$ALLOWLIST" ]; then
+        split_at_marker below "$ALLOWLIST" | grep '^#' | while IFS= read -r line; do
+            grep -qxF "$line" "$tmp" || echo "NOT PRESERVED (below the boundary): $line" >&2
+        done
+    fi
+
     mv "$tmp" "$ALLOWLIST"
 }
 
