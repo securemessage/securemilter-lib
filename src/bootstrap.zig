@@ -7,6 +7,7 @@
 //! former; a reader wondering why the health monitor starts where it does wants this.
 
 const std = @import("std");
+const posix = std.posix;
 const daemon = @import("daemon.zig");
 const log_mod = @import("log.zig");
 
@@ -40,6 +41,27 @@ pub const Bootstrap = struct {
     /// `worker_threads` with 0 resolved to the CPU count.
     workers: u32,
 
+    /// Write end of the readiness pipe, or null in the foreground where nobody is
+    /// waiting. Held rather than signalled here on purpose — see `notifyReady`.
+    ready_fd: ?posix.fd_t = null,
+    signal_ready: *const fn (posix.fd_t) void = daemon.signalReady,
+
+    /// Tell the waiting parent this daemon is serving. Call it once listeners are
+    /// bound and the worker pool is running, and not before.
+    ///
+    /// `run` deliberately does not do this itself. Everything that actually makes the
+    /// daemon useful — binding, the worker pool — happens after `run` returns, which
+    /// is the whole reason the parent's exit status was meaningless (X-16). Signalling
+    /// from inside `run` would move the lie rather than remove it.
+    ///
+    /// Idempotent, and a no-op in the foreground.
+    pub fn notifyReady(self: *Bootstrap) void {
+        if (self.ready_fd) |fd| {
+            self.ready_fd = null;
+            self.signal_ready(fd);
+        }
+    }
+
     /// Remove the PID file. `defer` this in `main`.
     ///
     /// Not done by `run` itself because the file must outlive it by the whole life of
@@ -58,9 +80,10 @@ pub const Bootstrap = struct {
 /// observable, which is the difference between the constraints being *documented* —
 /// they were, in four separate files — and being *enforced*.
 pub const Ops = struct {
-    daemonize: *const fn () anyerror!void = daemon.daemonize,
+    daemonize: *const fn () anyerror!posix.fd_t = daemon.daemonize,
     reinit_log: *const fn () void = log_mod.initThread,
     block_signals: *const fn () void = daemon.ManagedSignals.blockForKqueue,
+    signal_ready: *const fn (posix.fd_t) void = daemon.signalReady,
     write_pid_file: *const fn ([]const u8) anyerror!void = daemon.writePidFile,
     remove_pid_file: *const fn ([]const u8) void = daemon.removePidFile,
     raise_file_limit: *const fn (u64) void = daemon.raiseFileLimit,
@@ -98,8 +121,9 @@ pub fn run(opts: Options) !Bootstrap {
 
 /// `run` with the steps substituted. For tests; production calls `run`.
 pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
+    var ready_fd: ?posix.fd_t = null;
     if (!opts.foreground) {
-        ops.daemonize() catch |err| {
+        ready_fd = ops.daemonize() catch |err| {
             log_mod.err("daemonize failed: {}", .{err});
             return err;
         };
@@ -150,7 +174,15 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
         };
     }
 
-    return .{ .pid_file = opts.pid_file, .workers = workers };
+    // The readiness fd travels out UNSIGNALLED. Nothing this function does proves the
+    // daemon can serve -- the listeners are not bound yet. Any error path above returns
+    // without writing, the fd closes with the process, and the parent reads EOF.
+    return .{
+        .pid_file = opts.pid_file,
+        .workers = workers,
+        .ready_fd = ready_fd,
+        .signal_ready = ops.signal_ready,
+    };
 }
 
 /// The disposition line: why this process is about to stop existing.
@@ -210,7 +242,7 @@ pub fn fatal(e: anyerror) anyerror {
 // the PID file is claimed before or after the fd limit is free, and a test that pinned
 // the whole order would fail on a change that breaks nothing.
 
-const Step = enum { daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs };
+const Step = enum { daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs, signal_ready };
 
 var recorded: [16]Step = undefined;
 var recorded_len: usize = 0;
@@ -222,8 +254,13 @@ fn record(s: Step) void {
     }
 }
 
-fn recDaemonize() anyerror!void {
+/// The sentinel stands in for the readiness write end. It is never written to --
+/// `signal_ready` is recorded, not performed -- so it only has to be distinguishable.
+const fake_ready_fd: posix.fd_t = 4242;
+
+fn recDaemonize() anyerror!posix.fd_t {
     record(.daemonize);
+    return fake_ready_fd;
 }
 fn recReinitLog() void {
     record(.reinit_log);
@@ -240,6 +277,9 @@ fn recWritePid(_: []const u8) anyerror!void {
 fn recRemovePid(_: []const u8) void {
     record(.remove_pid);
 }
+fn recSignalReady(_: posix.fd_t) void {
+    record(.signal_ready);
+}
 fn recRaiseFd(_: u64) void {
     record(.raise_fd);
 }
@@ -251,6 +291,7 @@ const recording_ops = Ops{
     .daemonize = recDaemonize,
     .reinit_log = recReinitLog,
     .block_signals = recBlockSignals,
+    .signal_ready = recSignalReady,
     .write_pid_file = recWritePid,
     .remove_pid_file = recRemovePid,
     .raise_file_limit = recRaiseFd,
@@ -384,6 +425,60 @@ test "a failed PID file write is survivable, but a failed privilege drop is not"
     }.f;
     recorded_len = 0;
     try std.testing.expectError(error.SetuidFailed, runWithOps(test_opts, ops));
+}
+
+// --- X-16(a): readiness is claimed by the daemon, not by bootstrap -----------
+
+test "X-16: run does not report readiness, because nothing is listening yet" {
+    // The defect restated as a constraint. `run` finishes long before the listeners
+    // are bound and the worker pool exists, so a readiness signal from inside it
+    // would be the same false claim the parent used to make on its own.
+    const boot = try runRecorded(test_opts);
+    try std.testing.expect(indexOf(.signal_ready) == null);
+    try std.testing.expectEqual(fake_ready_fd, boot.ready_fd.?);
+}
+
+test "X-16: a bootstrap that fails never reports readiness" {
+    // The parent must see EOF, not a byte. Nothing writes on this path -- the fd goes
+    // out with the process -- and the assertion is that no signal is attempted.
+    var ops = recording_ops;
+    ops.drop_privileges = struct {
+        fn f(_: []const u8) anyerror!void {
+            return error.SetuidFailed;
+        }
+    }.f;
+    recorded_len = 0;
+
+    try std.testing.expectError(error.SetuidFailed, runWithOps(test_opts, ops));
+    try std.testing.expect(indexOf(.signal_ready) == null);
+}
+
+test "X-16: notifyReady signals once and only once" {
+    // Called from `main` after the pool is up. The second call must be inert: the fd
+    // is closed by the first, and writing to a closed descriptor that has since been
+    // reused would send a stray byte to whatever now owns that number.
+    var boot = try runRecorded(test_opts);
+    recorded_len = 0;
+
+    boot.notifyReady();
+    try std.testing.expectEqual(@as(usize, 1), recorded_len);
+    try std.testing.expect(indexOf(.signal_ready) != null);
+
+    boot.notifyReady();
+    try std.testing.expectEqual(@as(usize, 1), recorded_len);
+}
+
+test "X-16: in the foreground there is no parent to answer" {
+    // No fork, so no pipe and nobody waiting. `notifyReady` must not invent an fd to
+    // write to -- 0 is stdin.
+    var opts = test_opts;
+    opts.foreground = true;
+    var boot = try runRecorded(opts);
+    try std.testing.expect(boot.ready_fd == null);
+
+    recorded_len = 0;
+    boot.notifyReady();
+    try std.testing.expectEqual(@as(usize, 0), recorded_len);
 }
 
 // --- X-16: the PID file belongs to a process that exists ---------------------

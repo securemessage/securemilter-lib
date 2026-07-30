@@ -5,18 +5,70 @@ const log_mod = @import("log.zig");
 
 extern "c" fn setgroups(ngroups: c_int, gidset: ?[*]const c.gid_t) c_int;
 
+/// The byte a daemon sends its waiting parent once it is actually serving.
+///
+/// A specific value rather than any byte: the write end is inherited across two
+/// forks and nothing stops an unrelated descriptor from landing on the same
+/// number. Success is the one claim this protocol must not make by accident.
+const ready_byte: u8 = 'K';
+
+/// How long the parent waits for that byte before giving up, in seconds.
+///
+/// Waiting forever would convert a daemon wedged during startup into a wedged
+/// `service start`, which is a different failure with the same symptom as the one
+/// being fixed. Generous enough to cover a slow first DNS resolution.
+pub const startup_timeout_s: isize = 60;
+
 /// Daemonize the current process (double-fork, setsid, close fds).
 ///
-/// After this call, the process is running as a background daemon
-/// with no controlling terminal. stdin/stdout/stderr are redirected
-/// to /dev/null.
-pub fn daemonize() !void {
-    const pid1 = try posix.fork();
-    if (pid1 != 0) posix.exit(0);
+/// Returns the write end of the readiness pipe. The caller MUST hand it to
+/// `signalReady` once the daemon is genuinely serving, and must otherwise leave
+/// it alone: the parent is blocked on the read end and treats its closure without
+/// a byte as a failed start.
+///
+/// THE PARENT NO LONGER EXITS IMMEDIATELY, and that is the entire point (X-16).
+/// `daemonize` is bootstrap's first step and listeners are bound long after it
+/// returns, so the original process used to answer `service start` with 0 before
+/// anything had been tried. Measured: an unbindable listener gave exit 0, nothing
+/// listening, and no process. `rc.d` reported a started service; Postfix could
+/// not reach the milter, and a receiver running `milter_default_action=accept`
+/// takes mail unauthenticated. One typo in a listener address reaches that.
+pub fn daemonize() !posix.fd_t {
+    // Created before the first fork so both ends survive into the grandchild.
+    //
+    // CLOEXEC does not affect fork, which is what carries the write end where it
+    // needs to go. It covers the other direction: anything this daemon ever execs
+    // would otherwise inherit a live write end, and the parent would then wait on a
+    // pipe that no longer closes when the daemon dies.
+    const ready = try posix.pipe2(.{ .CLOEXEC = true });
+
+    // Cleanup is per-fork rather than a function-wide errdefer: the child closes the
+    // read end below, so a single errdefer covering both would double-close it on any
+    // later failure -- and by then the number may belong to something else.
+    const pid1 = posix.fork() catch |e| {
+        posix.close(ready[0]);
+        posix.close(ready[1]);
+        return e;
+    };
+    if (pid1 != 0) {
+        // The original process: the one whose exit status the caller reads.
+        posix.close(ready[1]);
+        defer posix.close(ready[0]);
+        awaitReady(ready[0], startup_timeout_s) catch posix.exit(1);
+        posix.exit(0);
+    }
+    posix.close(ready[0]);
 
     _ = c.setsid();
 
-    const pid2 = try posix.fork();
+    const pid2 = posix.fork() catch |e| {
+        posix.close(ready[1]);
+        return e;
+    };
+    // The intermediate process exits without signalling. Its copy of the write end
+    // is closed by exiting, which is why the parent must not treat one closure as
+    // EOF -- the read only reports EOF once the LAST copy is gone, and the daemon
+    // still holds one.
     if (pid2 != 0) posix.exit(0);
 
     const devnull = try posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
@@ -24,6 +76,49 @@ pub fn daemonize() !void {
     try posix.dup2(devnull, 1);
     try posix.dup2(devnull, 2);
     if (devnull > 2) posix.close(devnull);
+
+    return ready[1];
+}
+
+/// Tell the waiting parent the daemon is up, then close the pipe.
+///
+/// Call this only once listeners are bound and workers are running. Signalling
+/// earlier would restore the defect with extra steps: the parent would again be
+/// reporting success for work that had not happened yet.
+pub fn signalReady(wr: posix.fd_t) void {
+    _ = posix.write(wr, &[_]u8{ready_byte}) catch {};
+    posix.close(wr);
+}
+
+/// Block until the daemon reports readiness, it dies, or `timeout_s` elapses.
+///
+/// Three outcomes, and they are deliberately distinct. EOF without a byte means
+/// the daemon exited during startup -- the case that used to report success.
+/// A timeout means it is still alive but not serving, which is neither a clean
+/// start nor a clean failure and should not be reported as either.
+fn awaitReady(rd: posix.fd_t, timeout_s: isize) !void {
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+
+    // Registration and wait in one syscall, which is the reason to use kqueue at
+    // all rather than reaching for poll.
+    var changes = [_]posix.Kevent{.{
+        .ident = @intCast(rd),
+        .filter = c.EVFILT.READ,
+        .flags = c.EV.ADD | c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+        ._ext = .{ 0, 0, 0, 0 },
+    }};
+    var events: [1]posix.Kevent = undefined;
+    const ts = posix.timespec{ .sec = timeout_s, .nsec = 0 };
+
+    if (try posix.kevent(kq, &changes, &events, &ts) == 0) return error.StartupTimedOut;
+
+    var buf: [1]u8 = undefined;
+    const n = try posix.read(rd, &buf);
+    if (n == 0 or buf[0] != ready_byte) return error.StartupFailed;
 }
 
 /// Write the current PID to a file.
@@ -191,4 +286,55 @@ test "write and remove pid file" {
     const content = std.mem.trimRight(u8, buf[0..n], "\n");
     const pid = try std.fmt.parseInt(i32, content, 10);
     try std.testing.expect(pid > 0);
+}
+
+// --- X-16(a): the readiness handshake ----------------------------------------
+//
+// These run against a real pipe rather than a real fork. The protocol is what is
+// worth testing and it is fully observable from one process: a byte means the
+// daemon came up, EOF without a byte means it died on the way, and neither
+// arriving means it is wedged. Forking inside the test runner would test
+// `posix.fork` and cost the ability to assert anything.
+
+test "X-16: the ready byte releases the parent" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    signalReady(fds[1]); // closes the write end
+    try awaitReady(fds[0], 5);
+}
+
+test "X-16: a child that dies before signalling fails the parent" {
+    // This is the measured defect. The daemon exits during startup, its copy of
+    // the write end closes, and the parent sees EOF with no byte. Before this
+    // handshake existed the parent had already exited 0 and `rc.d` reported a
+    // started service with nothing listening.
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    posix.close(fds[1]); // the child exits without signalling
+    try std.testing.expectError(error.StartupFailed, awaitReady(fds[0], 5));
+}
+
+test "X-16: a wedged child does not hang the parent forever" {
+    // The write end stays open and silent, which is what a daemon stuck resolving
+    // DNS or blocked on a lock looks like. Waiting forever would turn a hung start
+    // into a hung `service start`, so the wait is bounded and the timeout is
+    // distinguishable from a clean failure.
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try std.testing.expectError(error.StartupTimedOut, awaitReady(fds[0], 0));
+}
+
+test "X-16: the parent rejects a byte it did not agree to" {
+    // An unrelated inherited descriptor writing into the pipe must not be read as
+    // a successful start.
+    const fds = try posix.pipe();
+    defer posix.close(fds[0]);
+
+    _ = try posix.write(fds[1], "?");
+    posix.close(fds[1]);
+    try std.testing.expectError(error.StartupFailed, awaitReady(fds[0], 5));
 }
