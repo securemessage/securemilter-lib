@@ -1,3 +1,4 @@
+pub const cli = @import("cli.zig");
 pub const config = @import("config.zig");
 pub const milter = @import("milter/protocol.zig");
 pub const listener = @import("listener.zig");
@@ -15,6 +16,7 @@ pub const rcu = @import("rcu.zig");
 pub const log = @import("log.zig");
 
 test {
+    _ = cli;
     _ = config;
     _ = milter;
     _ = listener;
