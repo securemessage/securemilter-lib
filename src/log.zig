@@ -251,22 +251,34 @@ pub const Logger = struct {
 /// Thread-local logger instance. Each worker thread initializes this once.
 pub threadlocal var logger: Logger = Logger{
     .fd = Logger.NO_FD,
-    .config = &default_config,
+    .config = &global_config,
     .pid = 0,
 };
 
-/// Default config (stderr, info level) for use before explicit init.
-var default_config: LogConfig = LogConfig.init(false, .mail, .info, "securemilter");
-
-/// Global shared config pointer. Set once by initGlobal(), read by all threads.
-var global_config: *const LogConfig = &default_config;
+/// The one live logging configuration, HELD BY VALUE AND NOT BY POINTER.
+///
+/// It used to be a `*const LogConfig` aimed at whatever the caller passed, with a doc
+/// comment requiring that the caller's config outlive every logger. All four daemons
+/// broke that rule in the same way: the config was a `const` local in `main`, so the
+/// pointer dangled the moment that frame returned.
+///
+/// Latent for as long as nothing logged after `main`'s body -- and then X-16 added the
+/// one thing that does. The disposition line came out as `__[69398]: fatal: ...`,
+/// reading a dead stack frame for the ident, on the single log line an operator has to
+/// diagnose a daemon that would not start.
+///
+/// `LogConfig` is plain data -- the ident is an inline `[64]u8`, not a slice -- so
+/// copying costs one 70-byte assignment at startup and makes the lifetime question
+/// disappear rather than be documented. Every logger points here, and this outlives
+/// every thread.
+var global_config: LogConfig = LogConfig.init(false, .mail, .info, "securemilter");
 
 /// Initialize the global logging configuration.
 ///
-/// Call once from main() after parsing config, before spawning workers.
-/// The config must outlive all logger instances (typically static or arena-allocated).
+/// Call once from main() after parsing config, before spawning workers. `cfg` is
+/// COPIED, so it may be a stack local and is the caller's to discard immediately.
 pub fn initGlobal(cfg: *const LogConfig) void {
-    global_config = cfg;
+    global_config = cfg.*;
 }
 
 /// Initialize the thread-local logger for the current thread.
@@ -274,7 +286,7 @@ pub fn initGlobal(cfg: *const LogConfig) void {
 /// Call once at the start of each worker thread entry function.
 /// Uses the global config set by initGlobal().
 pub fn initThread() void {
-    logger = Logger.init(global_config);
+    logger = Logger.init(&global_config);
 }
 
 /// Deinitialize the thread-local logger (close socket).
@@ -303,6 +315,29 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
+
+test "initGlobal copies, so a caller's stack local cannot dangle" {
+    // Found by X-16, not by reading: every daemon passed `&log_cfg` where `log_cfg`
+    // was a local in `main`. Nothing logged after that frame died, so it never showed
+    // -- until the fatal-disposition line did exactly that and printed its ident out
+    // of a dead stack frame as `__`.
+    //
+    // Simulating a returned frame is not something a test can do portably. Overwriting
+    // the caller's copy is the same aliasing question and is deterministic: if the
+    // global still points at `cfg`, it now reads the second value.
+    const saved = global_config;
+    defer global_config = saved;
+
+    var cfg = LogConfig.init(false, .mail, .info, "first");
+    initGlobal(&cfg);
+    cfg = LogConfig.init(false, .mail, .debug, "second");
+
+    initThread();
+    defer logger = Logger{ .fd = Logger.NO_FD, .config = &global_config, .pid = 0 };
+
+    try std.testing.expectEqualStrings("first", logger.config.ident[0..logger.config.ident_len]);
+    try std.testing.expectEqual(Level.info, logger.config.level);
+}
 
 test "Level.fromString" {
     try std.testing.expectEqual(Level.err, Level.fromString("err"));

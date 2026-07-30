@@ -62,6 +62,7 @@ pub const Ops = struct {
     reinit_log: *const fn () void = log_mod.initThread,
     block_signals: *const fn () void = daemon.ManagedSignals.blockForKqueue,
     write_pid_file: *const fn ([]const u8) anyerror!void = daemon.writePidFile,
+    remove_pid_file: *const fn ([]const u8) void = daemon.removePidFile,
     raise_file_limit: *const fn (u64) void = daemon.raiseFileLimit,
     drop_privileges: *const fn ([]const u8) anyerror!void = daemon.dropPrivileges,
 };
@@ -114,9 +115,25 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     if (opts.spawn_threads) |spawn| spawn();
 
     // (4) still privileged here.
-    ops.write_pid_file(opts.pid_file) catch |err| {
+    //
+    // Whether the file is ours is tracked, rather than inferred later from the file
+    // existing: if the write failed, some other instance may own that path and
+    // removing it on the way out would be worse than leaving it.
+    var pid_file_is_ours = false;
+    if (ops.write_pid_file(opts.pid_file)) {
+        pid_file_is_ours = true;
+    } else |err| {
         log_mod.err("pid file write failed: {}", .{err});
-    };
+    }
+
+    // Claiming the file and surviving the rest of this function are separate events,
+    // and only the caller's `defer boot.deinit()` covered the gap between them -- which
+    // it cannot, because it is only registered once `run` has already returned. A
+    // privilege drop that fails here therefore left a PID file naming a process that
+    // no longer exists: verified as /tmp/x16pid.pid holding 70682 after
+    // "privilege drop to 'nobody' failed: error.SetgroupsFailed". Ownership now begins
+    // where the file does (X-16).
+    errdefer if (pid_file_is_ours) ops.remove_pid_file(opts.pid_file);
 
     const workers = if (opts.worker_threads == 0)
         @as(u32, @intCast(std.Thread.getCpuCount() catch 4))
@@ -136,6 +153,56 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     return .{ .pid_file = opts.pid_file, .workers = workers };
 }
 
+/// The disposition line: why this process is about to stop existing.
+///
+/// Pure, and separate from the emission, BECAUSE THE LOG OFFERS NOTHING TO OBSERVE --
+/// it writes to a datagram socket or to stderr and returns void. A test can assert on
+/// this; it cannot assert on `log_mod.err`. The thing worth pinning is that the error
+/// is NAMED, since the whole defect was an operator with no way to tell which of a
+/// dozen failures had happened.
+pub fn fatalMessage(buf: []u8, e: anyerror) []const u8 {
+    return std.fmt.bufPrint(buf, "fatal: exiting on {s}", .{@errorName(e)}) catch
+        // Only reachable if `buf` cannot hold even the error name. Still says the one
+        // thing that must never be lost: this process is stopping on an error.
+        "fatal: exiting on an error whose name did not fit";
+}
+
+/// Announce a fatal failure through the log, then hand the error back to propagate.
+///
+/// Used as the whole body of `main`:
+///
+///     pub fn main() !void {
+///         run() catch |e| return bootstrap.fatal(e);
+///     }
+///
+/// THE SHAPE IS THE POINT, not the function. `daemonize` is the first thing `run`
+/// does, and it points stderr at /dev/null -- so from that instant the error Zig's
+/// start code prints for an error returned by `main` goes nowhere, and syslog is the
+/// only channel left. Every fallible step after it (the shutdown pipe, the worker
+/// pool, and whatever is added later) therefore had exactly one way to report: a
+/// `try` whose error was written to a closed descriptor. Measured on a daemon told to
+/// bind an unusable address: parent exit status 0, nothing listening, no process, and
+/// a last log line reading "starting" (X-16).
+///
+/// Reporting at the single point where every error converges is what makes this
+/// robust to a `try` added later. Per-site `catch` blocks were the alternative and
+/// are how X-7 came to be fixed in one of four copies.
+///
+/// The error is returned rather than swallowed so the exit status stays non-zero.
+/// That is necessary but NOT sufficient, and deliberately not the whole fix: the
+/// parent has already exited 0 by the time this runs, so `rc.d` still reports a
+/// started service. Closing that needs a readiness handshake across the fork, which
+/// is X-16(a) and a change of protocol rather than of reporting.
+///
+/// A failure that already logged its own diagnostic gets a second line here. That is
+/// intended: the diagnostic says what was wrong with the input, this says what became
+/// of the process, and only one of the two is guaranteed to exist.
+pub fn fatal(e: anyerror) anyerror {
+    var buf: [256]u8 = undefined;
+    log_mod.err("{s}", .{fatalMessage(&buf, e)});
+    return e;
+}
+
 // --- ordering ----------------------------------------------------------------
 //
 // Each test below names the defect it exists to catch. They assert RELATIONS rather
@@ -143,7 +210,7 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
 // the PID file is claimed before or after the fd limit is free, and a test that pinned
 // the whole order would fail on a change that breaks nothing.
 
-const Step = enum { daemonize, reinit_log, block_signals, spawn_threads, write_pid, raise_fd, drop_privs };
+const Step = enum { daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs };
 
 var recorded: [16]Step = undefined;
 var recorded_len: usize = 0;
@@ -170,6 +237,9 @@ fn recSpawnThreads() void {
 fn recWritePid(_: []const u8) anyerror!void {
     record(.write_pid);
 }
+fn recRemovePid(_: []const u8) void {
+    record(.remove_pid);
+}
 fn recRaiseFd(_: u64) void {
     record(.raise_fd);
 }
@@ -182,6 +252,7 @@ const recording_ops = Ops{
     .reinit_log = recReinitLog,
     .block_signals = recBlockSignals,
     .write_pid_file = recWritePid,
+    .remove_pid_file = recRemovePid,
     .raise_file_limit = recRaiseFd,
     .drop_privileges = recDropPrivs,
 };
@@ -313,4 +384,88 @@ test "a failed PID file write is survivable, but a failed privilege drop is not"
     }.f;
     recorded_len = 0;
     try std.testing.expectError(error.SetuidFailed, runWithOps(test_opts, ops));
+}
+
+// --- X-16: the PID file belongs to a process that exists ---------------------
+
+test "X-16: a fatal privilege drop takes the PID file with it" {
+    // Measured before the fix: /tmp/x16pid.pid left holding 70682 after
+    // "privilege drop to 'nobody' failed", naming a process that had already exited.
+    // The caller's `defer boot.deinit()` cannot cover this -- it is only registered
+    // once `run` has returned, and `run` did not.
+    //
+    // A stale PID file is not cosmetic. It is what `rc.d` reads to decide whether the
+    // service is running, and what an operator signals.
+    var ops = recording_ops;
+    ops.drop_privileges = struct {
+        fn f(_: []const u8) anyerror!void {
+            return error.SetgroupsFailed;
+        }
+    }.f;
+    recorded_len = 0;
+
+    try std.testing.expectError(error.SetgroupsFailed, runWithOps(test_opts, ops));
+    try expectBefore(.write_pid, .remove_pid);
+}
+
+test "X-16: a successful bootstrap keeps its PID file" {
+    // The removal is an error path only. Removing on the way out of a good start would
+    // leave a running daemon nothing could signal -- the same end state as the defect,
+    // reached from the opposite direction.
+    _ = try runRecorded(test_opts);
+    try std.testing.expect(indexOf(.remove_pid) == null);
+}
+
+test "X-16: a PID file we failed to write is not removed on the way out" {
+    // If the write failed, the path may belong to another instance. Deleting it
+    // because we are exiting would make this daemon's failure into that one's.
+    var ops = recording_ops;
+    ops.write_pid_file = struct {
+        fn f(_: []const u8) anyerror!void {
+            return error.AccessDenied;
+        }
+    }.f;
+    ops.drop_privileges = struct {
+        fn f(_: []const u8) anyerror!void {
+            return error.SetgroupsFailed;
+        }
+    }.f;
+    recorded_len = 0;
+
+    try std.testing.expectError(error.SetgroupsFailed, runWithOps(test_opts, ops));
+    try std.testing.expect(indexOf(.remove_pid) == null);
+}
+
+// --- X-16(b): a fatal failure says so ----------------------------------------
+
+test "X-16: the disposition line names the error that stopped the daemon" {
+    // The measured defect: a daemon told to bind an unusable address exited 0 with a
+    // last log line of "starting". The operator's evidence of a failed start was an
+    // affirmative claim of success. Whatever else is lost, the error's name must not
+    // be -- it is the difference between "the address was taken" and "the key was
+    // unreadable", and there is no second channel to ask on.
+    var buf: [256]u8 = undefined;
+    const msg = fatalMessage(&buf, error.AddressNotAvailable);
+
+    try std.testing.expect(std.mem.indexOf(u8, msg, "AddressNotAvailable") != null);
+    // "fatal" is what a human greps for, and what distinguishes this line from the
+    // diagnostics above it, which are also logged at err level.
+    try std.testing.expect(std.mem.startsWith(u8, msg, "fatal:"));
+}
+
+test "X-16: a buffer too small for the error name still reports a fatal exit" {
+    // The formatter is the last thing to run before the process disappears, so it may
+    // not be the thing that breaks. Losing the name is survivable; losing the fact
+    // that the daemon died is the defect all over again.
+    var tiny: [8]u8 = undefined;
+    const msg = fatalMessage(&tiny, error.SomeVeryLongErrorNameIndeed);
+
+    try std.testing.expect(std.mem.indexOf(u8, msg, "fatal") != null);
+}
+
+test "X-16: fatal returns the error unchanged, so the exit status stays non-zero" {
+    // `main` propagates what this hands back. Swallowing the error here would make the
+    // process exit 0 -- which is the half of X-16 that survives until the readiness
+    // handshake lands, and would be made permanent by returning void.
+    try std.testing.expectEqual(anyerror.AddressInUse, fatal(error.AddressInUse));
 }
