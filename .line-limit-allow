@@ -1,3 +1,30 @@
+# 2026-07-29, refactor plan stage 3.1: worker.zig 632 -> 659, RAISED DELIBERATELY.
+#
+#   handleConnectionData was the deepest function in any of the six repositories at
+#   NESTING DEPTH 7 -- a `while` around a `switch` around a `while` around a `switch`
+#   -- and it is the milter read path, where X-6's connection deadlock lived. Now
+#   depth 4 and 49 -> 30 lines, with the inner pass extracted as `drainBuffered`.
+#
+#   The check `if (self.connections.get(fd) == null) return;` APPEARED FIVE TIMES with
+#   no name on it. It is not defensive noise: a handler can close the connection --
+#   sendResponse removes it on a write failure -- so `conn` is freed memory the instant
+#   dispatchPacket returns, and each of those five was load-bearing. It is now
+#   `alive(fd)`, named once and explained once.
+#
+#   THE TEST CAME FIRST, which is the part worth insisting on. The property this
+#   function turns on was documented only in a comment and covered by nothing: `feed`
+#   reads at most 8192 bytes, so a larger packet returns .incomplete repeatedly, and
+#   returning to the event loop on one waits for a kqueue edge that never arrives once
+#   the peer is blocked writing. The new test sends one 24593-byte SMFIC_BODY packet
+#   over a socketpair and calls the function ONCE. Teeth-checked against BOTH the old
+#   and the new shape by changing `.incomplete => continue` to `return`: "expected
+#   24593, found 0" in each case.
+#
+#   +27 net. Roughly 8 of those are the test's `recordBodyLen` helper and its module
+#   variable, which sit outside the `test` block and so count as production -- the
+#   limitation recorded in 11.31. The rest is two signatures and their doc comments,
+#   bought with three levels of nesting and four unexplained repetitions.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -11,4 +38,4 @@
 # under it are regenerated every time a ceiling moves.
 442 src/connection.zig
 471 src/dns/resolver.zig
-632 src/worker.zig
+659 src/worker.zig

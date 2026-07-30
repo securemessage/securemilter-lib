@@ -312,49 +312,66 @@ pub const Worker = struct {
         }
     }
 
+    /// Whether the connection is still in the map after a dispatch.
+    ///
+    /// A handler can close the connection -- `sendResponse` removes it on a write
+    /// failure -- so `conn` may be freed memory the moment `dispatchPacket` returns.
+    /// This check appeared five times in `handleConnectionData` with no name on it.
+    fn alive(self: *Worker, fd: posix.fd_t) bool {
+        return self.connections.get(fd) != null;
+    }
+
+    /// Dispatch every packet already sitting in the reader's buffer.
+    ///
+    /// Postfix pipelines commands, so one read can carry several packets. `tryDecode`
+    /// is deliberately used rather than `feed`: this pass must not issue another
+    /// `read(2)`, only drain what the last one already delivered.
+    ///
+    /// Returns false if the connection went away, in which case `fd` is closed and
+    /// `conn` is freed.
+    fn drainBuffered(self: *Worker, conn: *connection_mod.Connection, fd: posix.fd_t) bool {
+        while (self.alive(fd)) {
+            switch (conn.reader.tryDecode()) {
+                .packet => |pkt| {
+                    self.dispatchPacket(conn, pkt);
+                    if (!self.alive(fd)) return false;
+                    conn.reader.consume();
+                },
+                // Both mean "nothing more decodable without another read".
+                .incomplete, .would_block => return true,
+                .closed, .err => {
+                    self.removeConnection(fd);
+                    return false;
+                },
+            }
+        }
+        return false;
+    }
+
     fn handleConnectionData(self: *Worker, fd: posix.fd_t) void {
         const conn = self.connections.get(fd) orelse return;
 
-        // Drain the socket and every buffered packet. A partial packet
-        // (.incomplete) means the rest may already sit in the kernel
-        // buffer, so keep feeding; feed() reports .would_block only once
-        // the socket is actually drained. Yielding to the event loop on a
-        // partial packet would wait for a kqueue edge that never arrives
-        // once the peer's send window fills.
-        while (true) {
-            if (self.connections.get(fd) == null) return; // connection was removed
-
+        // Drain the socket and every buffered packet.
+        //
+        // X-6: a partial packet (.incomplete) means the rest may already sit in the
+        // kernel buffer, so keep feeding. `feed` reports .would_block only once the
+        // socket is actually drained, and yielding to the event loop on a partial
+        // packet would wait for a kqueue edge that never arrives once the peer's send
+        // window fills. Covered by the test at the foot of this file, which sends one
+        // packet larger than the 8192-byte read chunk and calls this once.
+        while (self.alive(fd)) {
             switch (conn.reader.feed(fd)) {
                 .packet => |pkt| {
                     self.dispatchPacket(conn, pkt);
-                    if (self.connections.get(fd) == null) return;
+                    if (!self.alive(fd)) return;
                     conn.reader.consume();
-                    // More complete packets may already be buffered
-                    // (Postfix pipelines commands); tryDecode without
-                    // another read() before looping back to feed().
-                    while (self.connections.get(fd) != null) {
-                        switch (conn.reader.tryDecode()) {
-                            .packet => |next| {
-                                self.dispatchPacket(conn, next);
-                                if (self.connections.get(fd) == null) return;
-                                conn.reader.consume();
-                            },
-                            .incomplete => break,
-                            .would_block => break,
-                            .closed, .err => {
-                                self.removeConnection(fd);
-                                return;
-                            },
-                        }
-                    }
+                    if (!self.drainBuffered(conn, fd)) return;
                 },
+                // The rest of this packet may already be buffered; read again.
                 .incomplete => continue,
+                // Socket drained: this is the only path that returns to the loop.
                 .would_block => return,
-                .closed => {
-                    self.removeConnection(fd);
-                    return;
-                },
-                .err => {
+                .closed, .err => {
                     self.removeConnection(fd);
                     return;
                 },
