@@ -121,8 +121,59 @@ fn awaitReady(rd: posix.fd_t, timeout_s: isize) !void {
     if (n == 0 or buf[0] != ready_byte) return error.StartupFailed;
 }
 
-/// Write the current PID to a file.
+/// The PID recorded in `path`, if a process by that number is still alive.
+///
+/// `null` means the file is safe to take over: absent, unreadable, not a PID, or
+/// naming a process that no longer exists. Anything else is a live holder.
+///
+/// **EPERM counts as alive.** `kill(pid, 0)` failing with `PermissionDenied` means
+/// the process is there and simply belongs to someone else -- reading that as "not
+/// running" is the classic form of this bug, and it is the reading that lets a
+/// second instance start beside the first. `Unexpected` is treated the same way,
+/// because refusing to start is recoverable by hand and two daemons sharing a
+/// socket via SO_REUSEPORT, splitting mail between two different configurations,
+/// is not.
+///
+/// KNOWN LIMIT, not solved here: PID numbers are recycled, so a stale file whose
+/// number has been reused by an unrelated process reads as live and this refuses
+/// to start until the file is removed. Distinguishing that needs the holder's
+/// executable path (`KERN_PROC_PATHNAME`), which is more machinery than the
+/// failure justifies -- and under `rc.d` the `pidfile=` handling in `rc.subr` is
+/// the first line of defence anyway. This exists for the cases that bypass it:
+/// foreground runs, `monit`, and containers.
+fn livePidFileHolder(path: []const u8) ?c.pid_t {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    var buf: [32]u8 = undefined;
+    const n = file.readAll(&buf) catch return null;
+    const text = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const pid = std.fmt.parseInt(c.pid_t, text, 10) catch return null;
+    if (pid <= 0) return null;
+
+    posix.kill(pid, 0) catch |e| switch (e) {
+        error.ProcessNotFound => return null,
+        else => return pid,
+    };
+    return pid;
+}
+
+/// Write the current PID to a file, refusing if another instance holds it.
+///
+/// Returns `error.AlreadyRunning` when a live process is named by an existing
+/// file. That error is deliberately distinct: `bootstrap` tolerates every other
+/// failure here -- a daemon that cannot write a PID file should still carry mail --
+/// but starting a second copy of a milter alongside the first is not something to
+/// log and continue past.
 pub fn writePidFile(path: []const u8) !void {
+    if (livePidFileHolder(path)) |holder| {
+        log_mod.err(
+            "pid file {s} is held by live process {d}; refusing to start a second instance",
+            .{ path, holder },
+        );
+        return error.AlreadyRunning;
+    }
+
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
 
@@ -286,6 +337,73 @@ test "write and remove pid file" {
     const content = std.mem.trimRight(u8, buf[0..n], "\n");
     const pid = try std.fmt.parseInt(i32, content, 10);
     try std.testing.expect(pid > 0);
+}
+
+// --- L-5: a PID file held by a live process ----------------------------------
+//
+// The live case is testable without forking, and honestly: the test process is
+// itself a live PID, so writing our own number into the file is exactly the
+// condition a second instance would find. No stub, no injected clock.
+
+test "a pid file held by a live process is refused" {
+    const path = "/tmp/securemilter-test-live.pid";
+    defer removePidFile(path);
+
+    // Claim it once. This is the running daemon.
+    try writePidFile(path);
+
+    // A second start finds our own PID in the file, and ours is unambiguously
+    // alive. The specific error matters -- `bootstrap` keys on it to decide
+    // between refusing and carrying on.
+    try std.testing.expectError(error.AlreadyRunning, writePidFile(path));
+
+    // And the refusal left the file alone rather than truncating it.
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    var buf: [64]u8 = undefined;
+    const n = try file.readAll(&buf);
+    const held = try std.fmt.parseInt(c.pid_t, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10);
+    try std.testing.expectEqual(c.getpid(), held);
+}
+
+test "a stale pid file is taken over" {
+    const path = "/tmp/securemilter-test-stale.pid";
+    defer removePidFile(path);
+
+    // PID 0x7FFFFFFE: within pid_t, above any live process on a running system,
+    // and not a wildcard the way 0 and -1 are in kill(2). A number that reads as
+    // "no such process" is the whole point, so it must not be one kill()
+    // interprets as a process group.
+    {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("2147483646\n");
+    }
+
+    try writePidFile(path);
+
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    var buf: [64]u8 = undefined;
+    const n = try file.readAll(&buf);
+    const held = try std.fmt.parseInt(c.pid_t, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10);
+    try std.testing.expectEqual(c.getpid(), held);
+}
+
+test "a malformed pid file is taken over rather than refused" {
+    const path = "/tmp/securemilter-test-junk.pid";
+    defer removePidFile(path);
+
+    // Garbage, an empty file and a nonsense number all mean "nobody can prove an
+    // instance is running", which must not become a permanent refusal to start.
+    for ([_][]const u8{ "not-a-pid\n", "", "-1\n", "0\n" }) |content| {
+        {
+            const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll(content);
+        }
+        try writePidFile(path);
+    }
 }
 
 // --- X-16(a): the readiness handshake ----------------------------------------

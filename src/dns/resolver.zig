@@ -191,9 +191,22 @@ pub const Cache = struct {
         });
     }
 
+    /// Build the key for a name/type pair, **case-folded** (audit L-3).
+    ///
+    /// Names are case-insensitive (RFC 1035 §2.3.3), so keyed verbatim `Example.COM`
+    /// and `example.com` were two entries. The half that is not merely wasteful: a
+    /// NEGATIVE entry could be stepped around by re-asking in another case, so a name
+    /// that just NXDOMAINed was queried again instead of being suppressed for its TTL.
+    /// Folding here covers every path, since all of them build their key through this.
+    ///
+    /// ASCII-only per RFC 4343 -- folding a non-ASCII byte would merge names the
+    /// protocol keeps distinct.
     pub fn makeCacheKey(self: *Cache, domain: []const u8, rtype: packet.RecordType) ![]u8 {
         const type_int = @intFromEnum(rtype);
-        return std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ domain, type_int });
+        const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ domain, type_int });
+        // Bounded to the name: the ":<type>" suffix this appended is digits already.
+        for (key[0..domain.len]) |*ch| ch.* = std.ascii.toLower(ch.*);
+        return key;
     }
 
     pub fn dupeAnswers(self: *Cache, answers: []const packet.Answer) ![]packet.Answer {
@@ -535,6 +548,65 @@ test "cache negative entry" {
     const cached = cache.get(key);
     try std.testing.expect(cached != null);
     try std.testing.expectEqual(NegativeKind.name_error, cached.?.negative.?);
+}
+
+// L-3. Two assertions, because only the second one is more than housekeeping:
+// a negative entry that can be stepped around by changing capitalisation is not
+// suppressing anything.
+test "a name cached in one case is found in another" {
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
+    defer cache.deinit();
+
+    const answers = &[_]packet.Answer{.{
+        .name = "example.com",
+        .record_type = @intFromEnum(packet.RecordType.TXT),
+        .ttl = 300,
+        .data = "v=spf1 -all",
+    }};
+    try cache.put("Example.COM", .TXT, answers);
+
+    // Stored under one spelling, asked for under two others.
+    for ([_][]const u8{ "example.com", "EXAMPLE.com", "Example.COM" }) |spelling| {
+        const key = try cache.makeCacheKey(spelling, .TXT);
+        defer std.testing.allocator.free(key);
+        const hit = cache.get(key);
+        try std.testing.expect(hit != null);
+        try std.testing.expectEqualStrings("v=spf1 -all", hit.?.answers[0].data);
+    }
+
+    // And it is ONE entry, not three: the point is a shared cache slot, not
+    // merely that each spelling happens to resolve.
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+}
+
+test "a negative entry cannot be bypassed by re-asking in another case" {
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
+    defer cache.deinit();
+
+    try cache.putNegative("nxdomain.example", .TXT, .name_error);
+
+    const key = try cache.makeCacheKey("NXDomain.Example", .TXT);
+    defer std.testing.allocator.free(key);
+    const hit = cache.get(key);
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(NegativeKind.name_error, hit.?.negative.?);
+}
+
+// RFC 4343 confines DNS case-insensitivity to US-ASCII. Folding a non-ASCII byte
+// would merge names the protocol keeps distinct, so the fold must stop at 0x7f.
+// Pinned because `toLower` is the kind of call someone later swaps for a
+// Unicode-aware one without realising it changes what counts as the same name.
+test "makeCacheKey does not case-fold non-ASCII bytes" {
+    var cache = Cache.init(std.testing.allocator, 1000, 60);
+    defer cache.deinit();
+
+    const a = try cache.makeCacheKey("\xc3\x9fexample.com", .TXT);
+    defer std.testing.allocator.free(a);
+    const b = try cache.makeCacheKey("\xc3\xbfexample.com", .TXT);
+    defer std.testing.allocator.free(b);
+
+    try std.testing.expect(!mem.eql(u8, a, b));
+    try std.testing.expectEqualStrings("\xc3\x9fexample.com:16", a);
 }
 
 test "a cached timeout does not masquerade as a name error" {

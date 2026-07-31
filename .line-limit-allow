@@ -92,6 +92,24 @@
 #   taken. Recording that explicitly so the next reader does not go looking for
 #   a debt that is not there.
 #
+# 2026-07-31, L-3: dns/resolver.zig 494 -> 507, +13.
+#
+#   `makeCacheKey` now case-folds the name, because DNS names are case-insensitive
+#   (RFC 1035 2.3.3) and keying them verbatim made `Example.COM` and `example.com`
+#   two entries. The half worth the lines: a NEGATIVE entry could be stepped around
+#   by re-asking in another case, so a name that had just NXDOMAINed was queried
+#   again rather than suppressed for its TTL.
+#
+#   Two lines of code. The other eleven are the doc comment, and they were 15
+#   before being cut back -- a two-line fix should not cost seventeen. What is left
+#   is the two RFC citations (1035 for the fold, 4343 for why it stops at ASCII,
+#   since folding a non-ASCII byte would merge names the protocol keeps distinct)
+#   and the negative-cache consequence, which is the reason this is a finding and
+#   not housekeeping.
+#
+#   NO OBLIGATION TO UNDO. This file's own debt is the pool/eviction split noted
+#   under X-15 for worker.zig; nothing here adds to it.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -105,5 +123,5 @@
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
 449 src/connection.zig
-494 src/dns/resolver.zig
+507 src/dns/resolver.zig
 620 src/worker.zig

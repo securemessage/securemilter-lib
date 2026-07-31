@@ -143,11 +143,21 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     // Whether the file is ours is tracked, rather than inferred later from the file
     // existing: if the write failed, some other instance may own that path and
     // removing it on the way out would be worse than leaving it.
+    // Two outcomes, deliberately not one. A PID file that cannot be written is an
+    // operational annoyance -- `monit` loses track of us -- and stopping mail flow
+    // over it would be the worse failure, so it is logged and tolerated as before.
+    // `AlreadyRunning` is different in kind: another live instance holds the file,
+    // and `SO_REUSEPORT` means starting anyway does not fail loudly on the bind. It
+    // succeeds, and two daemons then split mail between two configurations, which
+    // is the sort of thing that gets diagnosed weeks later from inconsistent
+    // Authentication-Results. Refuse, and let X-16's ready-byte handshake carry the
+    // refusal back to `service start` (audit L-5).
     var pid_file_is_ours = false;
     if (ops.write_pid_file(opts.pid_file)) {
         pid_file_is_ours = true;
-    } else |err| {
-        log_mod.err("pid file write failed: {}", .{err});
+    } else |err| switch (err) {
+        error.AlreadyRunning => return err,
+        else => log_mod.err("pid file write failed: {}", .{err}),
     }
 
     // Claiming the file and surviving the rest of this function are separate events,
