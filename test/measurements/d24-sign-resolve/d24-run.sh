@@ -79,7 +79,7 @@ probe() {
         jexec "$JAIL" sockstat -4l 2>/dev/null | grep -q ":$PORT" && break
         _i=$((_i + 1)); sleep 0.1
     done
-    perl /root/rm/d24-sign.pl "$IP" "$PORT" "$_from" || true
+    perl /root/rm/signclient.pl "$IP" "$PORT" "$_from" || true
     echo "--- daemon log: $(wc -l < "$D/$_cfg.log" | tr -d ' ') lines"
     grep -iE 'sign|key|table|error|warn' "$D/$_cfg.log" | sed 's/^/    /' || echo "    (nothing about signing)"
     kill "$_pid" 2>/dev/null || true
