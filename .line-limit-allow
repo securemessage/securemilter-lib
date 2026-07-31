@@ -77,5 +77,5 @@
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
 430 src/connection.zig
-464 src/dns/resolver.zig
+494 src/dns/resolver.zig
 601 src/worker.zig

@@ -303,9 +303,37 @@ pub const Resolver = struct {
                 @panic("DNS resolver: invalid nameserver address");
         }
 
+        // Own the nameserver strings instead of borrowing the caller's.
+        //
+        // A resolver now outlives what configured it: audit X-3 made it one per
+        // worker thread, kept across messages, while securearc's nameserver list
+        // belongs to an RCU configuration snapshot whose `deinit` frees exactly
+        // these strings. The ordering makes that concrete rather than
+        // theoretical -- a worker announces quiescence at the top of its loop,
+        // which is what licences the main thread to free a retired snapshot, and
+        // only THEN calls the reload hook that drops this resolver. In between,
+        // a live resolver holds a slice into freed memory.
+        //
+        // Nothing dereferences it today: after init only `timeout_ms` and
+        // `retries` are read, and queries go to the parsed `addrs` above. But
+        // that is an invariant no one wrote down and the compiler cannot check,
+        // and it turns into a use-after-free the first time someone re-reads the
+        // list -- to re-resolve a nameserver hostname, say, or to log which
+        // server answered. Copying a handful of short strings once per worker
+        // costs nothing measurable and makes the struct self-contained.
+        const owned_ns = allocator.alloc([]const u8, config.nameservers.len) catch
+            @panic("DNS resolver: failed to allocate nameserver list");
+        for (config.nameservers, 0..) |ns, i| {
+            owned_ns[i] = allocator.dupe(u8, ns) catch
+                @panic("DNS resolver: failed to copy nameserver");
+        }
+
+        var owned_config = config;
+        owned_config.nameservers = owned_ns;
+
         return .{
             .allocator = allocator,
-            .config = config,
+            .config = owned_config,
             .cache = Cache.init(allocator, config.cache_size, config.negative_ttl),
             .next_id = @truncate(@as(u64, @bitCast(std.time.milliTimestamp()))),
             .addrs = addrs,
@@ -317,6 +345,8 @@ pub const Resolver = struct {
     pub fn deinit(self: *Resolver) void {
         self.cache.deinit();
         self.allocator.free(self.addrs);
+        for (self.config.nameservers) |ns| self.allocator.free(ns);
+        self.allocator.free(self.config.nameservers);
     }
 
     /// Resolve a domain name for the given record type.
@@ -568,4 +598,35 @@ test "resolver multi-server init" {
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 3), r.addrs.len);
     try std.testing.expectEqual(@as(usize, 0), r.rr_index);
+}
+
+test "resolver outlives the nameserver strings it was configured from" {
+    // The lifetime this asserts is securearc's: its nameserver list belongs to
+    // an RCU configuration snapshot, and since X-3 the resolver is per worker
+    // thread rather than per message, so it is still alive when a retired
+    // snapshot is reclaimed. The worker announces quiescence -- which is what
+    // permits that reclamation -- BEFORE calling the hook that drops the
+    // resolver, so this window is real and not hypothetical.
+    //
+    // Freeing the caller's strings and then using the resolver is exactly what
+    // the daemon does; under the testing allocator a borrowed slice here is a
+    // use-after-free rather than a silent pass.
+    const alloc = std.testing.allocator;
+
+    var servers = try alloc.alloc([]const u8, 2);
+    servers[0] = try alloc.dupe(u8, "192.0.2.1");
+    servers[1] = try alloc.dupe(u8, "192.0.2.2");
+
+    var r = Resolver.init(alloc, .{ .nameservers = servers });
+    defer r.deinit();
+
+    // The configuration snapshot goes away, as `Reloadable.deinit` does to it.
+    for (servers) |s| alloc.free(s);
+    alloc.free(servers);
+
+    // The resolver must still hold its own readable copy, not the freed one.
+    try std.testing.expectEqual(@as(usize, 2), r.config.nameservers.len);
+    try std.testing.expectEqualStrings("192.0.2.1", r.config.nameservers[0]);
+    try std.testing.expectEqualStrings("192.0.2.2", r.config.nameservers[1]);
+    try std.testing.expectEqual(@as(usize, 2), r.addrs.len);
 }
