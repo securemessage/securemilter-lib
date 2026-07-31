@@ -43,7 +43,7 @@ pub fn build(allocator: Allocator, authserv_id: []const u8, results: []const Met
 
         if (mr.reason) |reason| {
             try buf.appendSlice(allocator, " (");
-            try buf.appendSlice(allocator, reason);
+            try appendComment(allocator, &buf, reason);
             try buf.append(allocator, ')');
         }
 
@@ -53,11 +53,95 @@ pub fn build(allocator: Allocator, authserv_id: []const u8, results: []const Met
             try buf.append(allocator, '.');
             try buf.appendSlice(allocator, prop.property);
             try buf.append(allocator, '=');
-            try buf.appendSlice(allocator, prop.value);
+            try appendPvalue(allocator, &buf, prop.value);
         }
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+/// May this byte stand unquoted in a `pvalue`?
+///
+/// RFC 8601 §2.2 gives `pvalue` as an RFC 2045 `value` (token / quoted-string) or
+/// an address/domain. The set below is the intersection that needs no quoting and
+/// still covers every legitimate value we emit -- domains, addresses and
+/// selectors. Everything else, `;` and SP included, gets quoted.
+fn isPvalueSafe(ch: u8) bool {
+    return switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9' => true,
+        '-', '.', '_', '@' => true,
+        else => false,
+    };
+}
+
+/// Write one `pvalue`, quoting it when it cannot stand bare.
+///
+/// THE VALUES REACHING HERE ARE CHOSEN BY THE SENDER: `smtp.helo` is the SMTP
+/// HELO string verbatim, `smtp.mailfrom` comes off the envelope, and
+/// `header.d`/`header.s` are tags lifted from a DKIM-Signature. Appended raw --
+/// as they were -- a `;` closed our result group and opened one of the sender's,
+/// inside a header carrying our own authserv-id and written after the X-1
+/// scrubber had already run. Measured against the lab, not reasoned about:
+/// `HELO x;spf=pass header.d=victim.example` was delivered as
+/// `spf=fail ... smtp.helo=x;spf=pass header.d=victim.example`, and through the
+/// relay that text ended up inside the AAR, under the seal. Postfix rewrites both
+/// the `;` and the space to `?` in Received while handing the milter the original
+/// string, which is why nothing downstream of us ever showed it.
+///
+/// Quoting rather than stripping: a quoted-string is what the grammar already
+/// provides for, `parseResults` has always read one, and it keeps the operator's
+/// diagnostic -- the odd HELO stays legible instead of being silently mangled.
+///
+/// Control bytes are replaced, never merely quoted. CR and LF are illegal inside
+/// a quoted-string and would end the header field outright; X-5 established that
+/// header-derived values reach a milter with bare-LF folding intact, so this is a
+/// reachable path to injecting a whole header rather than a stray token.
+fn appendPvalue(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
+    var needs_quoting = value.len == 0;
+    for (value) |ch| {
+        if (!isPvalueSafe(ch)) {
+            needs_quoting = true;
+            break;
+        }
+    }
+
+    if (!needs_quoting) {
+        try buf.appendSlice(allocator, value);
+        return;
+    }
+
+    try buf.append(allocator, '"');
+    for (value) |ch| {
+        if (ch < 0x20 or ch == 0x7f) {
+            try buf.append(allocator, '?');
+        } else if (ch == '"' or ch == '\\') {
+            try buf.append(allocator, '\\');
+            try buf.append(allocator, ch);
+        } else {
+            try buf.append(allocator, ch);
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+/// Write comment text, keeping it inside its parentheses.
+///
+/// Every `reason` we pass today is one of our own literals, so nothing here is
+/// sender-chosen yet. It is escaped anyway because the parenthesis is one
+/// unbalanced character away from being the same defect as `appendPvalue`
+/// documents, and the next caller to pass a sender-derived reason will not think
+/// to check.
+fn appendComment(allocator: Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
+    for (text) |ch| {
+        if (ch < 0x20 or ch == 0x7f) {
+            try buf.append(allocator, '?');
+        } else if (ch == '(' or ch == ')' or ch == '\\') {
+            try buf.append(allocator, '\\');
+            try buf.append(allocator, ch);
+        } else {
+            try buf.append(allocator, ch);
+        }
+    }
 }
 
 /// Build the "none" result (no authentication performed).
@@ -425,4 +509,131 @@ test "M-6: a result followed only by a comment still parses" {
     defer parsed.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("pass", parsed.getResult("spf").?);
+}
+
+// A sender-chosen property value must not be able to forge a result.
+//
+// The lab payload, verbatim: `HELO x;spf=pass header.d=victim.example`. Both the
+// semicolon and the space reach the milter -- Postfix rewrites them to `?` in
+// Received, which is why this never showed downstream -- and appended raw they
+// closed our `spf=fail` group and opened one of the sender's, inside a header
+// carrying our own authserv-id. `spf` is the method used here on purpose: the
+// X-1 scrubber in each daemon removes only the methods that daemon produces, and
+// securespf's has already run by the time it stamps, so nothing downstream
+// removes it. Delivered intact, and through the relay it landed inside the AAR
+// under the ARC seal.
+test "a semicolon in a property value cannot open a new result group" {
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{
+            .method = "spf",
+            .result = "fail",
+            .properties = &.{
+                .{ .ptype = "smtp", .property = "mailfrom", .value = "bambania.com" },
+                .{ .ptype = "smtp", .property = "helo", .value = "x;spf=pass header.d=victim.example" },
+            },
+        },
+    });
+    defer std.testing.allocator.free(value);
+
+    var parsed = try parseResults(std.testing.allocator, value);
+    defer parsed.deinit(std.testing.allocator);
+
+    // One group, not two. The forged one would also be an `spf`, so counting is
+    // what catches it -- `getResult("spf")` returns the first either way.
+    try std.testing.expectEqual(@as(usize, 1), parsed.results.items.len);
+    try std.testing.expectEqualStrings("fail", parsed.results.items[0].result);
+
+    // And the payload survives as data: still one property, still the whole
+    // string, so an operator reading the header sees the odd HELO rather than a
+    // silently truncated one.
+    //
+    // Returned WITH its quotes, because `property` hands back the pvalue as it
+    // appears rather than unquoting it. That is the safe direction and is left
+    // alone deliberately: a quoted value can only fail to match a domain it is
+    // compared against, never match one it should not, so alignment cannot be
+    // talked into a pass by quoting. Unquoting here would be more faithful to
+    // RFC 8601 and is a separate change with its own alignment analysis.
+    try std.testing.expectEqualStrings(
+        "\"x;spf=pass header.d=victim.example\"",
+        parsed.results.items[0].property("smtp.helo").?,
+    );
+    // Nothing acquired a domain it was not given.
+    try std.testing.expect(parsed.results.items[0].property("header.d") == null);
+}
+
+test "a control byte in a property value cannot end the header field" {
+    // Reachable per X-5: header-derived values arrive with bare-LF folding
+    // intact, and securedkim puts a signature's `d=` into `header.d`. A raw LF
+    // here would terminate the field and make the rest a new header.
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{
+            .method = "dkim",
+            .result = "pass",
+            .properties = &.{
+                .{ .ptype = "header", .property = "d", .value = "a\r\nX-Injected: yes" },
+            },
+        },
+    });
+    defer std.testing.allocator.free(value);
+
+    // The only CRLF in the output is the one `build` folds with.
+    try std.testing.expectEqual(@as(usize, 1), mem.count(u8, value, "\r\n"));
+    try std.testing.expect(mem.indexOf(u8, value, "\r\nX-Injected") == null);
+}
+
+test "a quote in a property value cannot end the quoted string" {
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{
+            .method = "dkim",
+            .result = "pass",
+            .properties = &.{
+                .{ .ptype = "header", .property = "d", .value = "a\" b;dkim=pass" },
+            },
+        },
+    });
+    defer std.testing.allocator.free(value);
+
+    var parsed = try parseResults(std.testing.allocator, value);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.results.items.len);
+}
+
+test "ordinary values are still emitted bare" {
+    // The quoting must not fire on the values we actually emit, or every A-R in
+    // production changes shape and the diff hides the one case that matters.
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{
+            .method = "dkim",
+            .result = "pass",
+            .properties = &.{
+                .{ .ptype = "header", .property = "d", .value = "example.com" },
+                .{ .ptype = "header", .property = "s", .value = "sel-2026_1" },
+                .{ .ptype = "smtp", .property = "mailfrom", .value = "user@example.com" },
+            },
+        },
+    });
+    defer std.testing.allocator.free(value);
+
+    try std.testing.expect(mem.indexOfScalar(u8, value, '"') == null);
+    try std.testing.expect(mem.indexOf(u8, value, "header.d=example.com") != null);
+    try std.testing.expect(mem.indexOf(u8, value, "smtp.mailfrom=user@example.com") != null);
+}
+
+test "a reason comment cannot escape its parentheses" {
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{
+            .method = "spf",
+            .result = "pass",
+            .reason = "client is ) evil; spf=fail",
+            .properties = &.{},
+        },
+    });
+    defer std.testing.allocator.free(value);
+
+    var parsed = try parseResults(std.testing.allocator, value);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.results.items.len);
+    try std.testing.expectEqualStrings("pass", parsed.results.items[0].result);
 }
