@@ -158,22 +158,48 @@ fn livePidFileHolder(path: []const u8) ?c.pid_t {
     return pid;
 }
 
-/// Write the current PID to a file, refusing if another instance holds it.
+/// Refuse to continue if another instance already holds the PID file.
 ///
-/// Returns `error.AlreadyRunning` when a live process is named by an existing
-/// file. That error is deliberately distinct: `bootstrap` tolerates every other
-/// failure here -- a daemon that cannot write a PID file should still carry mail --
-/// but starting a second copy of a milter alongside the first is not something to
-/// log and continue past.
-pub fn writePidFile(path: []const u8) !void {
-    if (livePidFileHolder(path)) |holder| {
-        log_mod.err(
-            "pid file {s} is held by live process {d}; refusing to start a second instance",
-            .{ path, holder },
-        );
-        return error.AlreadyRunning;
-    }
+/// MUST run BEFORE `daemonize`, and that ordering is the whole point.
+///
+/// This check first lived inside `writePidFile`, which runs *after* the fork
+/// because the PID it records only exists after it. That was wrong in a way no
+/// unit test could see. The standard FreeBSD idiom
+/// `daemon -p /var/run/x.pid /usr/local/sbin/x` has the supervisor write the pid
+/// of the process it execs, so by the time the post-fork check ran, the file
+/// already named a live process -- our own ancestor -- and the daemon refused to
+/// start against itself. Measured, not deduced: securespf logged `pid file
+/// /var/run/securemilter/securespf.pid is held by live process 70078; refusing to
+/// start a second instance` followed by `fatal: exiting on AlreadyRunning`.
+///
+/// Ancestry cannot rescue a post-fork check either. `daemonize` double-forks and
+/// the intermediate parent exits, so we are reparented to init and the ppid that
+/// would have identified 70078 as ours is gone -- and whether it has exited yet is
+/// a race, which is how this managed to pass locally and fail on the lab.
+///
+/// Run here instead and the ambiguity disappears: we are still the process the
+/// supervisor named, so a live holder that is not us is unambiguously a rival.
+/// Being tolerant is deliberate -- everything except a confirmed live rival is
+/// left for `writePidFile` to report, because a daemon that cannot read a PID file
+/// should still carry mail (L-5).
+pub fn checkNotAlreadyRunning(path: []const u8) !void {
+    const holder = livePidFileHolder(path) orelse return;
+    if (holder == c.getpid() or holder == c.getppid()) return;
 
+    log_mod.err(
+        "pid file {s} is held by live process {d}; refusing to start a second instance",
+        .{ path, holder },
+    );
+    return error.AlreadyRunning;
+}
+
+/// Write the current PID to a file.
+///
+/// Unconditional by design. Whether another instance is running is decided by
+/// `checkNotAlreadyRunning` before the fork; repeating the test here would
+/// re-introduce the `daemon -p` failure this pair exists to avoid, because at this
+/// point the file legitimately names a process that is not us.
+pub fn writePidFile(path: []const u8) !void {
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
 
@@ -341,23 +367,71 @@ test "write and remove pid file" {
 
 // --- L-5: a PID file held by a live process ----------------------------------
 //
-// The live case is testable without forking, and honestly: the test process is
-// itself a live PID, so writing our own number into the file is exactly the
-// condition a second instance would find. No stub, no injected clock.
+// THE FIRST VERSION OF THIS TEST ENCODED THE BUG IT WAS MEANT TO CATCH. It wrote
+// the test process's own PID into the file and asserted a refusal, on the
+// reasoning that "the test process is itself a live PID, so this is exactly the
+// condition a second instance would find". It is not. It conflates *some* live
+// process with a *different* live process, and that conflation is the whole
+// defect: under `daemon -p` the pid in the file is our own ancestor, so the
+// daemon refused to start against itself. The test passed, and the lab did not.
+//
+// So the two cases are now separated, and the self case asserts the opposite of
+// what it used to.
 
-test "a pid file held by a live process is refused" {
+test "a pid file naming ourselves is not a second instance" {
+    const path = "/tmp/securemilter-test-self.pid";
+    defer removePidFile(path);
+
+    // What `daemon -p` leaves behind: the supervisor records the pid of the
+    // process it execs, which is us, before we have written anything.
+    try writePidFile(path);
+
+    try checkNotAlreadyRunning(path);
+}
+
+test "a pid file held by another live process is refused" {
     const path = "/tmp/securemilter-test-live.pid";
     defer removePidFile(path);
 
-    // Claim it once. This is the running daemon.
-    try writePidFile(path);
+    // PID 1 is alive on any running system, is not us, and is not our parent.
+    // Under an unprivileged test runner `kill(1, 0)` fails with EPERM rather than
+    // ESRCH -- which `livePidFileHolder` must read as "exists but is not ours to
+    // signal", not as "gone".
+    {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("1\n");
+    }
 
-    // A second start finds our own PID in the file, and ours is unambiguously
-    // alive. The specific error matters -- `bootstrap` keys on it to decide
-    // between refusing and carrying on.
-    try std.testing.expectError(error.AlreadyRunning, writePidFile(path));
+    // The specific error matters: this is the one pid-file fault `bootstrap`
+    // refuses to start on. Every other one is logged and survived, because a
+    // daemon that cannot write a PID file should still carry mail.
+    try std.testing.expectError(error.AlreadyRunning, checkNotAlreadyRunning(path));
 
     // And the refusal left the file alone rather than truncating it.
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    var buf: [64]u8 = undefined;
+    const n = try file.readAll(&buf);
+    const held = try std.fmt.parseInt(c.pid_t, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10);
+    try std.testing.expectEqual(@as(c.pid_t, 1), held);
+}
+
+test "writing the pid file does not re-test for a rival" {
+    // The check belongs before the fork and must not be duplicated after it. If it
+    // creeps back into `writePidFile`, `daemon -p` breaks again: at this point the
+    // file legitimately names a process that is not us.
+    const path = "/tmp/securemilter-test-nocheck.pid";
+    defer removePidFile(path);
+
+    {
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("1\n");
+    }
+
+    try writePidFile(path);
+
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
     var buf: [64]u8 = undefined;

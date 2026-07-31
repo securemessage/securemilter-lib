@@ -84,6 +84,7 @@ pub const Ops = struct {
     reinit_log: *const fn () void = log_mod.initThread,
     block_signals: *const fn () void = daemon.ManagedSignals.blockForKqueue,
     signal_ready: *const fn (posix.fd_t) void = daemon.signalReady,
+    check_not_running: *const fn ([]const u8) anyerror!void = daemon.checkNotAlreadyRunning,
     write_pid_file: *const fn ([]const u8) anyerror!void = daemon.writePidFile,
     remove_pid_file: *const fn ([]const u8) void = daemon.removePidFile,
     raise_file_limit: *const fn (u64) void = daemon.raiseFileLimit,
@@ -97,6 +98,10 @@ pub const Ops = struct {
 /// daemon, with each constraint restated as a comment — which is how X-7 came to be
 /// fixed in one copy while the others waited. The constraints, and what breaks:
 ///
+///   0. The already-running check before `daemonize`. It is only answerable while we
+///      are still the process a supervisor named; after the double fork the parent has
+///      exited, we belong to init, and `daemon -p`'s own entry is indistinguishable
+///      from a rival's — which made the daemon refuse to start against itself (L-5).
 ///   1. `daemonize` before any thread. `fork` carries over only the calling thread, so
 ///      a thread started earlier simply does not exist in the daemon.
 ///   2. Signals blocked before any thread. `sigprocmask` affects one thread and a new
@@ -114,13 +119,28 @@ pub const Ops = struct {
 ///
 /// A failed PID file write is logged and survived — the daemon still works, it is
 /// merely harder to signal. A failed `daemonize` or privilege drop is fatal, because
-/// continuing would mean running attached, or as root, without being asked to.
+/// continuing would mean running attached, or as root, without being asked to. So is a
+/// confirmed second instance, which is why that check is step 0 and not part of the
+/// write.
 pub fn run(opts: Options) !Bootstrap {
     return runWithOps(opts, .{});
 }
 
 /// `run` with the steps substituted. For tests; production calls `run`.
 pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
+    // (0) BEFORE `daemonize`, and it cannot move. While we are still the process a
+    // supervisor named, a live holder that is not us is unambiguously a second
+    // instance. After the fork that is no longer decidable: `daemon -p` has written
+    // our own ancestor's pid into the file, the double fork has orphaned us to init,
+    // and asking the question there refused to start against ourselves (L-5, and see
+    // `checkNotAlreadyRunning`).
+    //
+    // `SO_REUSEPORT` is why this is fatal rather than a warning: a second copy binds
+    // successfully and two daemons then split mail between two configurations, which
+    // gets diagnosed weeks later from inconsistent Authentication-Results. X-16's
+    // ready-byte handshake carries the refusal back to `service start`.
+    try ops.check_not_running(opts.pid_file);
+
     var ready_fd: ?posix.fd_t = null;
     if (!opts.foreground) {
         ready_fd = ops.daemonize() catch |err| {
@@ -143,21 +163,17 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     // Whether the file is ours is tracked, rather than inferred later from the file
     // existing: if the write failed, some other instance may own that path and
     // removing it on the way out would be worse than leaving it.
-    // Two outcomes, deliberately not one. A PID file that cannot be written is an
-    // operational annoyance -- `monit` loses track of us -- and stopping mail flow
-    // over it would be the worse failure, so it is logged and tolerated as before.
-    // `AlreadyRunning` is different in kind: another live instance holds the file,
-    // and `SO_REUSEPORT` means starting anyway does not fail loudly on the bind. It
-    // succeeds, and two daemons then split mail between two configurations, which
-    // is the sort of thing that gets diagnosed weeks later from inconsistent
-    // Authentication-Results. Refuse, and let X-16's ready-byte handshake carry the
-    // refusal back to `service start` (audit L-5).
+    // Tolerated, not fatal. A PID file that cannot be written is an operational
+    // annoyance -- `monit` loses track of us -- and stopping mail flow over it would
+    // be the worse failure. The one fault that *is* fatal, another live instance, was
+    // settled at step (0) while it was still answerable; there is deliberately no
+    // second test here, because at this point the file may legitimately name a
+    // supervisor that is not us (L-5).
     var pid_file_is_ours = false;
     if (ops.write_pid_file(opts.pid_file)) {
         pid_file_is_ours = true;
-    } else |err| switch (err) {
-        error.AlreadyRunning => return err,
-        else => log_mod.err("pid file write failed: {}", .{err}),
+    } else |err| {
+        log_mod.err("pid file write failed: {}", .{err});
     }
 
     // Claiming the file and surviving the rest of this function are separate events,
@@ -252,7 +268,7 @@ pub fn fatal(e: anyerror) anyerror {
 // the PID file is claimed before or after the fd limit is free, and a test that pinned
 // the whole order would fail on a change that breaks nothing.
 
-const Step = enum { daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs, signal_ready };
+const Step = enum { check_running, daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs, signal_ready };
 
 var recorded: [16]Step = undefined;
 var recorded_len: usize = 0;
@@ -268,6 +284,9 @@ fn record(s: Step) void {
 /// `signal_ready` is recorded, not performed -- so it only has to be distinguishable.
 const fake_ready_fd: posix.fd_t = 4242;
 
+fn recCheckRunning(_: []const u8) anyerror!void {
+    record(.check_running);
+}
 fn recDaemonize() anyerror!posix.fd_t {
     record(.daemonize);
     return fake_ready_fd;
@@ -298,6 +317,7 @@ fn recDropPrivs(_: []const u8) anyerror!void {
 }
 
 const recording_ops = Ops{
+    .check_not_running = recCheckRunning,
     .daemonize = recDaemonize,
     .reinit_log = recReinitLog,
     .block_signals = recBlockSignals,
@@ -362,6 +382,17 @@ test "X-7: the managed signals are blocked before any thread is spawned" {
 test "threads are spawned after daemonize, because fork keeps only the caller" {
     _ = try runRecorded(test_opts);
     try expectBefore(.daemonize, .spawn_threads);
+}
+
+test "L-5: the already-running check runs before daemonize" {
+    // Not a stylistic preference. Asked after the fork, the question has no correct
+    // answer: `daemon -p` has already written the pid of the process it execd -- ours
+    // -- and the double fork has since orphaned us to init, so the entry cannot be
+    // told apart from a rival's. That shipped, and securespf refused to start against
+    // its own supervisor with `exiting on AlreadyRunning`.
+    _ = try runRecorded(test_opts);
+    try expectBefore(.check_running, .daemonize);
+    try expectBefore(.check_running, .write_pid);
 }
 
 test "the log is re-initialised after daemonize, because the PID changed" {
