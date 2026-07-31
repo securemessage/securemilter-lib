@@ -52,6 +52,40 @@ pub const Config = struct {
             return parseSize(raw) orelse default;
         }
 
+        /// Read a comma-separated option into an owned slice of trimmed,
+        /// non-empty parts. Absent or all-empty yields a zero-length slice.
+        ///
+        /// This existed four times, once per daemon, hand-rolled for
+        /// `DnsNameserver` and a fifth time in `securearc` for
+        /// `LocalAuthMethods`. Each copy ran the same six-line dance: build an
+        /// `ArrayListUnmanaged`, split, trim, skip empties, `toOwnedSlice`. The
+        /// dance has one subtlety -- `toOwnedSlice` turns a list that unwinds
+        /// itself via `errdefer` into a bare slice that does not -- and one of
+        /// the five got it wrong, leaking on every SIGHUP against a config with
+        /// a typo in it. Five copies of a subtle ownership transfer is the
+        /// defect; one copy with a test is the fix.
+        ///
+        /// THE RETURNED STRINGS BORROW FROM THE `Config`. Only the outer slice
+        /// is owned, so `allocator.free(result)` is the whole cleanup -- and a
+        /// caller that outlives its `Config` must duplicate the contents, which
+        /// is what every `Reloadable.init` already does.
+        pub fn getCsvList(
+            self: *const Section,
+            allocator: Allocator,
+            key: []const u8,
+            default: []const u8,
+        ) ![]const []const u8 {
+            var list: std.ArrayListUnmanaged([]const u8) = .{};
+            errdefer list.deinit(allocator);
+
+            var it = mem.splitSequence(u8, self.getOrDefault(key, default), ",");
+            while (it.next()) |part| {
+                const trimmed = mem.trim(u8, part, " \t");
+                if (trimmed.len > 0) try list.append(allocator, trimmed);
+            }
+            return list.toOwnedSlice(allocator);
+        }
+
         fn deinit(self: *Section, allocator: Allocator) void {
             var it = self.entries.iterator();
             while (it.next()) |entry| {
@@ -289,6 +323,66 @@ test "getSize falls back to the default on a bad value" {
     try std.testing.expectEqual(@as(usize, 25 * 1024 * 1024), global.getSize("MaxBodyBytes", 1));
     try std.testing.expectEqual(@as(usize, 4096), global.getSize("MaxHeaderBytes", 4096));
     try std.testing.expectEqual(@as(usize, 7), global.getSize("NotPresent", 7));
+}
+
+test "getCsvList trims, skips empties, and applies the default" {
+    const source =
+        \\DnsNameserver = 10.0.0.1,  8.8.8.8 ,,
+        \\LocalAuthMethods =
+    ;
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+    const global = cfg.global().?;
+
+    const ns = try global.getCsvList(std.testing.allocator, "DnsNameserver", "127.0.0.1");
+    defer std.testing.allocator.free(ns);
+    try std.testing.expectEqual(@as(usize, 2), ns.len);
+    try std.testing.expectEqualStrings("10.0.0.1", ns[0]);
+    try std.testing.expectEqualStrings("8.8.8.8", ns[1]);
+
+    // Present but empty is not the same as absent: it must not fall back to the
+    // default, or `LocalAuthMethods =` would silently mean something.
+    const methods = try global.getCsvList(std.testing.allocator, "LocalAuthMethods", "");
+    defer std.testing.allocator.free(methods);
+    try std.testing.expectEqual(@as(usize, 0), methods.len);
+
+    const absent = try global.getCsvList(std.testing.allocator, "NotPresent", "a, b");
+    defer std.testing.allocator.free(absent);
+    try std.testing.expectEqual(@as(usize, 2), absent.len);
+    try std.testing.expectEqualStrings("b", absent[1]);
+}
+
+// The reason this function exists rather than five copies. `FailingAllocator`
+// walks the failure point across every allocation the call makes, and
+// `std.testing.allocator` underneath reports anything left outstanding -- so a
+// missing `errdefer` in here fails this test instead of leaking in a daemon.
+//
+// THE ITEM COUNT IS LOAD-BEARING. The first version of this test used eight
+// entries and PASSED with the `errdefer` deleted, which is worse than having no
+// test: eight items fit one allocation, and `toOwnedSlice` then shrinks it in
+// place, so the only failure point was the very first `alloc` -- at which the
+// list owned nothing and there was nothing to leak. A list long enough to be
+// reallocated several times is what puts a failure point *after* the list has
+// memory, which is the only case the `errdefer` exists for. Verified to fail
+// when the `errdefer` is removed.
+test "getCsvList leaves nothing outstanding when an allocation fails" {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, "DnsNameserver = a0");
+    for (1..512) |i| try buf.writer(std.testing.allocator).print(",a{d}", .{i});
+
+    var cfg = try parse(std.testing.allocator, buf.items);
+    defer cfg.deinit();
+    const global = cfg.global().?;
+
+    var fail_index: usize = 0;
+    while (fail_index < 24) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const result = global.getCsvList(failing.allocator(), "DnsNameserver", "") catch continue;
+        failing.allocator().free(result);
+    }
 }
 
 test "parse empty config" {
