@@ -28,6 +28,9 @@ test {
     _ = daemon;
     _ = bootstrap;
     _ = worker;
+    // `pool` was exported above but missing here, so its tests had never run.
+    // A module absent from this list still compiles and still looks tested.
+    _ = pool;
     _ = dns;
     _ = auth_results;
     _ = auth_stamp;

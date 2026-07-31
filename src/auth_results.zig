@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const cfws = @import("cfws.zig");
 
 /// RFC 8601 Authentication-Results header builder and parser.
 ///
@@ -104,34 +105,64 @@ pub const ResultIterator = struct {
     rest: []const u8,
 
     pub fn init(header_value: []const u8) ResultIterator {
-        const trimmed = mem.trimLeft(u8, header_value, &std.ascii.whitespace);
-        const first_semi = mem.indexOfScalar(u8, trimmed, ';') orelse return .{ .rest = "" };
-        return .{ .rest = trimmed[first_semi + 1 ..] };
+        const first_semi = cfws.indexOfScalar(header_value, 0, ';') orelse return .{ .rest = "" };
+        return .{ .rest = header_value[first_semi + 1 ..] };
     }
 
     pub fn next(self: *ResultIterator) ?ParsedHeader.ParsedResult {
         while (self.rest.len > 0) {
-            self.rest = mem.trimLeft(u8, self.rest, &std.ascii.whitespace);
-            if (self.rest.len == 0) return null;
+            // One `method = result *( CFWS property )` group, ending at the
+            // next semicolon that is real syntax rather than comment text.
+            const group_end = cfws.indexOfScalar(self.rest, 0, ';') orelse self.rest.len;
+            const group = self.rest[0..group_end];
+            self.rest = if (group_end < self.rest.len) self.rest[group_end + 1 ..] else "";
 
-            const eq_pos = mem.indexOfScalar(u8, self.rest, '=') orelse return null;
-            const method = mem.trim(u8, self.rest[0..eq_pos], &std.ascii.whitespace);
-
-            self.rest = self.rest[eq_pos + 1 ..];
-
-            const next_semi = mem.indexOfScalar(u8, self.rest, ';');
-            const result_part = if (next_semi) |s| self.rest[0..s] else self.rest;
-            self.rest = if (next_semi) |s| self.rest[s + 1 ..] else "";
-
-            const result_trimmed = mem.trim(u8, result_part, &std.ascii.whitespace);
-            const result_end = mem.indexOfAny(u8, result_trimmed, &.{ ' ', '\t', '(' }) orelse result_trimmed.len;
-            const result_value = result_trimmed[0..result_end];
-
-            if (method.len > 0 and result_value.len > 0) {
-                return .{ .method = method, .result = result_value };
-            }
+            const parsed = parseGroup(group) orelse continue;
+            return parsed;
         }
         return null;
+    }
+};
+
+/// Split one `method=result properties...` group. Null when it carries no
+/// method/result pair, which is how `none` and stray whitespace are skipped.
+fn parseGroup(group: []const u8) ?ParsedHeader.ParsedResult {
+    const m_start = cfws.skip(group, 0);
+    if (m_start >= group.len) return null;
+
+    const eq = cfws.indexOfScalar(group, m_start, '=') orelse return null;
+    const method = mem.trim(u8, group[m_start..eq], &std.ascii.whitespace);
+    if (method.len == 0) return null;
+
+    const r_start = cfws.skip(group, eq + 1);
+    if (r_start >= group.len) return null;
+    const r_end = cfws.tokenEnd(group, r_start, "");
+    const result = group[r_start..r_end];
+    if (result.len == 0) return null;
+
+    return .{ .method = method, .result = result, .props = group[r_end..] };
+}
+
+/// Iterator over the `ptype.property=value` items attached to one result.
+pub const PropertyIterator = struct {
+    rest: []const u8,
+
+    pub fn next(self: *PropertyIterator) ?ParsedHeader.Property {
+        while (true) {
+            const start = cfws.skip(self.rest, 0);
+            if (start >= self.rest.len) {
+                self.rest = "";
+                return null;
+            }
+            const end = cfws.tokenEnd(self.rest, start, "");
+            const token = self.rest[start..end];
+            self.rest = self.rest[end..];
+
+            const eq = mem.indexOfScalar(u8, token, '=') orelse continue;
+            const name = token[0..eq];
+            if (name.len == 0 or eq + 1 >= token.len) continue;
+            return .{ .name = name, .value = token[eq + 1 ..] };
+        }
     }
 };
 
@@ -189,9 +220,41 @@ pub const ParsedHeader = struct {
     authserv_id: []const u8,
     results: std.ArrayList(ParsedResult),
 
+    /// One `ptype.property=value` item.
+    pub const Property = struct {
+        /// The full dotted name, e.g. `header.d`.
+        name: []const u8,
+        value: []const u8,
+    };
+
     pub const ParsedResult = struct {
         method: []const u8,
         result: []const u8,
+        /// The properties belonging to *this* result: the text between its
+        /// result token and the next real semicolon.
+        ///
+        /// Keeping the span per result is the whole point (audit M-6). Reading
+        /// `header.d=` by searching the entire header value lets DMARC pair a
+        /// domain from one assertion with the result of another, which is a
+        /// bypass when the two disagree.
+        props: []const u8 = "",
+
+        pub fn properties(self: ParsedResult) PropertyIterator {
+            return .{ .rest = self.props };
+        }
+
+        /// The value of a property of this result, by dotted name.
+        pub fn property(self: ParsedResult, name: []const u8) ?[]const u8 {
+            var it = self.properties();
+            while (it.next()) |p| {
+                if (std.ascii.eqlIgnoreCase(p.name, name)) return p.value;
+            }
+            return null;
+        }
+
+        pub fn passed(self: ParsedResult) bool {
+            return std.ascii.eqlIgnoreCase(self.result, "pass");
+        }
     };
 
     pub fn deinit(self: *ParsedHeader, allocator: Allocator) void {
@@ -293,4 +356,73 @@ test "build none" {
     const header = try buildNone(std.testing.allocator, "mail.example.com");
     defer std.testing.allocator.free(header);
     try std.testing.expectEqualStrings("mail.example.com; none", header);
+}
+
+test "M-6: a semicolon in a comment does not manufacture a result" {
+    // Everything from '(' is one comment. There is no spf result in this
+    // header; a scan for ';' used to find one and report spf=pass.
+    const forged = "mail.example.com; dkim=fail (note; spf=pass ) header.d=a.test";
+
+    var parsed = try parseResults(std.testing.allocator, forged);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.getResult("spf") == null);
+    try std.testing.expectEqualStrings("fail", parsed.getResult("dkim").?);
+}
+
+test "M-6: the scrubber and the consumer agree about the comment" {
+    // The X-1 removal is only sound while these two see the same results. If
+    // the parser ever stops treating the comment as opaque, this fails next to
+    // the test above rather than silently opening a strip bypass.
+    const forged = "mail.example.com; dkim=fail (note; spf=pass ) header.d=a.test";
+
+    try std.testing.expect(!assertsAnyMethod(forged, &.{"spf"}));
+    try std.testing.expect(assertsAnyMethod(forged, &.{"dkim"}));
+}
+
+test "M-6: a property belongs to its own result" {
+    // The bypass: 'header.d=victim.test' sits in a comment on the spf result,
+    // and a whole-value search for "header.d=" paired it with the dkim=pass.
+    const value = "mail.example.com; spf=fail (header.d=victim.test ) ; dkim=pass header.d=attacker.test";
+
+    var parsed = try parseResults(std.testing.allocator, value);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.results.items.len);
+
+    const spf = parsed.results.items[0];
+    try std.testing.expectEqualStrings("spf", spf.method);
+    try std.testing.expect(spf.property("header.d") == null);
+
+    const dkim = parsed.results.items[1];
+    try std.testing.expectEqualStrings("dkim", dkim.method);
+    try std.testing.expectEqualStrings("attacker.test", dkim.property("header.d").?);
+}
+
+test "M-6: each of several signatures keeps its own domain" {
+    const value = "mail.example.com; dkim=fail header.d=noise.test; dkim=pass header.d=real.test";
+
+    var parsed = try parseResults(std.testing.allocator, value);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.results.items.len);
+    try std.testing.expect(!parsed.results.items[0].passed());
+    try std.testing.expectEqualStrings("noise.test", parsed.results.items[0].property("header.d").?);
+    try std.testing.expect(parsed.results.items[1].passed());
+    try std.testing.expectEqualStrings("real.test", parsed.results.items[1].property("header.d").?);
+}
+
+test "M-6: a quoted property value may contain a semicolon" {
+    var parsed = try parseResults(std.testing.allocator, "mail.example.com; dkim=pass header.i=\"a;b\" header.d=real.test");
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.results.items.len);
+    try std.testing.expectEqualStrings("real.test", parsed.results.items[0].property("header.d").?);
+}
+
+test "M-6: a result followed only by a comment still parses" {
+    var parsed = try parseResults(std.testing.allocator, "mail.example.com; spf=pass (good sender)");
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("pass", parsed.getResult("spf").?);
 }
