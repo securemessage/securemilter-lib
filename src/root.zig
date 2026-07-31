@@ -3,6 +3,7 @@ pub const config = @import("config.zig");
 pub const milter = @import("milter/protocol.zig");
 pub const listener = @import("listener.zig");
 pub const connection = @import("connection.zig");
+pub const header = @import("header.zig");
 pub const daemon = @import("daemon.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const worker = @import("worker.zig");
@@ -23,6 +24,7 @@ test {
     _ = milter;
     _ = listener;
     _ = connection;
+    _ = header;
     _ = daemon;
     _ = bootstrap;
     _ = worker;

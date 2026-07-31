@@ -5,6 +5,7 @@ const Allocator = mem.Allocator;
 const codec = @import("milter/codec.zig");
 const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
+const header_mod = @import("header.zig");
 const config = @import("config.zig");
 
 /// Milter conversation state — tracks where we are in the SMTP lifecycle.
@@ -93,11 +94,12 @@ pub const Macros = struct {
     }
 };
 
-/// Accumulated message headers for product-specific processing.
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+// The header field representation lives in `header.zig`: a connection is a
+// lifecycle, and how a field is spelt is a separate concern (see that file).
+// Re-exported so every existing `connection.Header` reference still resolves.
+pub const Header = header_mod.Header;
+pub const HeaderSplit = header_mod.HeaderSplit;
+pub const splitLeadingSpace = header_mod.splitLeadingSpace;
 
 /// Caps on the parts of a message an unauthenticated peer controls.
 ///
@@ -204,6 +206,12 @@ pub const Connection = struct {
     /// Actions the MTA granted during OPTNEG. A milter must not send a
     /// modification packet for an action that was not negotiated.
     negotiated_actions: negotiate.ActionFlags = .{},
+    /// Protocol flags the MTA granted during OPTNEG. Previously discarded: the
+    /// response was built and thrown away, so nothing downstream could know what
+    /// had been agreed. `header_leading_space` in particular changes what a
+    /// header value contains, and a milter that asks for it without checking
+    /// whether it got it would misread every header against an MTA that declined.
+    negotiated_protocol: negotiate.ProtocolFlags = .{},
     /// Peer IP address of the milter TCP connection (the Postfix instance).
     /// Format: bare IP string (e.g., "10.99.0.1") or "local" for Unix sockets.
     peer_addr: [64]u8 = undefined,
@@ -297,6 +305,13 @@ pub const Connection = struct {
     /// latches `headers_overflow` so the incomplete list cannot be mistaken for
     /// the message's real headers.
     pub fn addHeader(self: *Connection, name: []const u8, value: []const u8) !void {
+        return self.addHeaderSpaced(name, value, true);
+    }
+
+    /// As `addHeader`, but states whether a space followed the colon on the wire.
+    /// The worker uses this when `SMFIP_HDR_LEADSPC` is in force; `addHeader`'s
+    /// `true` is the classic MTA behaviour and stays correct when it is not.
+    pub fn addHeaderSpaced(self: *Connection, name: []const u8, value: []const u8, had_space: bool) !void {
         if (self.headers_overflow) return error.TooManyHeaders;
 
         if (self.limits.max_headers != 0 and self.headers.items.len >= self.limits.max_headers) {
@@ -314,7 +329,11 @@ pub const Connection = struct {
         errdefer self.allocator.free(name_dup);
         const value_dup = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(value_dup);
-        try self.headers.append(self.allocator, .{ .name = name_dup, .value = value_dup });
+        try self.headers.append(self.allocator, .{
+            .name = name_dup,
+            .value = value_dup,
+            .had_space = had_space,
+        });
         self.header_bytes += name.len + value.len;
     }
 

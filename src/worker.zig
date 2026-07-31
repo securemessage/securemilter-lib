@@ -36,10 +36,14 @@ pub const Callbacks = struct {
     on_reload: ?*const fn () void = null,
 
     required_actions: negotiate.ActionFlags = .{ .add_headers = true },
-    skip_flags: negotiate.ProtocolFlags = .{},
+
+    /// Protocol flags to request in OPTNEG. Named `skip_flags` until D-23, when
+    /// `header_leading_space` became the first that asks the MTA for *more* data
+    /// rather than less, and the old name said the opposite of what it did.
+    protocol_flags: negotiate.ProtocolFlags = .{},
 
     /// Caps applied to every connection this pool accepts. Carried here beside
-    /// `required_actions` and `skip_flags` — the worker behaviour a product
+    /// `required_actions` and `protocol_flags` — the worker behaviour a product
     /// milter chooses — so the daemons already building this struct need no new
     /// plumbing to set them.
     limits: connection_mod.Limits = .{},
@@ -422,7 +426,13 @@ pub const Worker = struct {
             return;
         };
         conn.negotiated_actions = negotiate.grantedActions(self.callbacks.required_actions, offer);
-        const resp = negotiate.buildResponse(self.callbacks.required_actions, self.callbacks.skip_flags, offer);
+        // What the MTA agreed to, by the same mask `buildResponse` applies: a
+        // milter that assumed it got what it asked for would misparse every header
+        // against an MTA that declined `header_leading_space`.
+        conn.negotiated_protocol = @bitCast(
+            @as(u32, @bitCast(offer.protocol)) & @as(u32, @bitCast(self.callbacks.protocol_flags)),
+        );
+        const resp = negotiate.buildResponse(self.callbacks.required_actions, self.callbacks.protocol_flags, offer);
         codec.writePacket(conn.fd, &resp) catch {
             self.removeConnection(conn.fd);
             return;
@@ -482,7 +492,14 @@ pub const Worker = struct {
         // of service. `addHeader` latches the flag, so end-of-message still
         // knows the list is incomplete however many headers followed.
         const first_overflow = !conn.headers_overflow;
-        conn.addHeader(hdr.name, hdr.value) catch |e| {
+        // With SMFIP_HDR_LEADSPC the value still carries the whitespace after the
+        // colon; recover the bit and hand consumers the value they always saw.
+        // See `Header.had_space` for why (audit D-23).
+        const split = if (conn.negotiated_protocol.header_leading_space)
+            connection_mod.splitLeadingSpace(hdr.value)
+        else
+            connection_mod.HeaderSplit{ .value = hdr.value, .had_space = true };
+        conn.addHeaderSpaced(hdr.name, split.value, split.had_space) catch |e| {
             if (first_overflow and conn.headers_overflow) {
                 const peer = conn.getPeerDisplay();
                 log_mod.warn(
@@ -502,7 +519,9 @@ pub const Worker = struct {
             }
         };
         conn.state = .headers;
-        const resp = if (self.callbacks.on_header) |cb| cb(conn, hdr.name, hdr.value) else @intFromEnum(responses.Code.@"continue");
+        // `split.value`, not `hdr.value`: a callback must see what was stored, or
+        // the two disagree about the same header once the flag is in force.
+        const resp = if (self.callbacks.on_header) |cb| cb(conn, hdr.name, split.value) else @intFromEnum(responses.Code.@"continue");
         self.sendResponse(conn, resp);
     }
 

@@ -64,6 +64,34 @@
 #   it and a number to hit. That is the only reason it got undone rather than becoming
 #   the new normal.
 #
+# 2026-07-31, D-23: connection.zig 430 -> 449 and worker.zig 601 -> 620.
+#
+#   A header field gained a third component. A milter is handed a name and a
+#   value, never the field's original octets, so the separator was fabricated as
+#   `name + ": " + value` at eight sites -- correct whenever the field had a
+#   leading space, wrong for `Name:value` and `Name:<TAB>value`, and `c=simple`
+#   hashes the field verbatim. `Header.had_space` carries the one bit an MTA
+#   destroys, and `render` is now the only place that decides the separator.
+#
+#   +19 each, and MOST OF THE COST WAS PAID IN THE SAME COMMIT. The naive shape
+#   of this change put connection.zig at 517 (+87). `Header`, `HeaderSplit`,
+#   `splitLeadingSpace` and the nine-shape round-trip tests moved to header.zig,
+#   which is the honest seam: a connection is a lifecycle, and how a field is
+#   spelt is a separate concern used by four daemons and three CLIs. Re-exported
+#   from connection.zig, so not one call site had to move. That took +87 to +19,
+#   and header.zig is a new 130-line file rather than an entry on this list.
+#
+#   What remains is function, not accretion: `addHeaderSpaced` and its doc,
+#   `Connection.negotiated_protocol` (the granted protocol flags were previously
+#   built into the OPTNEG reply and thrown away, so nothing downstream could
+#   know what had been agreed), and in worker.zig capturing that grant plus the
+#   split on the receive path.
+#
+#   NO OBLIGATION TO UNDO, unlike the X-15 raise above. There is no second seam
+#   left in either file that this change created -- the one that existed was
+#   taken. Recording that explicitly so the next reader does not go looking for
+#   a debt that is not there.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -76,6 +104,6 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-430 src/connection.zig
+449 src/connection.zig
 494 src/dns/resolver.zig
-601 src/worker.zig
+620 src/worker.zig
