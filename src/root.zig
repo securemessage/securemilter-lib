@@ -10,6 +10,11 @@ pub const worker = @import("worker.zig");
 pub const pool = @import("pool.zig");
 pub const dns = @import("dns.zig");
 pub const auth_results = @import("auth_results.zig");
+/// RFC 5322 comment and folding-whitespace scanners. Public because every
+/// consumer of a structured header field has to agree on where the tokens are,
+/// and a second private copy of that logic is how the four daemons came to
+/// disagree about `Authentication-Results` in the first place (audit M-6).
+pub const cfws = @import("cfws.zig");
 pub const auth_stamp = @import("auth_stamp.zig");
 pub const escape = @import("escape.zig");
 pub const header_scrub = @import("header_scrub.zig");
