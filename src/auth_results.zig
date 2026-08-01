@@ -25,6 +25,47 @@ pub const MethodResult = struct {
     };
 };
 
+/// The marker `securedkim` puts on a result from a key published `t=y`, and that
+/// `securedmarc` refuses to count as an aligned pass (audit D-11).
+///
+/// RFC 6376 §3.6.1 requires that verifiers "MUST NOT treat messages from Signers
+/// in testing mode differently from unsigned email", while also allowing that
+/// "Verifiers MAY wish to track testing mode results to assist the Signer". Those
+/// pull in opposite directions only if the result and the action are conflated.
+/// The result is reported truthfully -- a signer publishes a testing key precisely
+/// to learn whether it verifies, and `dkim=none` would withhold the one fact they
+/// asked for -- and the *action* is suppressed instead.
+///
+/// OpenDKIM draws the line in the same place, and its A-R output was checked
+/// rather than assumed: `dkimf_ar_all_sigs` never consults `DKIM_SIGFLAG_TESTKEY`,
+/// so a test key is reported as a plain `dkim=pass` with no annotation whatever.
+/// The flag is read in exactly two places, both of which skip the signature when
+/// choosing a domain for *reputation*. Result reported, action suppressed.
+///
+/// We need the marker OpenDKIM does without because the boundary is different.
+/// Its reputation code is in-process and reads `DKIM_SIGINFO` flags directly;
+/// `securedmarc` is a separate daemon whose only input is this header, so the fact
+/// has to survive serialization or it does not reach the code that must act on it.
+///
+/// RFC 8601 §2.4 defines exactly this mechanism -- the `policy` ptype indicates
+/// "some local policy mechanism was applied that augments or even replaces ... the
+/// result returned by the authentication mechanism" -- and its worked example is
+/// nearly ours: `dkim=policy policy.dkim-rules=unsigned-subject`. It notes these
+/// are "arbitrary names selected by (and presumably used within) the ADMD", not
+/// registered with IANA. We augment rather than replace, which §2.4's "augments or
+/// even replaces" permits, because replacing would discard the real result.
+///
+/// Safe for anyone else's parser: §2.3 says "Results reported using unknown ptypes
+/// MUST NOT be used in making handling decisions. They can be safely ignored."
+///
+/// One definition, referenced by both daemons. Two hand-typed copies is how the
+/// four daemons came to disagree about the space after a colon.
+pub const testing_key_marker = struct {
+    pub const ptype = "policy";
+    pub const property = "dkim-rules";
+    pub const value = "testing-key";
+};
+
 /// Build an Authentication-Results header value.
 ///
 /// Returns the header value (without the "Authentication-Results:" prefix).
@@ -372,6 +413,76 @@ test "build simple spf result" {
     try std.testing.expect(mem.indexOf(u8, header, "spf=pass") != null);
     try std.testing.expect(mem.indexOf(u8, header, "smtp.mailfrom=example.com") != null);
     try std.testing.expect(mem.indexOf(u8, header, "(sender IP is 192.0.2.1)") != null);
+}
+
+test "D-11: a testing-key result keeps its real verdict and carries the policy marker" {
+    const results = &[_]MethodResult{.{
+        .method = "dkim",
+        .result = "pass",
+        .properties = &.{
+            .{ .ptype = "header", .property = "d", .value = "example.com" },
+            .{
+                .ptype = testing_key_marker.ptype,
+                .property = testing_key_marker.property,
+                .value = testing_key_marker.value,
+            },
+        },
+    }};
+
+    const header = try build(std.testing.allocator, "mail.example.com", results);
+    defer std.testing.allocator.free(header);
+
+    // The real result survives. `dkim=none` here would withhold from the signer
+    // the single fact a testing key is published to establish.
+    try std.testing.expect(mem.indexOf(u8, header, "dkim=pass") != null);
+    try std.testing.expect(mem.indexOf(u8, header, "header.d=example.com") != null);
+
+    // The exact octets `securedmarc` matches on. Pinned as a literal rather than
+    // built from the constants: a test assembled from the same constants as the
+    // code would still pass if someone renamed the property, and the whole point
+    // of this string is that two separate daemons agree on it.
+    try std.testing.expect(mem.indexOf(u8, header, "policy.dkim-rules=testing-key") != null);
+}
+
+test "D-11: the testing-key marker survives the parser that reads it" {
+    // The producing side is only half of it. This marker crosses a process
+    // boundary, so what matters is that the parser on the far side recovers the
+    // same ptype/property/value -- if the emitted form did not round-trip,
+    // securedkim would be marking results that securedmarc could never see.
+    const results = &[_]MethodResult{.{
+        .method = "dkim",
+        .result = "pass",
+        .properties = &.{
+            .{ .ptype = "header", .property = "d", .value = "example.com" },
+            .{
+                .ptype = testing_key_marker.ptype,
+                .property = testing_key_marker.property,
+                .value = testing_key_marker.value,
+            },
+        },
+    }};
+
+    const header = try build(std.testing.allocator, "mail.example.com", results);
+    defer std.testing.allocator.free(header);
+
+    var found = false;
+    var it = ResultIterator.init(header);
+    while (it.next()) |method_result| {
+        if (!mem.eql(u8, method_result.method, "dkim")) continue;
+        try std.testing.expectEqualStrings("pass", method_result.result);
+
+        var props = PropertyIterator{ .rest = method_result.props };
+        while (props.next()) |p| {
+            // The iterator hands back the whole `ptype.property` token as `name`,
+            // so that is what the far side has to compare against.
+            if (mem.eql(u8, p.name, testing_key_marker.ptype ++ "." ++ testing_key_marker.property) and
+                mem.eql(u8, p.value, testing_key_marker.value))
+            {
+                found = true;
+            }
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "build multiple results" {
