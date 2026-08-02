@@ -216,6 +216,26 @@ pub const Connection = struct {
     /// Format: bare IP string (e.g., "10.99.0.1") or "local" for Unix sockets.
     peer_addr: [64]u8 = undefined,
     peer_addr_len: u8 = 0,
+    /// The connecting SMTP client's address, as carried by SMFIC_CONNECT.
+    ///
+    /// This is the milter protocol's own equivalent of the `hostaddr` argument
+    /// libmilter passes to `xxfi_connect()`, which sendmail documents as "the
+    /// host address, as determined by a getpeername(2) call on the SMTP socket".
+    /// It is where every libmilter-based filter -- OpenDKIM, OpenDMARC and the
+    /// rest -- gets the connecting address, and it arrives on every connection
+    /// with nothing to configure.
+    ///
+    /// Held SEPARATELY from the `{client_addr}` macro because that macro is
+    /// OPTIONAL: Postfix's default `milter_connect_macros` is
+    /// `j {daemon_name} {daemon_addr} v _` and does not include it, so a milter
+    /// that reads only the macro sees nothing at all on a stock MTA. Read this
+    /// through `clientAddr()` rather than directly.
+    connect_addr: ?[]const u8 = null,
+    /// Address family reported by SMFIC_CONNECT. Distinguishes "there is no IP
+    /// because this is a local or unix-socket submission" from "there was an IP
+    /// and it did not parse", which are different answers for a caller that has
+    /// to decide between `none` and `permerror`.
+    connect_family: commands.Family = .unknown,
 
     pub fn init(allocator: Allocator, fd: posix.fd_t, listener_index: usize, limits: Limits) Connection {
         return .{
@@ -275,6 +295,7 @@ pub const Connection = struct {
         self.headers.deinit(self.allocator);
         if (self.helo_name) |h| self.allocator.free(h);
         if (self.mail_from_raw) |m| self.allocator.free(m);
+        if (self.connect_addr) |a| self.allocator.free(a);
         self.freeRecipients();
         self.recipients.deinit(self.allocator);
         self.body.deinit(self.allocator);
@@ -386,6 +407,40 @@ pub const Connection = struct {
     pub fn setHelo(self: *Connection, name: []const u8) !void {
         if (self.helo_name) |old| self.allocator.free(old);
         self.helo_name = try self.allocator.dupe(u8, name);
+    }
+
+    /// Store the client address and family from SMFIC_CONNECT.
+    ///
+    /// Connection-level, so it is deliberately not cleared by `resetMessage`:
+    /// the client does not change between messages on one SMTP session.
+    pub fn setConnectInfo(self: *Connection, info: commands.ConnectInfo) !void {
+        if (self.connect_addr) |old| self.allocator.free(old);
+        self.connect_addr = try self.allocator.dupe(u8, info.address);
+        self.connect_family = info.family;
+    }
+
+    /// The connecting SMTP client's address, or null when there genuinely is not
+    /// one to report.
+    ///
+    /// Prefers the `{client_addr}` macro when the MTA sent it, and falls back to
+    /// the address SMFIC_CONNECT carried. The fallback is the part that matters:
+    /// without it this returns nothing on a default Postfix, because the macro is
+    /// not in the default connect macro list.
+    ///
+    /// RETURNS AN OPTIONAL ON PURPOSE, and callers must not paper over it with a
+    /// display string. Substituting a placeholder like "unknown" and carrying on
+    /// is how a missing address turned into an affirmative SPF `fail`: the
+    /// placeholder parsed as neither IPv4 nor IPv6, every mechanism declined to
+    /// match it, and evaluation ran to the terminal `-all`. A caller that cannot
+    /// proceed without an address must say so rather than invent one.
+    pub fn clientAddr(self: *const Connection) ?[]const u8 {
+        if (self.macros.client_addr) |m| {
+            if (m.len > 0) return m;
+        }
+        if (self.connect_addr) |a| {
+            if (a.len > 0) return a;
+        }
+        return null;
     }
 
     fn freeHeaders(self: *Connection) void {

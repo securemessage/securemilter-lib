@@ -451,6 +451,12 @@ pub const Worker = struct {
             self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
+        // Persist before dispatching, exactly as handleHelo and handleMailFrom
+        // do with their values. This was previously handed to the callback and
+        // dropped, and since no daemon registers on_connect it was dropped every
+        // time -- leaving the client address readable only from the optional
+        // {client_addr} macro, which a default Postfix does not send.
+        conn.setConnectInfo(info) catch {};
         conn.state = .connected;
         const resp = if (self.callbacks.on_connect) |cb| cb(conn, info) else @intFromEnum(responses.Code.@"continue");
         self.sendResponse(conn, resp);
