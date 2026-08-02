@@ -407,6 +407,40 @@ pub const Resolver = struct {
         defer response.deinit(self.allocator);
 
         if (response.id != query_id) return error.IdMismatch;
+
+        // A TC=1 answer is incomplete, and RFC 7766 §5 makes retrying it over TCP
+        // mandatory rather than optional. EDNS0 raises the ceiling but does not
+        // remove it, and a resolver may still answer TC=1 with an *empty* answer
+        // section -- which a caller cannot tell apart from NXDOMAIN. Before this
+        // existed, `truncated` was parsed, asserted in the tests, and then read
+        // by nobody, so Yahoo scored spf=none and every Microsoft 365 sender
+        // scored dkim=permerror.
+        //
+        // A failed retry deliberately falls through to whatever the UDP answer
+        // held, rather than erroring. A partial answer is still better evidence
+        // than none, and the alternative is a temperror on every oversized RRset
+        // anywhere 53/tcp happens to be filtered.
+        if (response.truncated) {
+            log_mod.debug("dns: {s} truncated over udp, retrying over tcp", .{domain});
+            if (self.sendAndReceiveTcp(query_pkt)) |tcp_data| {
+                defer self.allocator.free(tcp_data);
+                if (packet.parseResponse(self.allocator, tcp_data)) |parsed| {
+                    var tcp_response = parsed;
+                    if (tcp_response.id == query_id) {
+                        response.deinit(self.allocator);
+                        response = tcp_response;
+                    } else {
+                        // Not an answer to our question; keep the UDP one.
+                        tcp_response.deinit(self.allocator);
+                    }
+                } else |perr| {
+                    log_mod.debug("dns: tcp reply for {s} unparseable err={}", .{ domain, perr });
+                }
+            } else |err| {
+                log_mod.debug("dns: tcp retry for {s} failed err={}", .{ domain, err });
+            }
+        }
+
         if (response.rcode != .no_error) {
             // RCODE 3 is the only one that says anything permanent about the
             // name. Everything else is the server declining to answer, and is
@@ -489,12 +523,110 @@ pub const Resolver = struct {
         return error.DnsTimeout;
     }
 
+    /// Re-issue a query over TCP, for an answer that did not fit in a datagram.
+    ///
+    /// Walks the same servers in the same round-robin order as the UDP path and
+    /// skips any the health monitor has already written off, so a nameserver that
+    /// is down does not get retried here after being skipped there.
+    fn sendAndReceiveTcp(self: *Resolver, query: []const u8) ![]u8 {
+        const num_servers = self.addrs.len;
+
+        var tried: usize = 0;
+        while (tried < num_servers) : (tried += 1) {
+            const idx = (self.rr_index + tried) % num_servers;
+
+            if (self.health_monitor) |monitor| {
+                if (!monitor.isHealthy(idx)) continue;
+            }
+
+            return self.tcpQuery(self.addrs[idx], query) catch continue;
+        }
+
+        return error.DnsTimeout;
+    }
+
+    /// One TCP query, bounded at every step, with nothing polling.
+    ///
+    /// TCP_KEEPINIT bounds connection establishment. A plain blocking connect() is
+    /// governed by the kernel's SYN retry schedule instead -- 75 seconds by
+    /// default on FreeBSD -- and a milter worker stalled that long on one
+    /// unreachable nameserver is an outage, not a slow lookup. SO_RCVTIMEO and
+    /// SO_SNDTIMEO then bound the data phase, exactly as the UDP path does.
+    fn tcpQuery(self: *Resolver, addr: net.Address, query: []const u8) ![]u8 {
+        // The two-byte length prefix cannot describe anything longer.
+        if (query.len > 65535) return error.QueryTooLong;
+
+        const sock = try posix.socket(
+            @intCast(addr.any.family),
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            0,
+        );
+        defer posix.close(sock);
+
+        // Rounded up, and never zero: TCP_KEEPINIT is in seconds, and zero means
+        // "use the system default", which is the unbounded behaviour being
+        // avoided here. Best-effort -- an older kernel that rejects the option
+        // should still get a working lookup, just not a bounded connect.
+        const connect_secs: u32 = @max(1, (self.config.timeout_ms + 999) / 1000);
+        // 128 is TCP_KEEPINIT from <netinet/tcp.h>; Zig does not expose it.
+        posix.setsockopt(sock, posix.IPPROTO.TCP, 128, mem.asBytes(&connect_secs)) catch {};
+
+        const timeout_sec = self.config.timeout_ms / 1000;
+        const timeout_usec = (self.config.timeout_ms % 1000) * 1000;
+        const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = @intCast(timeout_usec) };
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv));
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, mem.asBytes(&tv));
+
+        try posix.connect(sock, &addr.any, addr.getOsSockLen());
+
+        // RFC 1035 §4.2.2: over TCP the message is preceded by its own two-byte
+        // length, because a stream has no datagram boundaries to delimit it.
+        var len_buf: [2]u8 = undefined;
+        mem.writeInt(u16, &len_buf, @intCast(query.len), .big);
+        try writeAll(sock, &len_buf);
+        try writeAll(sock, query);
+
+        try readExact(sock, &len_buf);
+        const msg_len = mem.readInt(u16, &len_buf, .big);
+        if (msg_len < 12) return error.PacketTooShort;
+
+        const msg = try self.allocator.alloc(u8, msg_len);
+        errdefer self.allocator.free(msg);
+        try readExact(sock, msg);
+        return msg;
+    }
+
     fn nextId(self: *Resolver) u16 {
         const id = self.next_id;
         self.next_id +%= 1;
         return id;
     }
 };
+
+/// A stream socket may accept fewer bytes than offered, so a single send() is not
+/// a write.
+fn writeAll(sock: posix.socket_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = try posix.send(sock, bytes[off..], 0);
+        if (n == 0) return error.UnexpectedEof;
+        off += n;
+    }
+}
+
+/// Fill `out` completely.
+///
+/// A short read on a stream socket is not an error -- it means the rest has not
+/// arrived yet. A zero-length read *is* end of file, and treating that as "try
+/// again" would spin forever against a peer that has hung up.
+fn readExact(sock: posix.socket_t, out: []u8) !void {
+    var off: usize = 0;
+    while (off < out.len) {
+        const n = try posix.recv(sock, out[off..], 0);
+        if (n == 0) return error.UnexpectedEof;
+        off += n;
+    }
+}
 
 fn parseNameserver(host: []const u8, port: u16) !net.Address {
     if (net.Ip4Address.parse(host, port)) |ip4| {

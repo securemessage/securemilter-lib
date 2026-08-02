@@ -47,9 +47,31 @@ pub const Response = struct {
     }
 };
 
+/// Advertised EDNS0 receive buffer, per DNS Flag Day 2020.
+///
+/// 1232 = 1280 (the IPv6 minimum MTU) - 40 (IPv6 header) - 8 (UDP header): the
+/// largest UDP response that cannot be IP-fragmented on any conforming path.
+/// Advertising 4096 instead invites fragmentation, which is both a PMTU hazard
+/// and the basis of cache-poisoning attacks that reassemble a forged second
+/// fragment. Anything above this size is TCP's job, not UDP's.
+pub const edns_udp_payload_size: u16 = 1232;
+
 /// Build a DNS query packet for the given domain and record type.
 ///
-/// Returns a buffer containing the complete DNS UDP packet.
+/// Includes an EDNS0 OPT pseudo-RR. Without one, a responder is held to the 512
+/// byte limit of RFC 1035 §2.3.4 and must set TC=1 for anything larger -- and
+/// many resolvers then return TC=1 with an *empty* answer section, which is
+/// indistinguishable from "no such record" to a caller that does not retry.
+///
+/// That is not hypothetical. It silently broke two of the three largest mail
+/// providers in production: `yahoo.com` publishes 11 apex TXT records, so its SPF
+/// record was never seen and every message from Yahoo scored `spf=none`; and
+/// Microsoft CNAME-delegates DKIM selectors to long
+/// `*.outbound.protection.outlook.com` names whose 2048-bit key responses also
+/// exceed 512 bytes, so *every* Microsoft 365 sender scored `dkim=permerror`.
+/// Both resolve correctly the moment a buffer is advertised.
+///
+/// Returns a buffer containing the complete DNS packet.
 /// Caller owns the returned slice.
 pub fn buildQuery(allocator: Allocator, domain: []const u8, rtype: RecordType, query_id: u16) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
@@ -61,12 +83,22 @@ pub fn buildQuery(allocator: Allocator, domain: []const u8, rtype: RecordType, q
     try buf.appendSlice(allocator, &.{ 0x00, 0x01 }); // QDCOUNT=1
     try buf.appendSlice(allocator, &.{ 0x00, 0x00 }); // ANCOUNT=0
     try buf.appendSlice(allocator, &.{ 0x00, 0x00 }); // NSCOUNT=0
-    try buf.appendSlice(allocator, &.{ 0x00, 0x00 }); // ARCOUNT=0
+    try buf.appendSlice(allocator, &.{ 0x00, 0x01 }); // ARCOUNT=1 (the OPT RR below)
 
     // Question: encoded domain name + QTYPE(2) + QCLASS(2)
     try encodeDomainName(&buf, allocator, domain);
     try buf.appendSlice(allocator, &mem.toBytes(mem.nativeToBig(u16, @intFromEnum(rtype))));
     try buf.appendSlice(allocator, &.{ 0x00, 0x01 }); // QCLASS=IN
+
+    // EDNS0 OPT pseudo-RR (RFC 6891 §6.1.2). CLASS carries the payload size
+    // rather than a class, and TTL carries extended-RCODE(1) + VERSION(1) +
+    // flags(2). Version 0 and DO=0: we advertise a buffer, nothing more. No
+    // options, so RDLEN is zero.
+    try buf.append(allocator, 0x00); // NAME: root
+    try buf.appendSlice(allocator, &.{ 0x00, 0x29 }); // TYPE: OPT (41)
+    try buf.appendSlice(allocator, &mem.toBytes(mem.nativeToBig(u16, edns_udp_payload_size)));
+    try buf.appendSlice(allocator, &.{ 0x00, 0x00, 0x00, 0x00 }); // ext-rcode 0, version 0, flags 0
+    try buf.appendSlice(allocator, &.{ 0x00, 0x00 }); // RDLEN: 0
 
     return buf.toOwnedSlice(allocator);
 }
@@ -314,6 +346,51 @@ test "build query" {
     try std.testing.expectEqual(@as(u8, 0), pkt[24]);
     // QTYPE = TXT (16)
     try std.testing.expectEqual(@as(u16, 16), mem.readInt(u16, pkt[25..27], .big));
+}
+
+// Not decoration. Without the OPT RR a responder is capped at 512 bytes and
+// answers anything larger with TC=1 and, in practice, an empty answer section --
+// which is why Yahoo scored spf=none and every Microsoft 365 sender scored
+// dkim=permerror. These assertions are on the exact wire bytes because the
+// failure they guard against is silent: a malformed or missing OPT does not
+// error, it just quietly restores the old ceiling.
+test "build query advertises an EDNS0 buffer" {
+    const pkt = try buildQuery(std.testing.allocator, "example.com", .TXT, 0x1234);
+    defer std.testing.allocator.free(pkt);
+
+    // ARCOUNT = 1: the OPT RR is counted, or resolvers ignore it.
+    try std.testing.expectEqual(@as(u16, 1), mem.readInt(u16, pkt[10..12], .big));
+
+    // Question ends after QCLASS at offset 29, so the OPT RR is the last 11 bytes.
+    const opt = pkt[pkt.len - 11 ..];
+    try std.testing.expectEqual(@as(usize, 29 + 11), pkt.len);
+
+    try std.testing.expectEqual(@as(u8, 0), opt[0]); // NAME must be root
+    try std.testing.expectEqual(@as(u16, 41), mem.readInt(u16, opt[1..3], .big)); // TYPE = OPT
+
+    // CLASS is the advertised payload size, not a class. Assert the value too:
+    // a 512 here would reintroduce the exact bug this guards.
+    try std.testing.expectEqual(edns_udp_payload_size, mem.readInt(u16, opt[3..5], .big));
+    try std.testing.expect(edns_udp_payload_size > 512);
+
+    // TTL is ext-rcode(1) + VERSION(1) + flags(2). Version must be 0; a nonzero
+    // version makes a conforming responder reply BADVERS and answer nothing.
+    try std.testing.expectEqual(@as(u32, 0), mem.readInt(u32, opt[5..9], .big));
+
+    // RDLEN = 0: we send no EDNS options.
+    try std.testing.expectEqual(@as(u16, 0), mem.readInt(u16, opt[9..11], .big));
+}
+
+// The OPT RR is appended after the question, so it must not disturb the offsets
+// every other parser and test in here depends on.
+test "the EDNS0 OPT RR does not shift the question section" {
+    const pkt = try buildQuery(std.testing.allocator, "example.com", .TXT, 0x1234);
+    defer std.testing.allocator.free(pkt);
+
+    try std.testing.expectEqual(@as(u8, 7), pkt[12]);
+    try std.testing.expectEqualStrings("example", pkt[13..20]);
+    try std.testing.expectEqual(@as(u16, 16), mem.readInt(u16, pkt[25..27], .big));
+    try std.testing.expectEqual(@as(u16, 1), mem.readInt(u16, pkt[27..29], .big)); // QCLASS=IN
 }
 
 test "encode domain name" {
