@@ -34,18 +34,48 @@ pub fn simple(code: Code) [1]u8 {
 /// Build an SMFIR_ADDHEADER payload.
 ///
 /// Format: name NUL value NUL
+///
+/// `leading_space` says whether this packet must carry the space that separates
+/// the colon from the value. **It is not cosmetic, and it has no default on
+/// purpose.**
+///
+/// `SMFIP_HDR_LEADSPC` is a two-sided bargain. D-23 asked for it to get header
+/// values on the *input* side exactly as they appeared on the wire, because
+/// `c=simple` hashes the field verbatim and the MTA otherwise eats one space.
+/// The half that went unnoticed is that the same flag transfers ownership of
+/// that space on the *output* side too: once a milter negotiates it, Postfix
+/// stops inserting a space after the colon in headers that milter adds, and
+/// expects the milter to supply it.
+///
+/// Neither daemon that asked for the flag supplied it, so every header they
+/// added shipped as `Authentication-Results:mail.example.org;` while the two
+/// daemons that never asked emitted `Authentication-Results: ...`. One delivered
+/// message carried both forms, from the same host, over the same Postfix.
+/// RFC 5322 tolerates the missing space -- FWS after the colon is optional --
+/// but every RFC 8601 example writes it, and four daemons in one ADMD disagreeing
+/// about their own header is the actual defect.
+///
+/// Required rather than defaulted for the reason recorded in L-2: a parameter
+/// that quietly supplies a value when a call site forgets is the mechanism of
+/// the bug, not the fix. Every caller must state which side of the bargain it
+/// is on, and the only correct source for that answer is
+/// `conn.negotiated_protocol.header_leading_space` -- what the MTA *agreed* to,
+/// never what the daemon asked for.
 pub fn addHeader(
     allocator: std.mem.Allocator,
     name: []const u8,
     value: []const u8,
+    leading_space: bool,
 ) ![]u8 {
-    const len = 1 + name.len + 1 + value.len + 1;
+    const space: usize = if (leading_space) 1 else 0;
+    const len = 1 + name.len + 1 + space + value.len + 1;
     const buf = try allocator.alloc(u8, len);
 
     buf[0] = @intFromEnum(Code.add_header);
     @memcpy(buf[1 .. 1 + name.len], name);
     buf[1 + name.len] = 0;
-    @memcpy(buf[2 + name.len .. 2 + name.len + value.len], value);
+    if (leading_space) buf[2 + name.len] = ' ';
+    @memcpy(buf[2 + name.len + space ..][0..value.len], value);
     buf[len - 1] = 0;
 
     return buf;
@@ -122,7 +152,7 @@ test "simple response" {
 }
 
 test "add header" {
-    const buf = try addHeader(std.testing.allocator, "X-Test", "value");
+    const buf = try addHeader(std.testing.allocator, "X-Test", "value", false);
     defer std.testing.allocator.free(buf);
 
     try std.testing.expectEqual(@as(u8, 'h'), buf[0]);

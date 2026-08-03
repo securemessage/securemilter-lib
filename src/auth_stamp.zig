@@ -35,23 +35,28 @@ const log = @import("log.zig");
 /// is never charged to the sender.** If we cannot record what we found, we defer
 /// and let the sender retry, rather than delivering a message that misrepresents
 /// what we checked.
-
 /// Build and write one `Authentication-Results` field.
 ///
 /// The whole value and its packet are built before anything is written, so an
 /// allocation failure cannot leave a partial header on the wire. That ordering
 /// matters for the same reason it did in X-8: a milter `addHeader` packet cannot
 /// be recalled once written.
+///
+/// `leading_space` must come from `conn.negotiated_protocol.header_leading_space`
+/// -- what the MTA agreed to, not what the daemon requested. Under
+/// `SMFIP_HDR_LEADSPC` the milter owns the space after the colon; see
+/// `responses.addHeader` for why that is not cosmetic and why it has no default.
 pub fn stamp(
     allocator: Allocator,
     fd: posix.fd_t,
     authserv_id: []const u8,
     results: []const auth_results.MethodResult,
+    leading_space: bool,
 ) !void {
     const value = try auth_results.build(allocator, authserv_id, results);
     defer allocator.free(value);
 
-    const payload = try responses.addHeader(allocator, "Authentication-Results", value);
+    const payload = try responses.addHeader(allocator, "Authentication-Results", value, leading_space);
     defer allocator.free(payload);
 
     try codec.writePacket(fd, payload);
@@ -91,7 +96,7 @@ test "stamp writes one complete Authentication-Results field" {
                 .{ .ptype = "smtp", .property = "mailfrom", .value = "example.com" },
             },
         },
-    });
+    }, false);
 
     var buf: [512]u8 = undefined;
     const n = try posix.read(fds[0], &buf);
@@ -100,6 +105,47 @@ test "stamp writes one complete Authentication-Results field" {
     try std.testing.expect(mem.indexOf(u8, packet, "Authentication-Results") != null);
     try std.testing.expect(mem.indexOf(u8, packet, "spf=pass") != null);
     try std.testing.expect(mem.indexOf(u8, packet, "smtp.mailfrom=example.com") != null);
+}
+
+test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not" {
+    // The defect this guards: two daemons negotiated `header_leading_space` for
+    // D-23's benefit on the input side and kept writing output as though they
+    // had not, so Postfix -- which stops inserting the space once the flag is
+    // agreed -- delivered `Authentication-Results:mail.test;` from them and
+    // `Authentication-Results: mail.test;` from the two that never asked.
+    //
+    // Asserted on the wire bytes rather than on the rendered header, because the
+    // rendered header is the MTA's business and this is the only part we own.
+    for ([_]bool{ false, true }) |leading_space| {
+        const fds = try posix.pipe2(.{ .NONBLOCK = true });
+        defer posix.close(fds[0]);
+        defer posix.close(fds[1]);
+
+        try stamp(std.testing.allocator, fds[1], "mail.test", &.{
+            .{ .method = "dkim", .result = "pass" },
+        }, leading_space);
+
+        var buf: [512]u8 = undefined;
+        const n = try posix.read(fds[0], &buf);
+        const packet = buf[0..n];
+
+        // On the wire: uint32 length, then 'h' name NUL value NUL. The length
+        // prefix is `codec.writePacket`'s, not `addHeader`'s -- getting that
+        // wrong is what made the first version of this test read a byte out of
+        // the middle of the header name and still look plausible.
+        const name = "Authentication-Results";
+        const value_start = 4 + 1 + name.len + 1;
+        try std.testing.expect(packet.len > value_start);
+        try std.testing.expectEqual(@as(u8, 0), packet[value_start - 1]);
+
+        if (leading_space) {
+            try std.testing.expectEqual(@as(u8, ' '), packet[value_start]);
+            try std.testing.expect(mem.startsWith(u8, packet[value_start..], " mail.test;"));
+        } else {
+            try std.testing.expect(packet[value_start] != ' ');
+            try std.testing.expect(mem.startsWith(u8, packet[value_start..], "mail.test;"));
+        }
+    }
 }
 
 test "stamp writes nothing at all when it cannot build the header" {
@@ -123,7 +169,7 @@ test "stamp writes nothing at all when it cannot build the header" {
         );
         const res = stamp(failing.allocator(), fds[1], "mail.test", &.{
             .{ .method = "dkim", .result = "pass" },
-        });
+        }, false);
 
         var buf: [512]u8 = undefined;
         const n = posix.read(fds[0], &buf) catch |err| switch (err) {
