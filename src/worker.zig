@@ -63,14 +63,23 @@ const DRAIN_TIMEOUT_MS: u64 = 30_000;
 /// Default max connections per worker if not configured.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 
+/// Maximum staged changelist entries. Flushed on next kevent() call.
+const MAX_PENDING: usize = 128;
+
+/// Minimum gap between one worker's "refused connections" reports.
+///
+/// The refusal path is reachable by anyone who can open a socket to the milter
+/// port, so a line per refused connection would let a caller choose how much
+/// this daemon writes to syslog. Reporting is therefore collapsed: the first
+/// refusal is logged at once, and subsequent ones are counted and summarised no
+/// more often than this.
+const REFUSED_LOG_INTERVAL_MS: i64 = 1000;
+
 /// A single worker thread's state.
 ///
 /// Each worker owns its own kqueue, its own set of SO_REUSEPORT
 /// listener sockets, and its own connection pool. Workers share
 /// nothing with each other — no locks, no contention.
-/// Maximum staged changelist entries. Flushed on next kevent() call.
-const MAX_PENDING: usize = 128;
-
 pub const Worker = struct {
     allocator: Allocator,
     kq: i32,
@@ -85,6 +94,10 @@ pub const Worker = struct {
     config_gen: ?*const reload_mod.ConfigGeneration,
     local_generation: u64,
     max_connections: u32,
+    /// Connections refused for being at `max_connections` and not yet reported,
+    /// with the time of the last report. See `reportRefusedConnections`.
+    refused_pending: u64,
+    refused_log_at: ?i64,
     /// Index of this worker's quiescent-state slot in `config_gen`.
     worker_index: usize,
     /// Read end of this worker's wakeup pipe, or -1. A byte here means only
@@ -119,6 +132,8 @@ pub const Worker = struct {
             .config_gen = config_gen,
             .local_generation = if (config_gen) |cg| cg.load() else 0,
             .max_connections = max_conn,
+            .refused_pending = 0,
+            .refused_log_at = null,
             .worker_index = worker_index,
             .wakeup_fd = wakeup_fd,
         };
@@ -274,6 +289,57 @@ pub const Worker = struct {
         }
     }
 
+    /// Count a connection closed for arriving while this worker was full.
+    ///
+    /// Counted here and reported by `reportRefusedConnections` once the accept
+    /// batch is drained, so that one burst produces one line naming how many it
+    /// refused. Reporting from inside the loop instead described a burst of four
+    /// as "refused 1", because the first refusal logged immediately and the rest
+    /// arrived inside the suppression window and were never flushed.
+    fn noteRefusedConnection(self: *Worker) void {
+        self.refused_pending += 1;
+    }
+
+    /// Report connections closed for arriving while this worker was full.
+    ///
+    /// The refusal itself is correct and is what L-2 asked for, but it used to be
+    /// SILENT: the fd was closed and the loop moved on. From the MTA's side that
+    /// is a milter that accepted a TCP connection and hung up without speaking,
+    /// which with `milter_default_action = tempfail` defers the mail. So an
+    /// operator who set `MaxConnections` too low, or who was simply pushed past
+    /// it, saw deferrals in the Postfix log and NOTHING here to attribute them
+    /// to -- while this daemon was working exactly as configured.
+    ///
+    /// Called once per accept batch rather than per connection. `handleAccept`
+    /// drains until EWOULDBLOCK, so a flood of connections costs a handful of
+    /// lines rather than one per connection; the time floor then bounds a caller
+    /// who trickles connections slowly enough to earn a batch each. Refusals
+    /// arriving inside that floor stay pending and are added to the next report,
+    /// so a count may lag by up to `REFUSED_LOG_INTERVAL_MS` but is never lost
+    /// except at the very end of an episode.
+    ///
+    /// The cap is named as the setting an operator would change, and
+    /// `max_connections` is PER WORKER, so the worker index is included: the
+    /// process-wide ceiling is this number times the worker count, and a reader
+    /// who assumed otherwise would go looking for a limit several times lower
+    /// than the one they actually hit.
+    fn reportRefusedConnections(self: *Worker) void {
+        if (self.refused_pending == 0) return;
+
+        const now = std.time.milliTimestamp();
+        if (self.refused_log_at) |last| {
+            if (now - last < REFUSED_LOG_INTERVAL_MS) return;
+        }
+
+        log_mod.warn("refused {d} connection(s): worker {d} is at MaxConnections={d}", .{
+            self.refused_pending,
+            self.worker_index,
+            self.max_connections,
+        });
+        self.refused_log_at = now;
+        self.refused_pending = 0;
+    }
+
     fn isListenFd(self: *const Worker, fd: posix.fd_t) bool {
         for (self.listeners.items) |lst| {
             if (lst.fd == fd) return true;
@@ -303,6 +369,7 @@ pub const Worker = struct {
             // Backpressure: reject connection if at capacity
             if (self.connections.count() >= self.max_connections) {
                 posix.close(conn_fd);
+                self.noteRefusedConnection();
                 continue;
             }
 
@@ -326,6 +393,8 @@ pub const Worker = struct {
 
             self.stageRead(conn_fd);
         }
+
+        self.reportRefusedConnections();
     }
 
     /// Whether the connection is still in the map after a dispatch.
