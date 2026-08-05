@@ -5,6 +5,11 @@ const log_mod = @import("log.zig");
 
 extern "c" fn setgroups(ngroups: c_int, gidset: ?[*]const c.gid_t) c_int;
 
+// Declared here for the same reason as `setgroups`: both `std.c` and `std.posix`
+// expose the uid pair and neither exposes the gid pair.
+extern "c" fn getgid() c.gid_t;
+extern "c" fn getegid() c.gid_t;
+
 /// The byte a daemon sends its waiting parent once it is actually serving.
 ///
 /// A specific value rather than any byte: the write end is inherited across two
@@ -248,6 +253,23 @@ pub fn calculateFdNeed(num_workers: u32, max_connections: u32, num_listeners: u3
 /// supplementary groups) + setgid + setuid. Order matters: setgroups
 /// requires root, so it must come before setuid.
 /// Must be called as root before entering the event loop.
+///
+/// A UID OF 0 IS REFUSED RATHER THAN OBEYED. Every syscall below succeeds when
+/// the target is root, so `User = root` produced a daemon that reported a
+/// successful privilege drop and kept every privilege it had -- the one outcome
+/// an operator reading that log line would rule out. This is not a hypothetical
+/// typo either: FreeBSD ships `toor` as a second uid-0 account, so a plausible
+/// name resolves to a silent no-op. There is already a way to say "do not drop",
+/// which is to leave the option unset (`bootstrap.Options.user` is optional), so
+/// nothing is lost by making the confusing spelling an error.
+///
+/// The drop is then VERIFIED rather than inferred from three return codes. The
+/// check is nearly free and covers the cases where a call reports success
+/// without having done what was asked -- and, more usefully, it is what would
+/// catch a future edit that reorders or drops one of the three calls. Note it
+/// cannot substitute for the uid-0 guard above: with a target of 0 the identity
+/// after the "drop" is 0, which is exactly what was asked for, so verification
+/// passes. The two checks catch different faults.
 pub fn dropPrivileges(username: []const u8) !void {
     var name_buf: [256:0]u8 = undefined;
     if (username.len >= name_buf.len) return error.UsernameTooLong;
@@ -259,10 +281,18 @@ pub fn dropPrivileges(username: []const u8) !void {
 
     const passwd = pw.?;
 
+    if (passwd.uid == 0) return error.RefusingToDropToRoot;
+
     // Clear supplementary groups — prevents inheriting root's group memberships
     if (setgroups(0, null) != 0) return error.SetgroupsFailed;
     if (c.setgid(passwd.gid) != 0) return error.SetgidFailed;
     if (c.setuid(passwd.uid) != 0) return error.SetuidFailed;
+
+    // Real *and* effective, because a mismatch is the shape a partial drop takes:
+    // an effective id that moved while the real one did not leaves the process
+    // able to return to what it was.
+    if (c.getuid() != passwd.uid or c.geteuid() != passwd.uid) return error.PrivilegeDropNotEffective;
+    if (getgid() != passwd.gid or getegid() != passwd.gid) return error.PrivilegeDropNotEffective;
 }
 
 /// Signal set for kqueue-based signal handling.
@@ -529,4 +559,26 @@ test "X-16: the parent rejects a byte it did not agree to" {
     _ = try posix.write(fds[1], "?");
     posix.close(fds[1]);
     try std.testing.expectError(error.StartupFailed, awaitReady(fds[0], 5));
+}
+
+// Every case below is rejected before the first syscall, which is what makes
+// them safe to run here: a test that actually completed a drop would leave the
+// rest of the suite running as somebody else. It is also why the uid-0 case is
+// testable at all -- unprivileged, the three syscalls would fail anyway and
+// prove nothing, whereas the guard returns the same answer either way.
+
+test "dropping to root is refused rather than quietly doing nothing" {
+    // The fault this prevents is silent by construction: as root, every syscall
+    // in the drop succeeds against a uid-0 target and the daemon logs an
+    // ordinary successful start while holding every privilege it had.
+    try std.testing.expectError(error.RefusingToDropToRoot, dropPrivileges("root"));
+}
+
+test "an unknown user is refused" {
+    try std.testing.expectError(error.UserNotFound, dropPrivileges("no-such-user-4f1c8e2a"));
+}
+
+test "an over-long username is refused before getpwnam sees it" {
+    const long = "u" ** 300;
+    try std.testing.expectError(error.UsernameTooLong, dropPrivileges(long));
 }
