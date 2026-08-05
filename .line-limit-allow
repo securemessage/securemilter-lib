@@ -110,6 +110,75 @@
 #   NO OBLIGATION TO UNDO. This file's own debt is the pool/eviction split noted
 #   under X-15 for worker.zig; nothing here adds to it.
 #
+# 2026-08-04, dns/resolver.zig 639 -> 414. SPLIT, NOT RAISED.
+#
+#   `Cache` shared nothing with the query engine but an allocator: it never
+#   touches a socket, a nameserver or `Result`, and reaches only for
+#   `packet.Answer`. Eight of the file's eleven tests were testing it and
+#   nothing else. It is now `dns/cache.zig` (257, under the goal, no ceiling).
+#
+#   The negative-answer taxonomy went with it. `CacheEntry` embeds
+#   `NegativeKind`, so that much had to move or the dependency would run both
+#   ways; `isTransientError` followed because the two are one classification,
+#   `Resolver` never calls it, and the test that pins the distinction -- a
+#   dropped packet must not look like an authoritative "no such name" --
+#   exercises both halves in one assertion. `resolver.zig` re-exports all three,
+#   so `dns.zig` and the four daemons are untouched.
+#
+#   The moved code is byte-identical to what was removed, verified by diffing
+#   the new file against the deleted ranges at HEAD rather than by eye. Tests
+#   210/210, the same count as HEAD -- and `_ = cache` was added to `dns.zig`'s
+#   test block, because `resolver.zig` importing the file is NOT enough to make
+#   Zig analyse its tests. Without that line all eight would have compiled,
+#   looked tested, and never run.
+#
+# 2026-08-04, connection.zig 504. RECORDED, AND DELIBERATELY NOT SPLIT.
+#
+#   The refactor plan already settled this one and the measurements still hold:
+#   "25 functions, max depth 3, zero deep, zero long. The cleanest large file in
+#   the suite. Left alone; it is over the goal on size only, which is exactly
+#   the distinction the gate now measures correctly."
+#
+#   It has also already been paid down once -- `header.zig` was extracted out of
+#   it and is re-exported back. What is left is one `Connection` struct plus the
+#   two types it embeds, `Macros` and `Limits`. Cutting either out would
+#   separate a type from the struct that owns it.
+#
+#   Growth is audit work, measured not assumed: 285 -> 430 at `208fd9a` (X-4,
+#   capping attacker-controlled content, +145), 449 at `b50d2bc` (D-23), and 504
+#   at `fa76b27` (keeping the client address the protocol already gave us, +55).
+#   The ceiling was 449, set at D-23; this raise is the client-address work.
+#
+# 2026-08-04, worker.zig 695. RECORDED WITH A NUMBER TO HIT.
+#
+#   PAID DOWN ONCE ALREADY AND HAS GROWN MOST OF IT BACK. `636aad7` split pool
+#   construction into `pool.zig` and took it 722 -> 601. Since then: 620
+#   (`b50d2bc`, D-23), 626 (`fa76b27`, client address), and 695 (`3dc0c45`, L-2
+#   reporting connections refused at MaxConnections, +69 in one commit). The
+#   split bought 121 lines and audit work has spent 94 of them. Saying so
+#   plainly because a ceiling that quietly returns to its pre-paydown value is
+#   the failure mode this file exists to catch.
+#
+#   NOT SPLIT AGAIN, and the reason is the shape rather than the effort. The
+#   obvious candidate is the eleven `handleX` command handlers, which look like
+#   a seam and are not one: they call back into `self.sendResponse` (9 times),
+#   `self.removeConnection` (4), `self.callbacks` (10), plus `allocator`,
+#   `connections` and `alive`, while `dispatchPacket` calls them. Moving them
+#   means a second file that needs the `Worker` type while `Worker` needs its
+#   functions -- mutual imports where each file reaches into the other, which is
+#   worse than one file. The alternative, inventing a narrower reply interface
+#   so the handlers stop touching `Worker`, adds an abstraction to satisfy a
+#   line count; that is the same mistake recorded for X-15, where a barrier was
+#   "the wrong repair" and constructing on the calling thread was the right one.
+#   `pool.zig` was separable because thread construction genuinely is. A kqueue
+#   loop and the replies it sends are not.
+#
+#   THE NUMBER TO HIT IF IT GROWS AGAIN: 601, the post-`pool.zig` figure. The
+#   next real seam is listener/accept handling (`handleAccept`,
+#   `isListenFd`, `listenerIndexForFd`, `noteRefusedConnection`,
+#   `reportRefusedConnections`), which touches connection admission rather than
+#   the protocol, and unlike the handlers does not need to send replies.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -122,6 +191,6 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-449 src/connection.zig
-507 src/dns/resolver.zig
-620 src/worker.zig
+504 src/connection.zig
+414 src/dns/resolver.zig
+695 src/worker.zig
