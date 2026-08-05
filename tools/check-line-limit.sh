@@ -61,6 +61,44 @@ list_sources() {
     find "$SRCDIR" -name '*.zig' | sort
 }
 
+# A TEST LIVES BESIDE THE THING IT TESTS. Refused, not advised.
+#
+# Measuring every file made relocation gain nothing for a test BODY, and that was
+# believed to be the end of it. It was not. A shared test HELPER is a top-level
+# declaration wherever it lives, so moving tests out still moved the helper lines
+# off the production file's ceiling and onto a new file with no ceiling at all --
+# and by 2026-08-05 five files had been split that way, three of them citing each
+# other as precedent in their own headers, one of them stating outright that it
+# existed "so the line-limit gate excludes it". Two ceilings went up when they
+# were folded back, which is the size of what the split had been hiding.
+#
+# The rule has two halves and only the first one is a metric:
+#
+#   comments and tests never count       `prod_lines` below
+#   a test lives beside its subject      here
+#
+# Without the second half the first is an invitation: if tests are free where
+# they are, the only thing moving them can buy is hiding their scaffolding.
+#
+# Enforced by name because that is what a reader and a `find` can both see. A
+# genuine external harness is a separate build target with its own root, not a
+# file dropped into src/.
+refuse_relocated_tests() {
+    found=$(find "$SRCDIR" -name '*_test.zig' | sort)
+    [ -n "$found" ] || return 0
+
+    echo "$found" | while IFS= read -r f; do
+        echo "relocated tests  $f"
+    done
+    echo
+    echo "A test belongs in the file it tests. Tests and the comments above them"
+    echo "are not counted against any file's length, so moving them out buys"
+    echo "nothing except moving their shared helpers off that file's ceiling --"
+    echo "which is the accounting error this gate exists to prevent."
+    echo "Fold each one back into its subject and delete the file."
+    exit 1
+}
+
 # Count PRODUCTION lines: everything outside a top-level `test` block.
 #
 # Excluding test FILES while counting test BLOCKS was a loophole, and it was
@@ -191,6 +229,10 @@ write_allowlist() {
 
     mv "$tmp" "$ALLOWLIST"
 }
+
+# Before anything else, and in --update mode too: a relocated test file must not
+# be bankable. Recording a ceiling for one would make the split official.
+refuse_relocated_tests
 
 if [ "$MODE" = "--update" ]; then
     write_allowlist
