@@ -4,6 +4,11 @@ pub const milter = @import("milter/protocol.zig");
 pub const listener = @import("listener.zig");
 pub const connection = @import("connection.zig");
 pub const header = @import("header.zig");
+/// The one definition of how a message *file* becomes the view of a message a
+/// milter receives. Public because every conformance checker in the suite has to
+/// model it identically to the daemon, and three private copies is how they came
+/// to disagree (refactor plan stage 5.2).
+pub const msgfile = @import("msgfile.zig");
 pub const daemon = @import("daemon.zig");
 pub const credentials = @import("credentials.zig");
 pub const bootstrap = @import("bootstrap.zig");
@@ -31,6 +36,7 @@ test {
     _ = listener;
     _ = connection;
     _ = header;
+    _ = msgfile;
     _ = daemon;
     _ = credentials;
     _ = bootstrap;
