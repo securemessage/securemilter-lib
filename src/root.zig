@@ -5,6 +5,7 @@ pub const listener = @import("listener.zig");
 pub const connection = @import("connection.zig");
 pub const header = @import("header.zig");
 pub const daemon = @import("daemon.zig");
+pub const credentials = @import("credentials.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const worker = @import("worker.zig");
 pub const pool = @import("pool.zig");
@@ -31,6 +32,7 @@ test {
     _ = connection;
     _ = header;
     _ = daemon;
+    _ = credentials;
     _ = bootstrap;
     _ = worker;
     // `pool` was exported above but missing here, so its tests had never run.

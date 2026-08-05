@@ -52,6 +52,33 @@ pub const Config = struct {
             return parseSize(raw) orelse default;
         }
 
+        /// Read a permission mask, in octal. Null means the option is absent.
+        ///
+        /// OCTAL UNCONDITIONALLY, which is a deliberate narrowing of what
+        /// opendkim accepts. Its config reader parses integers with `strtol`
+        /// base 0, so a leading zero selects octal and anything else is decimal.
+        /// For every value an operator actually writes the two agree, because a
+        /// mask is written `0022` or `0117`. They diverge only on a value typed
+        /// without the leading zero, where base 0 reads `117` as one hundred and
+        /// seventeen -- 0o165, `rwxr-x--x` -- and grants a mask nobody asked
+        /// for. A permission mask has no meaningful decimal spelling, so there
+        /// is nothing to lose by not guessing.
+        ///
+        /// A MALFORMED VALUE IS AN ERROR, unlike `getInt` and `getSize` which
+        /// fall back to their default. Those describe capacity, where landing on
+        /// a sane number is better than refusing to start. This one describes who
+        /// may open a socket that signs mail, and quietly substituting the
+        /// inherited mask for a value the operator wrote down and got slightly
+        /// wrong is how a socket ends up more permissive than the file says it
+        /// is. Same reasoning as `parseListenerSocket` refusing a malformed
+        /// `Socket` rather than falling back to loopback (X-14).
+        pub fn getMode(self: *const Section, key: []const u8) !?std.posix.mode_t {
+            const raw = self.entries.get(key) orelse return null;
+            const trimmed = std.mem.trim(u8, raw, " \t");
+            if (trimmed.len == 0) return error.InvalidMode;
+            return std.fmt.parseInt(std.posix.mode_t, trimmed, 8) catch return error.InvalidMode;
+        }
+
         /// Read a comma-separated option into an owned slice of trimmed,
         /// non-empty parts. Absent or all-empty yields a zero-length slice.
         ///
@@ -494,6 +521,35 @@ test "bool parsing" {
     try std.testing.expect(!g.getBool("No2", true));
     try std.testing.expect(!g.getBool("No3", true));
     try std.testing.expect(g.getBool("Missing", true));
+}
+
+test "mode parsing is octal, and a bad value is refused rather than defaulted" {
+    const source =
+        \\Leading = 0117
+        \\Bare = 117
+        \\Zero = 0
+        \\Junk = 0o117
+        \\Empty =
+        \\Negative = -1
+    ;
+    var cfg = try parse(std.testing.allocator, source);
+    defer cfg.deinit();
+
+    const g = cfg.global().?;
+    try std.testing.expectEqual(@as(?std.posix.mode_t, 0o117), try g.getMode("Leading"));
+
+    // The case the octal-only rule exists for: base-0 parsing, which is what
+    // opendkim uses, reads this as decimal 117 = 0o165 and hands out a socket
+    // group-writable and world-executable.
+    try std.testing.expectEqual(@as(?std.posix.mode_t, 0o117), try g.getMode("Bare"));
+
+    // Distinct from absent -- 0 is a legitimate mask meaning "filter nothing".
+    try std.testing.expectEqual(@as(?std.posix.mode_t, 0), try g.getMode("Zero"));
+    try std.testing.expectEqual(@as(?std.posix.mode_t, null), try g.getMode("Missing"));
+
+    try std.testing.expectError(error.InvalidMode, g.getMode("Junk"));
+    try std.testing.expectError(error.InvalidMode, g.getMode("Empty"));
+    try std.testing.expectError(error.InvalidMode, g.getMode("Negative"));
 }
 
 test "duplicate key overwrites" {

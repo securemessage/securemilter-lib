@@ -9,6 +9,7 @@
 const std = @import("std");
 const posix = std.posix;
 const daemon = @import("daemon.zig");
+const credentials = @import("credentials.zig");
 const log_mod = @import("log.zig");
 
 /// What a daemon needs to come up, in one place.
@@ -16,8 +17,18 @@ pub const Options = struct {
     /// Skip `daemonize`, staying attached to the terminal.
     foreground: bool,
     pid_file: []const u8,
-    /// Unprivileged user to become. Null leaves privileges alone.
+    /// Unprivileged user to become, as `user` or `user:group`. Null leaves
+    /// privileges alone.
     user: ?[]const u8,
+
+    /// File-creation mask for the PID file and any unix-domain listener. Null
+    /// inherits whatever the supervisor had, which is the pre-existing behaviour.
+    ///
+    /// This is the only control over unix socket permissions, because there is no
+    /// second one to have: `bind` applies the umask at creation and a later `chmod`
+    /// leaves a window in which the socket exists at the wider mode. opendkim
+    /// spells it the same way and for the same reason.
+    umask: ?posix.mode_t = null,
     /// 0 means "one per CPU", resolved by `run` and reported back.
     worker_threads: u32,
     max_connections: u32,
@@ -88,7 +99,8 @@ pub const Ops = struct {
     write_pid_file: *const fn ([]const u8) anyerror!void = daemon.writePidFile,
     remove_pid_file: *const fn ([]const u8) void = daemon.removePidFile,
     raise_file_limit: *const fn (u64) void = daemon.raiseFileLimit,
-    drop_privileges: *const fn ([]const u8) anyerror!void = daemon.dropPrivileges,
+    drop_privileges: *const fn ([]const u8) anyerror!void = credentials.dropPrivileges,
+    set_umask: *const fn (posix.mode_t) void = credentials.setUmask,
 };
 
 /// Bring the daemon up: daemonize, block signals, spawn threads, claim the PID file,
@@ -116,6 +128,12 @@ pub const Ops = struct {
 ///      unprivileged user.
 ///   5. fd limit raised before privileges are dropped: `setrlimit` above the soft limit
 ///      needs root.
+///   6. The umask set before anything is created. It is not a permission that can be
+///      applied afterwards — it filters the mode at creation — so a mask installed
+///      after the PID file is written, or after the caller binds its listeners, is
+///      simply not in effect for the files it was configured to protect. Ordered
+///      first because "every file from here on" is the only version of this rule with
+///      no exceptions to remember.
 ///
 /// A failed PID file write is logged and survived — the daemon still works, it is
 /// merely harder to signal. A failed `daemonize` or privilege drop is fatal, because
@@ -128,6 +146,10 @@ pub fn run(opts: Options) !Bootstrap {
 
 /// `run` with the steps substituted. For tests; production calls `run`.
 pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
+    // (6) first, so it covers the PID file below and the listeners the caller binds
+    // after this returns.
+    if (opts.umask) |mask| ops.set_umask(mask);
+
     // (0) BEFORE `daemonize`, and it cannot move. While we are still the process a
     // supervisor named, a live holder that is not us is unambiguously a second
     // instance. After the fork that is no longer decidable: `daemon -p` has written
@@ -268,7 +290,7 @@ pub fn fatal(e: anyerror) anyerror {
 // the PID file is claimed before or after the fd limit is free, and a test that pinned
 // the whole order would fail on a change that breaks nothing.
 
-const Step = enum { check_running, daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs, signal_ready };
+const Step = enum { check_running, daemonize, reinit_log, block_signals, spawn_threads, write_pid, remove_pid, raise_fd, drop_privs, signal_ready, set_umask };
 
 var recorded: [16]Step = undefined;
 var recorded_len: usize = 0;
@@ -315,6 +337,9 @@ fn recRaiseFd(_: u64) void {
 fn recDropPrivs(_: []const u8) anyerror!void {
     record(.drop_privs);
 }
+fn recSetUmask(_: posix.mode_t) void {
+    record(.set_umask);
+}
 
 const recording_ops = Ops{
     .check_not_running = recCheckRunning,
@@ -326,6 +351,7 @@ const recording_ops = Ops{
     .remove_pid_file = recRemovePid,
     .raise_file_limit = recRaiseFd,
     .drop_privileges = recDropPrivs,
+    .set_umask = recSetUmask,
 };
 
 fn runRecorded(opts: Options) !Bootstrap {
@@ -413,6 +439,26 @@ test "the fd limit is raised while still privileged" {
     // rather than as an error here.
     _ = try runRecorded(test_opts);
     try expectBefore(.raise_fd, .drop_privs);
+}
+
+test "the umask is set before anything is created" {
+    // A mask is not applied to a file, it filters the mode the file is created with.
+    // Set it after `write_pid` and the PID file keeps the supervisor's mask; the more
+    // expensive version of the same mistake is the caller's unix socket, bound after
+    // `run` returns, which is the file the option exists for.
+    var opts = test_opts;
+    opts.umask = 0o117;
+    _ = try runRecorded(opts);
+
+    try expectBefore(.set_umask, .write_pid);
+    try std.testing.expectEqual(@as(usize, 0), indexOf(.set_umask).?);
+}
+
+test "no umask configured leaves the inherited one alone" {
+    // Distinct from configuring 0: the daemon must not narrow -- or widen -- a mask
+    // nobody asked it to touch.
+    _ = try runRecorded(test_opts);
+    try std.testing.expect(indexOf(.set_umask) == null);
 }
 
 test "foreground skips daemonize and its log re-init, but still blocks before spawning" {
