@@ -80,6 +80,11 @@ list_sources() {
 # Without the second half the first is an invitation: if tests are free where
 # they are, the only thing moving them can buy is hiding their scaffolding.
 #
+# As of 2026-08-05 `prod_lines` finally implements the first half as written --
+# every comment is free, not just one above a `test` -- which makes the second
+# half the only thing standing between a relocated test and a lower number, and
+# therefore load-bearing rather than advisory.
+#
 # Enforced by name because that is what a reader and a `find` can both see. A
 # genuine external harness is a separate build target with its own root, not a
 # file dropped into src/.
@@ -91,8 +96,8 @@ refuse_relocated_tests() {
         echo "relocated tests  $f"
     done
     echo
-    echo "A test belongs in the file it tests. Tests and the comments above them"
-    echo "are not counted against any file's length, so moving them out buys"
+    echo "A test belongs in the file it tests. Neither tests nor comments are"
+    echo "counted against any file's length -- anywhere -- so moving them out buys"
     echo "nothing except moving their shared helpers off that file's ceiling --"
     echo "which is the accounting error this gate exists to prevent."
     echo "Fold each one back into its subject and delete the file."
@@ -113,25 +118,55 @@ refuse_relocated_tests() {
 # the incentive to move them and makes the number mean what it claims to --
 # the size of the logic a reader has to hold in their head.
 #
-# A TEST'S LEADING COMMENT BLOCK IS PART OF THE TEST. Comments and blank lines
-# are held back and only charged when real code follows them; a `test` line
-# discards whatever is held. Without this the rule above is false in the way
-# that matters most -- an explanation of what a test defends against is exactly
-# the thing worth writing, and charging it as production made the cheapest way
-# to satisfy the gate "delete the reasoning" or "move the test to a file the
-# checker skips". A metric that bills you for documenting a regression test is
-# steering away from the behaviour it exists to encourage.
+# A COMMENT IS NEVER CHARGED, WHEREVER IT IS. Not above a test, not above a
+# function, not at the top of the file.
+#
+# This was half-implemented until 2026-08-05. Comments were held back and charged
+# as soon as real code followed them, so only a comment block directly above a
+# `test` line came out free -- and the header two blocks up nonetheless stated the
+# rule as "comments and tests never count", which the code did not do. 41% of what
+# the gate was measuring across the six packages was comment text: 21,353 counted
+# lines fell to 12,408 when the rule was applied as written, and 15 files over the
+# goal fell to 2.
+#
+# The argument for charging them does not survive contact with the stated purpose
+# of the number, which is "the size of the logic a reader has to hold in their
+# head". A comment is not logic; it is the thing that makes logic cost less to
+# hold. Billing for it makes the cheapest way to satisfy the gate "delete the
+# reasoning", in a codebase whose entire review standard is that the reasoning is
+# written down -- and it was already recognised as unacceptable for tests, for
+# exactly this reason, without the same conclusion being drawn one line further
+# out.
+#
+# WHAT THIS DOES NOT EXCUSE. Thirteen files stopped being flagged the moment this
+# landed, having had no code removed. That is honest -- they were never 500 lines
+# of logic -- but it means the length metric is no longer what justifies the
+# remaining consolidation work. Duplication is, and no version of this counter has
+# ever been able to see it.
+#
+# Worked example from the same day: `securearc/src/arc.zig` held a FOURTH live copy
+# of the tag scanner that lives in `securemilter_crypto.sig_header`. On the old
+# scale that file measured 420 and was on the allowlist -- so the gate was
+# complaining about it, and complaining about the wrong thing, since what was
+# actually wrong was 17 lines of duplicated function. On this scale it measures
+# 234 and the gate says nothing at all. Deleting the copy moved the number by 17.
+# A metric that is equally uninformative before and after is not the tool for this
+# class of defect, at either calibration.
+#
+# Zig has no block comments, so `//` at the start of a line is unambiguous: a
+# multi-line string literal's continuation lines begin `\\`, and a `//` inside a
+# string cannot be the first token on its line.
 #
 # `zig fmt` guarantees a top-level closing brace at column 0, which is what
-# makes this safe to do with a line scan rather than a parser.
+# makes the test-block scan safe to do with a line scan rather than a parser.
 prod_lines() {
     awk '
-        !intest && /^test[ \t{"]/ { intest = 1; pending = 0; next }
+        !intest && /^test[ \t{"]/ { intest = 1; next }
         intest && /^\}/          { intest = 0; next }
         intest                    { next }
-        /^[ \t]*\/\//             { pending++; next }
-        /^[ \t]*$/                { pending++; next }
-                                  { n += pending; pending = 0; n++ }
+        /^[ \t]*\/\//             { next }
+        /^[ \t]*$/                { next }
+                                  { n++ }
         END                       { print n + 0 }
     ' "$1"
 }

@@ -9,6 +9,10 @@ pub const header = @import("header.zig");
 /// model it identically to the daemon, and three private copies is how they came
 /// to disagree (refactor plan stage 5.2).
 pub const msgfile = @import("msgfile.zig");
+/// The one implementation of the `-testkey` tool. A generic over the crypto
+/// package rather than an import of it, so that this library does not drag
+/// OpenSSL into the two daemons that have no keys (refactor plan stage 5.1).
+pub const testkey = @import("testkey.zig");
 pub const daemon = @import("daemon.zig");
 pub const credentials = @import("credentials.zig");
 pub const bootstrap = @import("bootstrap.zig");
@@ -37,6 +41,12 @@ test {
     _ = connection;
     _ = header;
     _ = msgfile;
+    // Reaches the file's declarations but not the body of `testkey.Tool`, which
+    // is not analysed until a caller instantiates it -- and no caller can, here,
+    // because instantiating it needs the crypto package this library does not
+    // depend on. The real check on that body is that `securedkim` and `securearc`
+    // both build against it.
+    _ = testkey;
     _ = daemon;
     _ = credentials;
     _ = bootstrap;
