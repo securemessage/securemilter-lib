@@ -20,7 +20,7 @@
 //! stdout is a **pipe**, which is exactly where partial writes occur. A truncated
 //! result line reaches the harness as unparseable output and is reported as a case
 //! failure -- pointing at production code that is fine. That is the same class of
-//! harness-side fault that has twice produced phantom defects here (the `DkimDns`
+//! harness-side fault that has twice produced phantom defects here (the DNS fake's
 //! character-iteration bug, and `c=simple/*` in the ARC suite).
 //!
 //! So this module takes the minority implementation, and the loop is the point of it.

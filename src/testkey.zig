@@ -19,9 +19,16 @@
 //! -- passes the one it has, and the graph stays as it is.
 //!
 //! NOTHING HERE IS COVERED BY A CONFORMANCE SUITE, unlike everything else stage 5
-//! consolidated. There is no RFC to be conformant to: the tool compares two
-//! strings. It is exercised by hand against `test/rfc6376/dkimdns.py`, which is
-//! why `-p` exists -- see `Options.usage`.
+//! consolidated, and nothing here can be covered by a unit test either: the
+//! generic cannot be instantiated in this library's own test build, because that
+//! would need the crypto dependency this file exists to avoid. There is also no
+//! RFC to be conformant to -- the tool compares two strings.
+//!
+//! What it has instead is `test/testkey_verify.py`, which drives both binaries
+//! against the shared DNS fake and pins 18 behaviours each. `-p` exists so that is
+//! possible at all -- see `Options.usage`. Teeth-checked by hardcoding one
+//! product's name in place of `opts.daemon`, which fails exactly one check, in the
+//! other product only.
 
 const std = @import("std");
 const mem = std.mem;

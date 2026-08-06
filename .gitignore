@@ -14,3 +14,7 @@ zig-cache/
 # megabytes and can hold key material lifted from process memory, so match the
 # pattern.
 *.core
+
+# The four products already ignore this; the library needs it too now that
+# test/ holds the shared DNS fake and its consumers import it as a module.
+__pycache__/
