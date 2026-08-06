@@ -105,16 +105,37 @@ pub const Worker = struct {
     /// the top of its loop, where it announces quiescence.
     wakeup_fd: posix.fd_t,
 
-    pub fn init(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t) !Worker {
-        return initWithReload(allocator, addresses, callbacks, shutdown_pipe, null, DEFAULT_MAX_CONNECTIONS, 0, -1);
-    }
+    /// What a worker needs to exist. The three fields without a default are the
+    /// ones a caller cannot sensibly omit; the four with one are the reload and
+    /// pool machinery, absent in a single-worker daemon and in every test.
+    ///
+    /// This was two constructors and eight positional parameters. The pair
+    /// existed only to supply these four defaults, and at eight arguments the
+    /// call in `pool.zig` passed `config_gen, max_connections, built, wake_fd`
+    /// as a bare tail no reader could check against the signature -- two of
+    /// them integers, adjacent, and transposable without a type error.
+    pub const Options = struct {
+        addresses: []const listener_mod.ListenAddress,
+        callbacks: Callbacks,
+        /// Read end. EOF here begins the drain.
+        shutdown_pipe: posix.fd_t,
+        /// Absent in a daemon that never reloads; the quiescent-state
+        /// announcement in `run` is skipped entirely when this is null.
+        config_gen: ?*const reload_mod.ConfigGeneration = null,
+        max_connections: u32 = DEFAULT_MAX_CONNECTIONS,
+        /// This worker's slot in `config_gen`. Meaningless without one.
+        worker_index: usize = 0,
+        /// Read end of this worker's wakeup pipe, or -1 for none. Owned by the
+        /// worker once `init` returns: `deinit` closes it.
+        wakeup_fd: posix.fd_t = -1,
+    };
 
     /// On failure nothing is retained: the kqueue descriptor and any listeners
     /// already bound are released before the error propagates. That matters now
     /// that the error is reportable -- while this ran inside a spawned thread the
     /// only response was to log and return, so the descriptors were simply
     /// abandoned and the leak was unobservable (X-15).
-    pub fn initWithReload(allocator: Allocator, addresses: []const listener_mod.ListenAddress, callbacks: Callbacks, shutdown_pipe: posix.fd_t, config_gen: ?*const reload_mod.ConfigGeneration, max_conn: u32, worker_index: usize, wakeup_fd: posix.fd_t) !Worker {
+    pub fn init(allocator: Allocator, opts: Options) !Worker {
         const kq = try posix.kqueue();
         errdefer posix.close(kq);
 
@@ -123,19 +144,19 @@ pub const Worker = struct {
             .kq = kq,
             .listeners = .{},
             .connections = std.AutoHashMap(posix.fd_t, *connection_mod.Connection).init(allocator),
-            .callbacks = callbacks,
+            .callbacks = opts.callbacks,
             .running = true,
-            .shutdown_pipe = shutdown_pipe,
+            .shutdown_pipe = opts.shutdown_pipe,
             .draining = false,
             .pending = undefined,
             .pending_len = 0,
-            .config_gen = config_gen,
-            .local_generation = if (config_gen) |cg| cg.load() else 0,
-            .max_connections = max_conn,
+            .config_gen = opts.config_gen,
+            .local_generation = if (opts.config_gen) |cg| cg.load() else 0,
+            .max_connections = opts.max_connections,
             .refused_pending = 0,
             .refused_log_at = null,
-            .worker_index = worker_index,
-            .wakeup_fd = wakeup_fd,
+            .worker_index = opts.worker_index,
+            .wakeup_fd = opts.wakeup_fd,
         };
 
         errdefer self.connections.deinit();
@@ -145,10 +166,10 @@ pub const Worker = struct {
         }
 
         // Stage initial registrations — flushed on first kevent() call
-        self.stageRead(shutdown_pipe);
-        if (wakeup_fd >= 0) self.stageRead(wakeup_fd);
+        self.stageRead(opts.shutdown_pipe);
+        if (opts.wakeup_fd >= 0) self.stageRead(opts.wakeup_fd);
 
-        for (addresses) |addr| {
+        for (opts.addresses) |addr| {
             const bound = try listener_mod.bind(addr);
             self.stageRead(bound.fd);
             try self.listeners.append(allocator, bound);
@@ -730,12 +751,11 @@ test "X-6: a packet larger than the read chunk is assembled without yielding to 
     defer posix.close(pipe[1]);
 
     test_body_len = 0;
-    var worker = try Worker.init(
-        std.testing.allocator,
-        &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
-        .{ .on_body = recordBodyLen },
-        pipe[0],
-    );
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{ .on_body = recordBodyLen },
+        .shutdown_pipe = pipe[0],
+    });
     // Closes `worker_end` and frees the connection below.
     defer worker.deinit();
 
@@ -766,12 +786,11 @@ test "worker init and deinit" {
     const pipe = try posix.pipe();
     defer posix.close(pipe[0]);
     defer posix.close(pipe[1]);
-    var worker = try Worker.init(
-        std.testing.allocator,
-        &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
-        .{},
-        pipe[0],
-    );
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{},
+        .shutdown_pipe = pipe[0],
+    });
     defer worker.deinit();
 
     try std.testing.expect(worker.kq >= 0);

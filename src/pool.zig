@@ -25,26 +25,24 @@ const worker_mod = @import("worker.zig");
 const Worker = worker_mod.Worker;
 const Callbacks = worker_mod.Callbacks;
 
-/// Spawn a pool of worker threads.
-///
-/// `shutdown_pipe_rd` is the read end of a pipe shared across all workers.
-/// Writing to the write end wakes all workers from kevent() to begin drain.
-pub fn spawnPool(
-    allocator: Allocator,
-    num_workers: u32,
+/// What a pool needs. Only the three without defaults must be supplied.
+pub const Options = struct {
+    /// 0 means one thread per CPU.
+    num_workers: u32 = 0,
     addresses: []const listener_mod.ListenAddress,
     callbacks: Callbacks,
+    /// Read end of a pipe shared by every worker. Writing to the write end
+    /// wakes them all out of kevent() to begin the drain.
     shutdown_pipe_rd: posix.fd_t,
-) !std.ArrayList(std.Thread) {
-    return spawnPoolWithReload(allocator, num_workers, addresses, callbacks, shutdown_pipe_rd, null, worker_mod.DEFAULT_MAX_CONNECTIONS);
-}
+    /// The global ConfigGeneration counter. Workers announce quiescence
+    /// against it each iteration and call `callbacks.on_reload` when it
+    /// advances. Null in a daemon that never reloads.
+    config_gen: ?*reload_mod.ConfigGeneration = null,
+    /// Per-worker connection limit, for backpressure.
+    max_connections: u32 = worker_mod.DEFAULT_MAX_CONNECTIONS,
+};
 
-/// Spawn a pool of worker threads with config reload support.
-///
-/// `config_gen` is a pointer to the global ConfigGeneration counter.
-/// Workers poll it each event loop iteration and call callbacks.on_reload
-/// when the generation advances.
-/// `max_connections` is the per-worker connection limit for backpressure.
+/// Spawn a pool of worker threads.
 ///
 /// This is also where the quiescent-state slots are allocated, because this is
 /// the first point at which the real worker count is known (`num_workers` of 0
@@ -52,15 +50,19 @@ pub fn spawnPool(
 /// slot count and the thread count impossible to disagree about — a worker
 /// without a slot would silently never be waited for, and configuration could
 /// be freed while it was reading.
-pub fn spawnPoolWithReload(
-    allocator: Allocator,
-    num_workers: u32,
-    addresses: []const listener_mod.ListenAddress,
-    callbacks: Callbacks,
-    shutdown_pipe_rd: posix.fd_t,
-    config_gen: ?*reload_mod.ConfigGeneration,
-    max_connections: u32,
-) !std.ArrayList(std.Thread) {
+///
+/// This was `spawnPool` and `spawnPoolWithReload`, the second taking seven
+/// positional arguments and the first existing only to pass two defaults to
+/// it. Every one of the four daemons called the long form, so the short one
+/// had no callers at all and the pair bought nothing.
+pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread) {
+    const num_workers = opts.num_workers;
+    const addresses = opts.addresses;
+    const callbacks = opts.callbacks;
+    const shutdown_pipe_rd = opts.shutdown_pipe_rd;
+    const config_gen = opts.config_gen;
+    const max_connections = opts.max_connections;
+
     var threads: std.ArrayList(std.Thread) = .{};
     errdefer threads.deinit(allocator);
 
@@ -114,7 +116,15 @@ pub fn spawnPoolWithReload(
         const wake_fd: posix.fd_t = if (built < wakeup_rd.len) wakeup_rd[built] else -1;
         const w = try allocator.create(Worker);
         errdefer allocator.destroy(w);
-        w.* = try Worker.initWithReload(allocator, addresses, callbacks, shutdown_pipe_rd, config_gen, max_connections, built, wake_fd);
+        w.* = try Worker.init(allocator, .{
+            .addresses = addresses,
+            .callbacks = callbacks,
+            .shutdown_pipe = shutdown_pipe_rd,
+            .config_gen = config_gen,
+            .max_connections = max_connections,
+            .worker_index = built,
+            .wakeup_fd = wake_fd,
+        });
         workers[built] = w;
     }
 
@@ -136,8 +146,8 @@ pub fn spawnPoolWithReload(
 /// Run one worker until shutdown, then free it.
 ///
 /// The worker arrives fully constructed: everything that can fail happened in
-/// `spawnPoolWithReload`, on a thread that could still report it. That is why
-/// there is no error path here to swallow (X-15).
+/// `spawnPool`, on a thread that could still report it. That is why there is
+/// no error path here to swallow (X-15).
 fn workerEntryReload(allocator: Allocator, worker: *Worker) void {
     log_mod.initThread();
     defer log_mod.deinitThread();
@@ -167,15 +177,12 @@ test "X-15: a worker that cannot bind fails the spawn instead of the thread" {
         .unix = .{ .path = "/nonexistent-x15-directory/securemilter.sock" },
     };
 
-    const result = spawnPoolWithReload(
-        std.testing.allocator,
-        2,
-        &.{unbindable},
-        .{},
-        pipe[0],
-        null,
-        worker_mod.DEFAULT_MAX_CONNECTIONS,
-    );
+    const result = spawnPool(std.testing.allocator, .{
+        .num_workers = 2,
+        .addresses = &.{unbindable},
+        .callbacks = .{},
+        .shutdown_pipe_rd = pipe[0],
+    });
 
     try std.testing.expectError(error.FileNotFound, result);
 }
@@ -198,15 +205,13 @@ test "X-15: a failed spawn leaves the generation counter clean" {
         .unix = .{ .path = "/nonexistent-x15-directory/securemilter.sock" },
     };
 
-    const result = spawnPoolWithReload(
-        std.testing.allocator,
-        3,
-        &.{unbindable},
-        .{},
-        pipe[0],
-        &gen,
-        worker_mod.DEFAULT_MAX_CONNECTIONS,
-    );
+    const result = spawnPool(std.testing.allocator, .{
+        .num_workers = 3,
+        .addresses = &.{unbindable},
+        .callbacks = .{},
+        .shutdown_pipe_rd = pipe[0],
+        .config_gen = &gen,
+    });
 
     try std.testing.expectError(error.FileNotFound, result);
 

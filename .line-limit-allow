@@ -197,6 +197,43 @@
 #   `isListenFd`, `listenerIndexForFd`, `noteRefusedConnection`,
 #   `reportRefusedConnections`), which touches connection admission rather than
 #   the protocol, and unlike the handlers does not need to send replies.
+#
+# 2026-08-06, worker.zig 456 -> 462, +6. Worker.Options.
+#
+#   `init` took four positional parameters and `initWithReload` took eight; the
+#   pair existed so that four defaults could be omitted. They are now one `init`
+#   taking `Options`, whose three fields without a default are the ones no
+#   caller can omit and whose four with one are the reload and pool machinery.
+#
+#   THE SIX LINES ARE THE STRUCT AND THEY BOUGHT A REAL THING. `shutdown_pipe`
+#   and `wakeup_fd` were both `posix.fd_t`, three arguments apart in a list of
+#   eight, and the single production call site passed them as part of a bare
+#   positional tail: `config_gen, max_connections, built, wake_fd`. Transposing
+#   those two type-checks perfectly and yields a worker that begins its drain
+#   when a reload pokes it and ignores the shutdown pipe entirely. Nothing in
+#   the compiler, the tests or the gate would have said a word. The field names
+#   now make it unwriteable.
+#
+#   The pair I first wrote down here -- `max_connections` (u32) against
+#   `worker_index` (usize) -- is NOT transposable, and the entry claimed it was
+#   until the claim was actually compiled: `usize` to `u32` is narrowing and
+#   Zig rejects it. Left in as a correction rather than deleted, because an
+#   unverified justification for a ceiling raise is the same defect as an
+#   unverified line count, and this file is where that gets caught.
+#
+#   `pool.zig` had the identical shape one level up -- `spawnPool` (5) and
+#   `spawnPoolWithReload` (7), with all four daemons calling the long form and
+#   nothing at all calling the short one. Collapsed the same way in the same
+#   commit, and pool.zig stays under the goal, so it is not on this list.
+#
+#   NO OBLIGATION TO UNDO. This is not accretion: the file lost two function
+#   signatures and gained one struct. The listener/accept seam recorded above is
+#   untouched and remains the answer if this file grows for a real reason.
+#
+#   Counter #3 measures declarations, so a struct field costs the same as a
+#   statement. Worth noting because it means the gate cannot tell an argument
+#   list that got safer from one that got longer -- this entry is the only
+#   record that it was the former.
 
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
@@ -210,4 +247,4 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-456 src/worker.zig
+462 src/worker.zig

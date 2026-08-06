@@ -33,8 +33,8 @@ pub const ConfigGeneration = struct {
     }
 
     /// Construct with the slots already allocated, for callers that know the
-    /// worker count up front (tests, mainly — daemons let `spawnPoolWithReload`
-    /// do it so the count cannot disagree with the threads actually spawned).
+    /// worker count up front (tests, mainly — daemons let `spawnPool` do it so
+    /// the count cannot disagree with the threads actually spawned).
     pub fn initWithWorkers(allocator: Allocator, worker_count: usize) Allocator.Error!ConfigGeneration {
         var self = ConfigGeneration.init();
         try self.initSlots(allocator, worker_count);
