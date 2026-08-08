@@ -256,14 +256,6 @@ pub const Resolver = struct {
             if (monitor.healthyCount() == 0) return error.DnsTimeout;
         }
 
-        const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
-        defer posix.close(sock);
-
-        const timeout_sec = self.config.timeout_ms / 1000;
-        const timeout_usec = (self.config.timeout_ms % 1000) * 1000;
-        const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = @intCast(timeout_usec) };
-        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv));
-
         // Try each server starting from round-robin index, skipping
         // servers the health monitor has marked unhealthy.
         var tried: usize = 0;
@@ -275,27 +267,51 @@ pub const Resolver = struct {
                 if (!monitor.isHealthy(idx)) continue;
             }
 
-            const addr = self.addrs[idx];
-
-            var attempts: u8 = 0;
-            while (attempts <= self.config.retries) : (attempts += 1) {
-                _ = posix.sendto(sock, query, 0, &addr.any, addr.getOsSockLen()) catch continue;
-
-                var buf: [4096]u8 = undefined;
-                const n = posix.recvfrom(sock, &buf, 0, null, null) catch |err| {
-                    if (err == error.WouldBlock) continue;
-                    continue;
-                };
-
-                if (n < 12) continue;
-
+            if (try self.udpServerQuery(self.addrs[idx], query)) |answer| {
                 // Success — advance round-robin
                 self.rr_index = (idx + 1) % num_servers;
-                return try self.allocator.dupe(u8, buf[0..n]);
+                return answer;
             }
         }
 
         return error.DnsTimeout;
+    }
+
+    /// One server's worth of UDP attempts, or null when it did not answer.
+    ///
+    /// The socket's family must be the SERVER's, and the configured list may
+    /// mix families, so the socket is per server rather than per query. The
+    /// previous shape created one AF.INET socket per query: a v6 nameserver
+    /// then failed at sendto with EADDRNOTAVAIL in 0ms, which surfaced as
+    /// "DNS lookup failed transiently" against a resolver that was answering
+    /// drill on the same address. Caught by the 9.3 v6-only lab set, where
+    /// EVERY nameserver is v6. The TCP path below already does this right
+    /// (`addr.any.family`); this is the UDP side of the same rule.
+    fn udpServerQuery(self: *Resolver, addr: net.Address, query: []const u8) !?[]u8 {
+        const sock = try posix.socket(
+            @intCast(addr.any.family),
+            posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
+            0,
+        );
+        defer posix.close(sock);
+
+        const timeout_sec = self.config.timeout_ms / 1000;
+        const timeout_usec = (self.config.timeout_ms % 1000) * 1000;
+        const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = @intCast(timeout_usec) };
+        try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv));
+
+        var attempts: u8 = 0;
+        while (attempts <= self.config.retries) : (attempts += 1) {
+            _ = posix.sendto(sock, query, 0, &addr.any, addr.getOsSockLen()) catch continue;
+
+            var buf: [4096]u8 = undefined;
+            const n = posix.recvfrom(sock, &buf, 0, null, null) catch continue;
+
+            if (n < 12) continue;
+
+            return try self.allocator.dupe(u8, buf[0..n]);
+        }
+        return null;
     }
 
     /// Re-issue a query over TCP, for an answer that did not fit in a datagram.
@@ -411,6 +427,73 @@ fn parseNameserver(host: []const u8, port: u16) !net.Address {
         return .{ .in6 = ip6 };
     } else |_| {}
     return error.InvalidNameserver;
+}
+
+test "UDP query to an IPv6 nameserver" {
+    // Caught by the 9.3 v6-only lab set (2026-08-08): sendAndReceive created
+    // one AF.INET socket per query, so a v6 nameserver failed at sendto with
+    // EADDRNOTAVAIL in 0ms and every lookup on the v6-only jails came back
+    // "DNS lookup failed transiently" while drill answered on the same
+    // address. The responder below binds ::1 ONLY, so a v4 socket cannot
+    // reach it in principle -- the test cannot pass vacuously.
+    const srv = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(srv);
+    const bind_addr = try net.Address.parseIp6("::1", 0);
+    try posix.bind(srv, &bind_addr.any, bind_addr.getOsSockLen());
+    var bound = bind_addr;
+    var bound_len: posix.socklen_t = bound.getOsSockLen();
+    try posix.getsockname(srv, &bound.any, &bound_len);
+    const port = bound.getPort();
+
+    // Answer one query with a well-formed empty NOERROR response: the query
+    // id and question echoed, QR|RD|RA set, no answer records. resolve() then
+    // succeeds with zero answers, which is distinguishable from the
+    // regression's signature (DnsTimeout without a packet ever leaving).
+    // RCVTIMEO bounds the thread so a regressed client strands nothing.
+    const Responder = struct {
+        fn run(sock: posix.socket_t) void {
+            const tv = posix.timeval{ .sec = 5, .usec = 0 };
+            posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv)) catch return;
+            var qbuf: [512]u8 = undefined;
+            var src: posix.sockaddr.storage = undefined;
+            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const n = posix.recvfrom(sock, &qbuf, 0, @ptrCast(&src), &src_len) catch return;
+            if (n < 12) return;
+            var rbuf: [600]u8 = undefined;
+            rbuf[0] = qbuf[0];
+            rbuf[1] = qbuf[1];
+            rbuf[2] = 0x85; // QR | RD
+            rbuf[3] = 0x80; // RA, RCODE=NOERROR
+            rbuf[4] = 0;
+            rbuf[5] = 1; // QDCOUNT
+            rbuf[6] = 0;
+            rbuf[7] = 0; // ANCOUNT
+            rbuf[8] = 0;
+            rbuf[9] = 0; // NSCOUNT
+            rbuf[10] = 0;
+            rbuf[11] = 0; // ARCOUNT
+            const question = qbuf[12..n];
+            @memcpy(rbuf[12..][0..question.len], question);
+            _ = posix.sendto(sock, rbuf[0 .. 12 + question.len], 0, @ptrCast(&src), src_len) catch return;
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Responder.run, .{srv});
+    th.detach();
+
+    var r = Resolver.init(std.testing.allocator, .{
+        .nameservers = &.{"::1"},
+        .port = port,
+        .timeout_ms = 2000,
+        .retries = 0,
+    });
+    defer r.deinit();
+
+    var result = r.resolve("example.test", .A) catch |err| {
+        if (err == error.DnsTimeout) return error.TestUnexpectedResult;
+        return err;
+    };
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.answers.len);
 }
 
 test "resolver init and deinit" {

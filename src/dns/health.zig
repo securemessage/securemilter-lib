@@ -189,7 +189,15 @@ pub const HealthMonitor = struct {
         var query_buf: [32]u8 = undefined;
         const query_len = buildProbeQuery(&query_buf) catch return false;
 
-        const sock = posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0) catch return false;
+        // The probed server's family, not a fixed one: with a v6 server an
+        // AF.INET probe fails at sendto and the monitor condemns a healthy
+        // server -- and when every server is v6 (the 9.3 lab's set b), the
+        // healthyCount fast path then fails every lookup in 0ms.
+        const sock = posix.socket(
+            @intCast(addr.any.family),
+            posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
+            0,
+        ) catch return false;
         defer posix.close(sock);
 
         const timeout_sec = self.probe_timeout_ms / 1000;
