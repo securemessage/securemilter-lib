@@ -247,4 +247,4 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-462 src/worker.zig
+466 src/worker.zig

@@ -506,7 +506,9 @@ pub const Worker = struct {
                 conn.resetMessage();
                 conn.state = .new;
             },
-            else => self.sendResponse(conn, @intFromEnum(responses.Code.@"continue")),
+            else => {
+                _ = self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
+            },
         }
     }
 
@@ -538,7 +540,7 @@ pub const Worker = struct {
 
     fn handleConnect(self: *Worker, conn: *connection_mod.Connection, data: []const u8) void {
         const info = commands.parseConnect(data) catch {
-            self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
+            _ = self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
         // Persist before dispatching, exactly as handleHelo and handleMailFrom
@@ -549,7 +551,7 @@ pub const Worker = struct {
         conn.setConnectInfo(info) catch {};
         conn.state = .connected;
         const resp = if (self.callbacks.on_connect) |cb| cb(conn, info) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleHelo(self: *Worker, conn: *connection_mod.Connection, data: []const u8) void {
@@ -557,7 +559,7 @@ pub const Worker = struct {
         conn.setHelo(helo) catch {};
         conn.state = .helo;
         const resp = if (self.callbacks.on_helo) |cb| cb(conn, helo) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleMailFrom(self: *Worker, conn: *connection_mod.Connection, data: []const u8) void {
@@ -566,7 +568,7 @@ pub const Worker = struct {
         conn.setMailFrom(sender) catch {};
         conn.state = .mail_from;
         const resp = if (self.callbacks.on_mail_from) |cb| cb(conn, sender) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleRcptTo(self: *Worker, conn: *connection_mod.Connection, data: []const u8) void {
@@ -575,12 +577,12 @@ pub const Worker = struct {
         conn.addRecipient(rcpt) catch {};
         conn.state = .rcpt_to;
         const resp = if (self.callbacks.on_rcpt_to) |cb| cb(conn, rcpt) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleHeader(self: *Worker, conn: *connection_mod.Connection, data: []const u8) void {
         const hdr = commands.parseHeader(data) catch {
-            self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
+            _ = self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
         // Report the first rejection only: a flood would otherwise turn one
@@ -618,19 +620,19 @@ pub const Worker = struct {
         // `split.value`, not `hdr.value`: a callback must see what was stored, or
         // the two disagree about the same header once the flag is in force.
         const resp = if (self.callbacks.on_header) |cb| cb(conn, hdr.name, split.value) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleEoh(self: *Worker, conn: *connection_mod.Connection) void {
         conn.state = .end_of_headers;
         const resp = if (self.callbacks.on_eoh) |cb| cb(conn) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleBody(self: *Worker, conn: *connection_mod.Connection, data: []const u8) void {
         conn.state = .body;
         const resp = if (self.callbacks.on_body) |cb| cb(conn, data) else @intFromEnum(responses.Code.@"continue");
-        self.sendResponse(conn, resp);
+        if (!self.sendResponse(conn, resp)) return;
     }
 
     fn handleEom(self: *Worker, conn: *connection_mod.Connection) void {
@@ -664,13 +666,17 @@ pub const Worker = struct {
                     conn.limits.max_header_bytes,
                 },
             );
-            self.sendResponse(conn, @intFromEnum(responses.Code.tempfail));
+            if (!self.sendResponse(conn, @intFromEnum(responses.Code.tempfail))) return;
             conn.resetMessage();
             return;
         }
 
         const resp = if (self.callbacks.on_eom) |cb| cb(conn) else @intFromEnum(responses.Code.accept);
-        self.sendResponse(conn, resp);
+        // If the write failed the connection is ALREADY FREED -- the 9.3 mapped
+        // probe closed before reading the EOM response and the resetMessage()
+        // below then ran on freed memory (SIGBUS in freeHeaders). The check is
+        // load-bearing, and the bool return exists so this cannot be forgotten.
+        if (!self.sendResponse(conn, resp)) return;
         conn.resetMessage();
     }
 
@@ -679,10 +685,18 @@ pub const Worker = struct {
         conn.resetMessage();
     }
 
-    fn sendResponse(self: *Worker, conn: *connection_mod.Connection, resp_code: u8) void {
+    /// Write a one-byte response. Returns false when the write failed and the
+    /// connection is GONE -- removed and freed -- in which case the caller must
+    /// not touch `conn` again. The bool exists so that ignoring the outcome is
+    /// a compile error: the one place that used to (handleEom's resetMessage
+    /// after a failed EOM write) was a use-after-free that cost a daemon its
+    /// life to a client that simply closed early.
+    fn sendResponse(self: *Worker, conn: *connection_mod.Connection, resp_code: u8) bool {
         codec.writeSimpleResponse(conn.fd, resp_code) catch {
             self.removeConnection(conn.fd);
+            return false;
         };
+        return true;
     }
 
     fn removeConnection(self: *Worker, fd: posix.fd_t) void {
@@ -780,6 +794,75 @@ test "X-6: a packet larger than the read chunk is assembled without yielding to 
     worker.handleConnectionData(worker_end);
 
     try std.testing.expectEqual(payload_len, test_body_len);
+}
+
+test "a dead peer at EOM must not leave handleEom touching the freed connection" {
+    // Found by the 9.3 "mapped" probe (2026-08-08): a raw milter client that
+    // closes before reading the EOM response turns the response write into
+    // EPIPE. sendResponse removed the connection on that failure -- and
+    // handleEom then ran conn.resetMessage() on the freed struct, dying with
+    // SIGBUS in freeHeaders (connection.zig:447). Every deploy of the daemon
+    // could be killed by any client that went away at the wrong moment.
+    //
+    // The peer is closed ABORTIVELY (SO_LINGER onoff=1 linger=0), so the very
+    // first write fails with EPIPE deterministically; a plain close() can let
+    // the write succeed into a half-open socket and the test would pass
+    // vacuously.
+    //
+    // SIGPIPE is blocked because that is the daemon's own arrangement
+    // (ManagedSignals.blockForKqueue): without it the write would kill the
+    // test runner instead of returning EPIPE.
+    var sigs = std.mem.zeroes(std.c.sigset_t);
+    _ = std.c.sigaddset(&sigs, 13); // SIGPIPE
+    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigs, null);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &fds,
+    ));
+    const worker_end = fds[0];
+    const peer_end = fds[1];
+    try setNonBlocking(worker_end);
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{},
+        .shutdown_pipe = pipe[0],
+    });
+    defer worker.deinit();
+
+    const conn = try std.testing.allocator.create(connection_mod.Connection);
+    conn.* = connection_mod.Connection.init(std.testing.allocator, worker_end, 0, .{});
+    try worker.connections.put(worker_end, conn);
+
+    // A stored header, so the pre-fix resetMessage() walk over the freed
+    // Connection's header list has something to trip on rather than reading
+    // an empty list by luck.
+    try conn.headers.append(std.testing.allocator, .{
+        .name = try std.testing.allocator.dupe(u8, "X-Probe"),
+        .value = try std.testing.allocator.dupe(u8, "1"),
+        .had_space = false,
+    });
+
+    // Peer vanishes, rudely, before the daemon answers EOM. std.c has no
+    // struct linger; its layout is two c_ints on every platform we run on.
+    const Linger = extern struct { onoff: c_int, linger: c_int };
+    const ling = Linger{ .onoff = 1, .linger = 0 };
+    _ = std.c.setsockopt(peer_end, posix.SOL.SOCKET, posix.SO.LINGER, &ling, @sizeOf(Linger));
+    posix.close(peer_end);
+
+    worker.dispatchPacket(conn, .{ .cmd = @intFromEnum(commands.Code.body_eob), .data = &.{} });
+
+    // The connection must be gone (the failed write removed it) and -- the
+    // actual defect -- the process must still be here to say so.
+    try std.testing.expect(!worker.alive(worker_end));
 }
 
 test "worker init and deinit" {
