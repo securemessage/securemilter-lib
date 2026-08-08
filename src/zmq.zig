@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const posix = std.posix;
 const Allocator = mem.Allocator;
 const c = @cImport({
     @cInclude("zmq.h");
@@ -44,6 +45,17 @@ pub const Publisher = struct {
         // Set send high-water mark (drop messages if subscriber is slow)
         var hwm: c_int = 1000;
         _ = c.zmq_setsockopt(sock, c.ZMQ_SNDHWM, &hwm, @sizeOf(c_int));
+
+        // libzmq's TCP transport is IPv4-only UNLESS ZMQ_IPV6 is set -- a
+        // tcp://[v6] endpoint fails outright without it (EOPNOTSUPP, seen as
+        // "no events captured on the bus" on the 9.3 v6-only lab set). Sniff
+        // the bracketed literal; harmless for v4 endpoints either way.
+        if (endpoint) |ep| {
+            if (mem.indexOf(u8, ep, "[")) |_| {
+                var one: c_int = 1;
+                _ = c.zmq_setsockopt(sock, c.ZMQ_IPV6, &one, @sizeOf(c_int));
+            }
+        }
 
         var ep_buf: [512]u8 = undefined;
         const ep = endpoint.?;
@@ -116,4 +128,56 @@ test "publisher with invalid endpoint" {
     // May or may not connect (zmq_connect doesn't validate reachability),
     // but publish should never crash
     pub_bad.publish("{\"test\": true}");
+}
+
+test "a published frame crosses an IPv6 loopback endpoint" {
+    // libzmq's TCP transport is v4-only until ZMQ_IPV6 is set; without it the
+    // 9.3 v6-only lab set's collector failed its bind with EOPNOTSUPP and the
+    // event bus read as a silent hole. A connect-only check has no teeth here
+    // (zmq_connect defers resolution and reports success either way), so this
+    // is a real round trip: bind a SUB on [::1], publish, receive.
+    const addr = try std.net.Address.parseIp6("::1", 0);
+    const sockfd = try posix.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
+    var bound = addr;
+    var bound_len: posix.socklen_t = bound.getOsSockLen();
+    try posix.getsockname(sockfd, &bound.any, &bound_len);
+    posix.close(sockfd);
+    const port = bound.getPort();
+
+    const ctx = c.zmq_ctx_new();
+    defer _ = c.zmq_ctx_destroy(ctx);
+    const sub = c.zmq_socket(ctx, c.ZMQ_SUB);
+    // LINGER 0 and an explicit close: zmq_ctx_destroy blocks while a socket
+    // is open, which would hang the whole test run at the defer.
+    var zero: c_int = 0;
+    _ = c.zmq_setsockopt(sub, c.ZMQ_LINGER, &zero, @sizeOf(c_int));
+    defer _ = c.zmq_close(sub);
+    var one: c_int = 1;
+    _ = c.zmq_setsockopt(sub, c.ZMQ_IPV6, &one, @sizeOf(c_int));
+    _ = c.zmq_setsockopt(sub, c.ZMQ_SUBSCRIBE, "", 0);
+    const rcv_ms: c_int = 3000;
+    _ = c.zmq_setsockopt(sub, c.ZMQ_RCVTIMEO, &rcv_ms, @sizeOf(c_int));
+
+    var ep_buf: [64]u8 = undefined;
+    const ep = try std.fmt.bufPrint(&ep_buf, "tcp://[::1]:{d}", .{port});
+    if (c.zmq_bind(sub, ep.ptr) != 0) return error.TestUnexpectedResult;
+
+    var pub6 = Publisher.init(ep, "test");
+    defer pub6.deinit();
+    try std.testing.expect(pub6.isConnected());
+
+    // PUB drops messages until the subscription handshake completes, so
+    // publish on a short loop rather than once -- the same reason the suite
+    // warms every worker before trusting the bus.
+    var msg: [64]u8 = undefined;
+    var received = false;
+    var tries: u8 = 0;
+    while (tries < 40 and !received) : (tries += 1) {
+        pub6.publish("ping6");
+        const n = c.zmq_recv(sub, &msg, msg.len, 0);
+        if (n > 0) received = true;
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(received);
 }
