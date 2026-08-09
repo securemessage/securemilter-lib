@@ -36,6 +36,9 @@ pub const log = @import("log.zig");
 /// L-7: config-path addresses (listeners, nameservers) must be rejected when
 /// malformed, never repaired into a different address.
 pub const ip = @import("ip.zig");
+/// The wall-clock bound on one evaluation (X-21). One type, one default, one
+/// option spelling for all four daemons.
+pub const deadline = @import("deadline.zig");
 
 test {
     _ = cli;
@@ -68,4 +71,5 @@ test {
     _ = rcu;
     _ = log;
     _ = ip;
+    _ = deadline;
 }
