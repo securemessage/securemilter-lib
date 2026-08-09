@@ -25,9 +25,10 @@ judgement and it is being overturned on evidence, not taste:
   - The premise turned out to be false. It is not a package: the six
     repositories are checked out side by side because build.zig.zon depends on
     `../securemilter-lib` by path, so this file is reachable with a `sys.path`
-    insert -- which `securedkim/test/dkimpy_diff/rundiff.py` had already been
-    doing for two years to borrow `dkimdns` from a sibling directory, under the
-    comment "shared, not duplicated".
+    insert -- which the dkimpy differential (now `interop/dkimpy-diff/` in
+    the engineering-docs repository) had already been doing for two years to
+    borrow `dkimdns` from a sibling directory, under the comment "shared, not
+    duplicated".
   - A copied test helper has already produced phantom defects here twice. The
     worst is recorded in `securedkim/test/rfc6376/README.md`: a value-
     normalisation bug present in ONE copy served a TXT record per character and

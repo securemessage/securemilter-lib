@@ -65,9 +65,9 @@ pub fn splitLeadingSpace(raw: []const u8) HeaderSplit {
 }
 
 // The nine shapes measured against Postfix 3.11.5 and FreeBSD base sendmail,
-// recorded in test/measurements/d23-header-wsp/README.md. Both MTAs behaved
-// identically: exactly one leading SP is stripped if and only if one is present,
-// and a TAB is never stripped.
+// recorded in engineering-docs securemilter/measurements/d23-header-wsp/README.md.
+// Both MTAs behaved identically: exactly one leading SP is stripped if and only
+// if one is present, and a TAB is never stripped.
 //
 // `wire` is what follows the colon in the delivered message, which with
 // SMFIP_HDR_LEADSPC negotiated is also what the milter receives. `classic` is

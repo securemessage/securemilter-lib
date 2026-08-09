@@ -173,7 +173,8 @@ pub fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) 
 /// **Exactly one SP, and never a TAB.** D-23's open question is answered: both
 /// Postfix 3.11.5 and FreeBSD base sendmail strip one leading SP if and only if
 /// one is present, and leave a TAB alone (§11.40, and
-/// `test/measurements/d23-header-wsp/`). This line used to strip a leading TAB
+/// `securemilter/measurements/d23-header-wsp/` in engineering-docs). This line
+/// used to strip a leading TAB
 /// as well, which no MTA does — so for `Name:<TAB>value` it handed the verifier
 /// a byte sequence production never produces, in the module whose one job is to
 /// predict production.
