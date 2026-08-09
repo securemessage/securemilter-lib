@@ -32,6 +32,10 @@ pub const zmq = @import("zmq.zig");
 pub const reload = @import("reload.zig");
 pub const rcu = @import("rcu.zig");
 pub const log = @import("log.zig");
+/// Strict RFC 4291 §2.2 IPv6 literal parsing, moved out of `securespf` for
+/// L-7: config-path addresses (listeners, nameservers) must be rejected when
+/// malformed, never repaired into a different address.
+pub const ip = @import("ip.zig");
 
 test {
     _ = cli;
@@ -63,4 +67,5 @@ test {
     _ = reload;
     _ = rcu;
     _ = log;
+    _ = ip;
 }

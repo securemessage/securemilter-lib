@@ -5,6 +5,7 @@ const net = std.net;
 const Allocator = mem.Allocator;
 const packet = @import("packet.zig");
 const log_mod = @import("../log.zig");
+const ip = @import("../ip.zig");
 
 /// DNS resolution result.
 pub const Result = struct {
@@ -423,8 +424,10 @@ fn parseNameserver(host: []const u8, port: u16) !net.Address {
     if (net.Ip4Address.parse(host, port)) |ip4| {
         return .{ .in = ip4 };
     } else |_| {}
-    if (net.Ip6Address.parse(host, port)) |ip6| {
-        return .{ .in6 = ip6 };
+    // L-7: strict, never repaired -- a mistyped nameserver must fail at parse,
+    // not resolve against an address the operator did not write.
+    if (ip.parseIp6Address(host, port)) |addr| {
+        return addr;
     } else |_| {}
     return error.InvalidNameserver;
 }

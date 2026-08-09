@@ -4,6 +4,7 @@ const posix = std.posix;
 const mem = std.mem;
 const log_mod = @import("log.zig");
 const escape = @import("escape.zig");
+const ip = @import("ip.zig");
 
 /// Parsed listener address from config.
 ///
@@ -180,13 +181,19 @@ pub fn bind(addr: ListenAddress) !BoundListener {
 
 /// Parse an IP address string into a net.Address without using resolveIp
 /// (which requires if_nametoindex, not available on all platforms in Zig 0.15).
+///
+/// The v6 half goes through the STRICT parser (L-7): `std.net.Ip6Address.parse`
+/// repairs what it cannot read, and on this path a repair becomes a bind to an
+/// address the operator did not write -- `Socket=inet:8890@:CAFE::` was measured
+/// landing on [::]:8890, every interface, on the protocol with no
+/// authentication. The v4 half of std.net has no repair behaviour to avoid.
 fn parseIpAddress(host: []const u8, port: u16) !net.Address {
     if (net.Ip4Address.parse(host, port)) |ip4| {
         return .{ .in = ip4 };
     } else |_| {}
 
-    if (net.Ip6Address.parse(host, port)) |ip6| {
-        return .{ .in6 = ip6 };
+    if (ip.parseIp6Address(host, port)) |addr| {
+        return addr;
     } else |_| {}
 
     return error.InvalidAddress;
@@ -265,6 +272,18 @@ test "parse rejects a hostname, because bind cannot resolve one" {
     // a live daemon with no listener.
     try std.testing.expectError(error.InvalidHost, ListenAddress.parse("inet:8891@localhost"));
     try std.testing.expectError(error.InvalidHost, ListenAddress.parse("inet:8891@mail.example.com"));
+}
+
+test "parse rejects a repaired IPv6 literal (L-7)" {
+    // The measured L-7 case: one illegal leading colon. The stdlib parser
+    // repairs this to "::cafe::" and the daemon then binds the WILDCARD --
+    // told to listen on one address, it listened on all of them, on the
+    // protocol that has no authentication. Now a parse error instead.
+    // parseTcp reports host failures as InvalidHost -- the same variant the
+    // X-14 tests assert for a bad host.
+    try std.testing.expectError(error.InvalidHost, ListenAddress.parse("inet:8890@:CAFE::"));
+    // And the honest form still parses.
+    _ = try ListenAddress.parse("inet:8890@fd10:99::254");
 }
 
 test "parse rejects a misspelled scheme rather than reinterpreting it" {

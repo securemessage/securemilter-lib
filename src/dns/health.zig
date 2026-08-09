@@ -5,6 +5,7 @@ const net = std.net;
 const Allocator = mem.Allocator;
 const packet = @import("packet.zig");
 const daemon_mod = @import("../daemon.zig");
+const ip = @import("../ip.zig");
 
 const log_mod = @import("../log.zig");
 
@@ -251,8 +252,9 @@ fn parseNameserver(host: []const u8, port: u16) !net.Address {
     if (net.Ip4Address.parse(host, port)) |ip4| {
         return .{ .in = ip4 };
     } else |_| {}
-    if (net.Ip6Address.parse(host, port)) |ip6| {
-        return .{ .in6 = ip6 };
+    // L-7: strict, never repaired -- same rule as the resolver's copy.
+    if (ip.parseIp6Address(host, port)) |addr| {
+        return addr;
     } else |_| {}
     return error.InvalidNameserver;
 }
