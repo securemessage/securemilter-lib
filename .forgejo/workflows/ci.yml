@@ -21,5 +21,8 @@ jobs:
       - name: Build
         run: cd securemilter-lib && zig build
 
+      - name: Lint
+        run: cd securemilter-lib && zig build lint
+
       - name: Unit tests
         run: cd securemilter-lib && zig build test
