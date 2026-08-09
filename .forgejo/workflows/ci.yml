@@ -15,6 +15,9 @@ jobs:
         with:
           path: securemilter-lib
 
+      - name: libzmq (event bus link dependency)
+        run: pkg info -q libzmq4 || doas pkg install -y libzmq4
+
       - name: Build
         run: cd securemilter-lib && zig build
 
