@@ -30,7 +30,8 @@ judgement and it is being overturned on evidence, not taste:
     borrow `dkimdns` from a sibling directory, under the comment "shared, not
     duplicated".
   - A copied test helper has already produced phantom defects here twice. The
-    worst is recorded in `securedkim/test/rfc6376/README.md`: a value-
+    worst is recorded in the DKIM suite's README (now
+    `rfc-suites/suites/rfc6376-dkim/README.md`): a value-
     normalisation bug present in ONE copy served a TXT record per character and
     made the suite report ELEVEN product defects that did not exist. Four
     copies of a hand-rolled DNS server is four chances to certify the harness
