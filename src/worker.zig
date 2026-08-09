@@ -37,15 +37,12 @@ pub const Callbacks = struct {
 
     required_actions: negotiate.ActionFlags = .{ .add_headers = true },
 
-    /// Protocol flags to request in OPTNEG. Named `skip_flags` until D-23, when
-    /// `header_leading_space` became the first that asks the MTA for *more* data
-    /// rather than less, and the old name said the opposite of what it did.
+    /// Protocol flags for OPTNEG. Renamed from `skip_flags` when D-23 added
+    /// `header_leading_space` (requests more data, not less).
     protocol_flags: negotiate.ProtocolFlags = .{},
 
-    /// Caps applied to every connection this pool accepts. Carried here beside
-    /// `required_actions` and `protocol_flags` — the worker behaviour a product
-    /// milter chooses — so the daemons already building this struct need no new
-    /// plumbing to set them.
+    /// Per-connection caps. Grouped here with `required_actions` and
+    /// `protocol_flags` so daemons need no separate plumbing.
     limits: connection_mod.Limits = .{},
 };
 
@@ -66,13 +63,9 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 /// Maximum staged changelist entries. Flushed on next kevent() call.
 const MAX_PENDING: usize = 128;
 
-/// Minimum gap between one worker's "refused connections" reports.
-///
-/// The refusal path is reachable by anyone who can open a socket to the milter
-/// port, so a line per refused connection would let a caller choose how much
-/// this daemon writes to syslog. Reporting is therefore collapsed: the first
-/// refusal is logged at once, and subsequent ones are counted and summarised no
-/// more often than this.
+/// Minimum gap between "refused connections" log lines.
+/// Refusal is reachable by anyone who can connect; rate-limit prevents
+/// attacker-controlled syslog volume.
 const REFUSED_LOG_INTERVAL_MS: i64 = 1000;
 
 /// A single worker thread's state.
@@ -105,15 +98,8 @@ pub const Worker = struct {
     /// the top of its loop, where it announces quiescence.
     wakeup_fd: posix.fd_t,
 
-    /// What a worker needs to exist. The three fields without a default are the
-    /// ones a caller cannot sensibly omit; the four with one are the reload and
-    /// pool machinery, absent in a single-worker daemon and in every test.
-    ///
-    /// This was two constructors and eight positional parameters. The pair
-    /// existed only to supply these four defaults, and at eight arguments the
-    /// call in `pool.zig` passed `config_gen, max_connections, built, wake_fd`
-    /// as a bare tail no reader could check against the signature -- two of
-    /// them integers, adjacent, and transposable without a type error.
+    /// Constructor options. Three required fields (cannot be omitted); four
+    /// optional (reload/pool machinery, absent in single-worker and tests).
     pub const Options = struct {
         addresses: []const listener_mod.ListenAddress,
         callbacks: Callbacks,
@@ -214,18 +200,11 @@ pub const Worker = struct {
                 }
             }
 
-            // Top of the loop is the quiescent point: every reference this
-            // worker took to shared configuration while handling the previous
-            // batch of events has been dropped, and it has not yet acquired
-            // one for the next. Announcing it here — and only here — is what
-            // lets the main thread free retired configuration without racing
-            // us (audit X-2; see reload.zig and rcu.zig).
-            //
-            // This must stay above the kevent() call. Announcing after the
-            // wait would leave the slot stale for as long as the worker sits
-            // idle, which delays reclamation; announcing mid-batch would be
-            // worse than useless, since it would licence freeing memory a
-            // half-finished message is still reading.
+            // Top of loop = quiescent point: no references to shared config held.
+            // Announcing here (only here) lets the main thread free retired config
+            // safely (audit X-2; see reload.zig, rcu.zig).
+            // Must stay above kevent(): announcing after would leave the slot stale
+            // during idle, delaying reclamation.
             if (self.config_gen) |cg| {
                 cg.quiesce(self.worker_index);
 
@@ -260,9 +239,7 @@ pub const Worker = struct {
                         drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
                     }
                 } else if (self.wakeup_fd >= 0 and fd == self.wakeup_fd) {
-                    // Waking was the whole point; the quiescent announcement
-                    // happens at the top of the next iteration. Just drain the
-                    // byte so the pipe does not stay readable.
+                    // Drain byte; quiescence announced at top of next iteration.
                     var sink: [64]u8 = undefined;
                     while (posix.read(self.wakeup_fd, &sink)) |got| {
                         if (got < sink.len) break;
@@ -321,29 +298,11 @@ pub const Worker = struct {
         self.refused_pending += 1;
     }
 
-    /// Report connections closed for arriving while this worker was full.
-    ///
-    /// The refusal itself is correct and is what L-2 asked for, but it used to be
-    /// SILENT: the fd was closed and the loop moved on. From the MTA's side that
-    /// is a milter that accepted a TCP connection and hung up without speaking,
-    /// which with `milter_default_action = tempfail` defers the mail. So an
-    /// operator who set `MaxConnections` too low, or who was simply pushed past
-    /// it, saw deferrals in the Postfix log and NOTHING here to attribute them
-    /// to -- while this daemon was working exactly as configured.
-    ///
-    /// Called once per accept batch rather than per connection. `handleAccept`
-    /// drains until EWOULDBLOCK, so a flood of connections costs a handful of
-    /// lines rather than one per connection; the time floor then bounds a caller
-    /// who trickles connections slowly enough to earn a batch each. Refusals
-    /// arriving inside that floor stay pending and are added to the next report,
-    /// so a count may lag by up to `REFUSED_LOG_INTERVAL_MS` but is never lost
-    /// except at the very end of an episode.
-    ///
-    /// The cap is named as the setting an operator would change, and
-    /// `max_connections` is PER WORKER, so the worker index is included: the
-    /// process-wide ceiling is this number times the worker count, and a reader
-    /// who assumed otherwise would go looking for a limit several times lower
-    /// than the one they actually hit.
+    /// Report refused connections. Previously silent (L-2): the MTA saw TCP accept
+    /// then hangup (deferred under `milter_default_action=tempfail`) but this daemon
+    /// logged nothing. Called once per accept batch, rate-limited by
+    /// `REFUSED_LOG_INTERVAL_MS`. `max_connections` is per worker, so the worker
+    /// index is included.
     fn reportRefusedConnections(self: *Worker) void {
         if (self.refused_pending == 0) return;
 
@@ -543,11 +502,10 @@ pub const Worker = struct {
             _ = self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
-        // Persist before dispatching, exactly as handleHelo and handleMailFrom
-        // do with their values. This was previously handed to the callback and
-        // dropped, and since no daemon registers on_connect it was dropped every
-        // time -- leaving the client address readable only from the optional
-        // {client_addr} macro, which a default Postfix does not send.
+        // Store address before dispatching (same as helo/mail_from). Previously
+        // passed only to the callback, which no daemon registers; the address
+        // was lost, leaving only the optional {client_addr} macro (not in default
+        // Postfix `milter_connect_macros`).
         conn.setConnectInfo(info) catch {};
         conn.state = .connected;
         const resp = if (self.callbacks.on_connect) |cb| cb(conn, info) else @intFromEnum(responses.Code.@"continue");
@@ -585,10 +543,8 @@ pub const Worker = struct {
             _ = self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
-        // Report the first rejection only: a flood would otherwise turn one
-        // abusive message into thousands of log lines, which is its own denial
-        // of service. `addHeader` latches the flag, so end-of-message still
-        // knows the list is incomplete however many headers followed.
+        // Log first overflow only (a flood would produce thousands of lines).
+        // `addHeader` latches the flag; EOM still sees the incomplete list.
         const first_overflow = !conn.headers_overflow;
         // With SMFIP_HDR_LEADSPC the value still carries the whitespace after the
         // colon; recover the bit and hand consumers the value they always saw.
@@ -638,21 +594,13 @@ pub const Worker = struct {
     fn handleEom(self: *Worker, conn: *connection_mod.Connection) void {
         conn.state = .end_of_message;
 
-        // A header block we did not see in full must not be delivered.
+        // Incomplete header block: tempfail. Enforced here (not per-callback) because
+        // a sender who pads past max_headers then appends a forged `spf=pass` would
+        // bypass the A-R scrub (X-1). Tempfail holds the message; the sender may retry.
         //
-        // Enforced here rather than left to each product callback because
-        // getting it wrong is silent. Every daemon in this suite strips
-        // Authentication-Results headers that forge its own authserv-id (audit
-        // X-1), and it can only strip headers it accumulated: with the cap in
-        // place, a sender who pads past `max_headers` and then appends a forged
-        // `spf=pass` would have it pass through uninspected. Tempfail is the only
-        // response that cannot leak it — the MTA holds the message and the
-        // sender may retry within the limits.
-        //
-        // Body overflow is deliberately not treated this way. There the header
-        // block was seen in full and scrubbed; only the hash is unavailable, so
-        // the callback can still return a truthful temperror result and the
-        // message can be delivered.
+        // Body overflow is NOT tempfailed here: headers were fully scrubbed, only the
+        // body hash is unavailable, so the callback returns a truthful temperror and
+        // the message can be delivered.
         if (conn.headers_overflow) {
             const peer = conn.getPeerDisplay();
             // The peer name comes from rDNS the sender may control, so it is
@@ -672,10 +620,9 @@ pub const Worker = struct {
         }
 
         const resp = if (self.callbacks.on_eom) |cb| cb(conn) else @intFromEnum(responses.Code.accept);
-        // If the write failed the connection is ALREADY FREED -- the 9.3 mapped
-        // probe closed before reading the EOM response and the resetMessage()
-        // below then ran on freed memory (SIGBUS in freeHeaders). The check is
-        // load-bearing, and the bool return exists so this cannot be forgotten.
+        // Failed write = connection already freed (removed in sendResponse).
+        // Touching `conn` after this is use-after-free (SIGBUS in freeHeaders,
+        // found by 9.3 mapped probe). Bool return makes ignoring this a compile error.
         if (!self.sendResponse(conn, resp)) return;
         conn.resetMessage();
     }
@@ -685,12 +632,9 @@ pub const Worker = struct {
         conn.resetMessage();
     }
 
-    /// Write a one-byte response. Returns false when the write failed and the
-    /// connection is GONE -- removed and freed -- in which case the caller must
-    /// not touch `conn` again. The bool exists so that ignoring the outcome is
-    /// a compile error: the one place that used to (handleEom's resetMessage
-    /// after a failed EOM write) was a use-after-free that cost a daemon its
-    /// life to a client that simply closed early.
+    /// Write response. Returns false if write failed and connection was removed/freed.
+    /// Caller must not touch `conn` after false. Bool return prevents the use-after-free
+    /// that handleEom's resetMessage previously triggered (SIGBUS on early client close).
     fn sendResponse(self: *Worker, conn: *connection_mod.Connection, resp_code: u8) bool {
         codec.writeSimpleResponse(conn.fd, resp_code) catch {
             self.removeConnection(conn.fd);
@@ -730,16 +674,9 @@ fn recordBodyLen(conn: *connection_mod.Connection, data: []const u8) u8 {
 }
 
 test "X-6: a packet larger than the read chunk is assembled without yielding to the event loop" {
-    // THE PROPERTY: `feed` reads at most 8192 bytes per call, so a larger packet
-    // necessarily returns `.incomplete` several times before it completes.
-    // `handleConnectionData` must keep feeding on `.incomplete` rather than returning
-    // to the event loop, because the rest of the packet may already be in the kernel
-    // buffer -- in which case no new data arrives, no new kqueue edge fires, and the
-    // connection hangs. That was X-6.
-    //
-    // Until now this was documented only in a comment inside the function. The
-    // refactor plan lists this function as the riskiest in the codebase, so the test
-    // is written FIRST, against the unmodified implementation.
+    // `feed` reads 8192 bytes per call; a larger packet returns `.incomplete`.
+    // `handleConnectionData` must keep feeding (not return to event loop), because
+    // remaining data in the kernel buffer produces no new kqueue edge. X-6.
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(
         @intCast(posix.AF.UNIX),
@@ -797,21 +734,12 @@ test "X-6: a packet larger than the read chunk is assembled without yielding to 
 }
 
 test "a dead peer at EOM must not leave handleEom touching the freed connection" {
-    // Found by the 9.3 "mapped" probe (2026-08-08): a raw milter client that
-    // closes before reading the EOM response turns the response write into
-    // EPIPE. sendResponse removed the connection on that failure -- and
-    // handleEom then ran conn.resetMessage() on the freed struct, dying with
-    // SIGBUS in freeHeaders (connection.zig:447). Every deploy of the daemon
-    // could be killed by any client that went away at the wrong moment.
+    // Client closes before EOM response → EPIPE → sendResponse removes connection →
+    // handleEom's resetMessage touches freed memory (SIGBUS in freeHeaders).
+    // Found by 9.3 mapped probe. Every deploy was killable by a client closing early.
     //
-    // The peer is closed ABORTIVELY (SO_LINGER onoff=1 linger=0), so the very
-    // first write fails with EPIPE deterministically; a plain close() can let
-    // the write succeed into a half-open socket and the test would pass
-    // vacuously.
-    //
-    // SIGPIPE is blocked because that is the daemon's own arrangement
-    // (ManagedSignals.blockForKqueue): without it the write would kill the
-    // test runner instead of returning EPIPE.
+    // SO_LINGER(0) makes the first write fail with EPIPE deterministically.
+    // SIGPIPE blocked (matches daemon's ManagedSignals.blockForKqueue).
     var sigs = std.mem.zeroes(std.c.sigset_t);
     _ = std.c.sigaddset(&sigs, 13); // SIGPIPE
     _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigs, null);
@@ -842,9 +770,8 @@ test "a dead peer at EOM must not leave handleEom touching the freed connection"
     conn.* = connection_mod.Connection.init(std.testing.allocator, worker_end, 0, .{});
     try worker.connections.put(worker_end, conn);
 
-    // A stored header, so the pre-fix resetMessage() walk over the freed
-    // Connection's header list has something to trip on rather than reading
-    // an empty list by luck.
+    // Stored header: ensures pre-fix resetMessage walks a non-empty list (otherwise
+    // it reads an empty list and passes by luck).
     try conn.headers.append(std.testing.allocator, .{
         .name = try std.testing.allocator.dupe(u8, "X-Probe"),
         .value = try std.testing.allocator.dupe(u8, "1"),
@@ -860,8 +787,7 @@ test "a dead peer at EOM must not leave handleEom touching the freed connection"
 
     worker.dispatchPacket(conn, .{ .cmd = @intFromEnum(commands.Code.body_eob), .data = &.{} });
 
-    // The connection must be gone (the failed write removed it) and -- the
-    // actual defect -- the process must still be here to say so.
+    // Connection removed by failed write; process still alive (the actual defect).
     try std.testing.expect(!worker.alive(worker_end));
 }
 

@@ -2,41 +2,17 @@ const std = @import("std");
 const mem = std.mem;
 const Writer = std.io.Writer;
 
-/// Rendering untrusted strings into structured output (audit X-5).
+/// Escaping attacker-controlled strings for structured output (audit X-5).
 ///
-/// Every daemon interpolates attacker-controlled strings -- HELO, MAIL FROM, a
-/// DKIM `d=`, a `From:` domain, a header value -- into two structured formats
-/// that both have delimiters an attacker can reach:
+/// Two output formats have attacker-reachable delimiters:
+///   * Syslog: CR/LF forges log lines; space breaks `key=value` structure.
+///   * ZMQ JSON: unescaped `"` ends the string, reinterpreting the payload.
 ///
-///   * **syslog lines**, whose shape is space-separated `key=value` pairs, one
-///     line per event. A CR or LF in a value forges an additional log line; a
-///     space or an empty value silently shifts what the following key appears to
-///     hold. Log forgery is the security half: an attacker who can inject a
-///     newline can write a plausible line attributing an action to another host.
-///   * **ZMQ event JSON**, consumed by SecureMessageWebhooks. A `"` in a value
-///     ends the string early and the rest of the payload is reinterpreted --
-///     invalid JSON at best, an attacker-chosen field value at worst.
+/// Formatters (use with `{f}`); allocate nothing.
+/// Render untrusted value as a single bare token for `key=value` log lines.
 ///
-/// Both helpers are formatters rather than functions returning a slice, so they
-/// allocate nothing and cannot leave a caller holding a pointer into a dead
-/// buffer. Use them with the `{f}` specifier.
-/// An untrusted value rendered as exactly one bare token, safe in a `key=value`
-/// log line.
-///
-/// **Every byte outside printable ASCII, and the space itself, becomes `_`.**
-/// One byte in, one byte out: the substitution cannot expand the line into the
-/// logger's 1 KiB buffer and cannot change how many characters the operator
-/// sees. That does discard *which* control character was sent -- a tab and a
-/// NUL both read as `_` -- and that is a deliberate trade. The alternative,
-/// expanding to `\xNN`, means an attacker can triple the length of a field and
-/// push the useful part of the line past truncation, which costs more than the
-/// distinction is worth. The count and position of the offending bytes survive,
-/// which is what tells an operator the value was hostile.
-///
-/// An empty value renders as `-`, not as nothing. `from=` followed by a space
-/// makes the *next* field look like this one's value, both to a human and to a
-/// parser reading `key=(.*)`; `-` is the placeholder the rest of the codebase
-/// already uses for an absent macro.
+/// Non-printable and space → `_` (1:1, no expansion into logger's 1 KiB buffer).
+/// Empty value → `-` (prevents `from=` from merging with the next field).
 pub const LogField = struct {
     raw: []const u8,
 
@@ -99,18 +75,9 @@ pub fn jsonString(raw: []const u8) JsonString {
     return .{ .raw = raw };
 }
 
-/// Replace every control byte in an already-formatted log message.
-///
-/// The backstop behind `logField`. `logField` has to be applied per value at
-/// every call site, and a call site that is added later, or one that was missed,
-/// would silently reopen the log-forgery hole. This runs once over the assembled
-/// message inside the logger, so **no log line can contain a CR or LF no matter
-/// what any call site does**.
-///
-/// It deliberately does not touch spaces: at this point the separators between
-/// fields are indistinguishable from a space inside a value, so squashing them
-/// would corrupt every message. Holding the `key=value` shape is `logField`'s
-/// job; this only guarantees one line per line.
+/// Backstop: replace control bytes (< 0x20, 0x7F) in an assembled log message.
+/// Guarantees no CR/LF in output regardless of call-site errors. Does NOT touch
+/// spaces (indistinguishable from field separators at this stage).
 pub fn scrubControlBytes(msg: []u8) void {
     for (msg) |*ch| {
         if (ch.* < 0x20 or ch.* == 0x7f) ch.* = '_';

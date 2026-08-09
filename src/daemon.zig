@@ -3,46 +3,30 @@ const posix = std.posix;
 const c = std.c;
 const log_mod = @import("log.zig");
 
-/// The byte a daemon sends its waiting parent once it is actually serving.
-///
-/// A specific value rather than any byte: the write end is inherited across two
-/// forks and nothing stops an unrelated descriptor from landing on the same
-/// number. Success is the one claim this protocol must not make by accident.
+/// Ready byte: 'K' signals the daemon is serving.
+/// A fixed value prevents misreading an unrelated descriptor value as success.
 const ready_byte: u8 = 'K';
 
-/// How long the parent waits for that byte before giving up, in seconds.
-///
-/// Waiting forever would convert a daemon wedged during startup into a wedged
-/// `service start`, which is a different failure with the same symptom as the one
-/// being fixed. Generous enough to cover a slow first DNS resolution.
+/// Startup timeout in seconds. A blocked daemon must fail; a blocked `service start`
+/// must fail rather than hang forever.
 pub const startup_timeout_s: isize = 60;
 
-/// Daemonize the current process (double-fork, setsid, close fds).
+/// Double-fork daemonization: setsid, close fds, return readiness pipe.
+/// The parent reads the pipe; a byte means the daemon is serving, EOF means failure.
+/// Must signal via `signalReady` once listeners and workers are running.
 ///
-/// Returns the write end of the readiness pipe. The caller MUST hand it to
-/// `signalReady` once the daemon is genuinely serving, and must otherwise leave
-/// it alone: the parent is blocked on the read end and treats its closure without
-/// a byte as a failed start.
-///
-/// THE PARENT NO LONGER EXITS IMMEDIATELY, and that is the entire point (X-16).
-/// `daemonize` is bootstrap's first step and listeners are bound long after it
-/// returns, so the original process used to answer `service start` with 0 before
-/// anything had been tried. Measured: an unbindable listener gave exit 0, nothing
-/// listening, and no process. `rc.d` reported a started service; Postfix could
-/// not reach the milter, and a receiver running `milter_default_action=accept`
-/// takes mail unauthenticated. One typo in a listener address reaches that.
+/// Before this change, `daemonize` returned before listeners bound, so `service start`
+/// reported success while nothing listened. A typo in a listener address would
+/// silently produce exit 0, no listener, and unauthenticated mail (X-16).
 pub fn daemonize() !posix.fd_t {
-    // Created before the first fork so both ends survive into the grandchild.
-    //
-    // CLOEXEC does not affect fork, which is what carries the write end where it
-    // needs to go. It covers the other direction: anything this daemon ever execs
-    // would otherwise inherit a live write end, and the parent would then wait on a
-    // pipe that no longer closes when the daemon dies.
+    // Create before first fork so both ends survive into grandchild.
+    // CLOEXEC prevents exec'd children from inheriting the write end, which
+    // would keep the parent blocked on a dead descriptor.
     const ready = try posix.pipe2(.{ .CLOEXEC = true });
 
-    // Cleanup is per-fork rather than a function-wide errdefer: the child closes the
-    // read end below, so a single errdefer covering both would double-close it on any
-    // later failure -- and by then the number may belong to something else.
+    // Per-fork cleanup: the child closes the read end below. A single errdefer
+    // covering both would double-close it on failure, and by then the fd number
+    // may belong to something else.
     const pid1 = posix.fork() catch |e| {
         posix.close(ready[0]);
         posix.close(ready[1]);
@@ -63,10 +47,8 @@ pub fn daemonize() !posix.fd_t {
         posix.close(ready[1]);
         return e;
     };
-    // The intermediate process exits without signalling. Its copy of the write end
-    // is closed by exiting, which is why the parent must not treat one closure as
-    // EOF -- the read only reports EOF once the LAST copy is gone, and the daemon
-    // still holds one.
+    // Intermediate parent exits; its write-end copy closes on exit.
+    // EOF only reports when the LAST copy (daemon's) is gone.
     if (pid2 != 0) posix.exit(0);
 
     const devnull = try posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
@@ -78,28 +60,20 @@ pub fn daemonize() !posix.fd_t {
     return ready[1];
 }
 
-/// Tell the waiting parent the daemon is up, then close the pipe.
-///
-/// Call this only once listeners are bound and workers are running. Signalling
-/// earlier would restore the defect with extra steps: the parent would again be
-/// reporting success for work that had not happened yet.
+/// Signal readiness once listeners and workers are running.
+/// Calling earlier reports success before work is done.
 pub fn signalReady(wr: posix.fd_t) void {
     _ = posix.write(wr, &[_]u8{ready_byte}) catch {};
     posix.close(wr);
 }
 
-/// Block until the daemon reports readiness, it dies, or `timeout_s` elapses.
-///
-/// Three outcomes, and they are deliberately distinct. EOF without a byte means
-/// the daemon exited during startup -- the case that used to report success.
-/// A timeout means it is still alive but not serving, which is neither a clean
-/// start nor a clean failure and should not be reported as either.
+/// Wait for daemon readiness or timeout.
+/// EOF without byte = startup failure. Timeout = alive but not serving.
 fn awaitReady(rd: posix.fd_t, timeout_s: isize) !void {
     const kq = try posix.kqueue();
     defer posix.close(kq);
 
-    // Registration and wait in one syscall, which is the reason to use kqueue at
-    // all rather than reaching for poll.
+    // Single kevent call for registration and wait; avoids poll.
     var changes = [_]posix.Kevent{.{
         .ident = @intCast(rd),
         .filter = c.EVFILT.READ,
@@ -119,26 +93,13 @@ fn awaitReady(rd: posix.fd_t, timeout_s: isize) !void {
     if (n == 0 or buf[0] != ready_byte) return error.StartupFailed;
 }
 
-/// The PID recorded in `path`, if a process by that number is still alive.
+/// Read PID from `path`. Return `null` if file is missing, unreadable, not a PID,
+/// or names a dead process. EPERM counts as alive (process exists but is owned
+/// by someone else). Any error besides ProcessNotFound returns the PID.
 ///
-/// `null` means the file is safe to take over: absent, unreadable, not a PID, or
-/// naming a process that no longer exists. Anything else is a live holder.
-///
-/// **EPERM counts as alive.** `kill(pid, 0)` failing with `PermissionDenied` means
-/// the process is there and simply belongs to someone else -- reading that as "not
-/// running" is the classic form of this bug, and it is the reading that lets a
-/// second instance start beside the first. `Unexpected` is treated the same way,
-/// because refusing to start is recoverable by hand and two daemons sharing a
-/// socket via SO_REUSEPORT, splitting mail between two different configurations,
-/// is not.
-///
-/// KNOWN LIMIT, not solved here: PID numbers are recycled, so a stale file whose
-/// number has been reused by an unrelated process reads as live and this refuses
-/// to start until the file is removed. Distinguishing that needs the holder's
-/// executable path (`KERN_PROC_PATHNAME`), which is more machinery than the
-/// failure justifies -- and under `rc.d` the `pidfile=` handling in `rc.subr` is
-/// the first line of defence anyway. This exists for the cases that bypass it:
-/// foreground runs, `monit`, and containers.
+/// LIMIT: recycled PID numbers read as live; distinguishing that requires
+/// `KERN_PROC_PATHNAME`, which is not implemented. `rc.subr` pidfile handling
+/// covers most cases; this covers foreground runs, monit, and containers.
 fn livePidFileHolder(path: []const u8) ?c.pid_t {
     const file = std.fs.cwd().openFile(path, .{}) catch return null;
     defer file.close();
@@ -156,30 +117,11 @@ fn livePidFileHolder(path: []const u8) ?c.pid_t {
     return pid;
 }
 
-/// Refuse to continue if another instance already holds the PID file.
+/// Check no other instance holds the PID file. Must run before `daemonize`.
 ///
-/// MUST run BEFORE `daemonize`, and that ordering is the whole point.
-///
-/// This check first lived inside `writePidFile`, which runs *after* the fork
-/// because the PID it records only exists after it. That was wrong in a way no
-/// unit test could see. The standard FreeBSD idiom
-/// `daemon -p /var/run/x.pid /usr/local/sbin/x` has the supervisor write the pid
-/// of the process it execs, so by the time the post-fork check ran, the file
-/// already named a live process -- our own ancestor -- and the daemon refused to
-/// start against itself. Measured, not deduced: securespf logged `pid file
-/// /var/run/securemilter/securespf.pid is held by live process 70078; refusing to
-/// start a second instance` followed by `fatal: exiting on AlreadyRunning`.
-///
-/// Ancestry cannot rescue a post-fork check either. `daemonize` double-forks and
-/// the intermediate parent exits, so we are reparented to init and the ppid that
-/// would have identified 70078 as ours is gone -- and whether it has exited yet is
-/// a race, which is how this managed to pass locally and fail on the lab.
-///
-/// Run here instead and the ambiguity disappears: we are still the process the
-/// supervisor named, so a live holder that is not us is unambiguously a rival.
-/// Being tolerant is deliberate -- everything except a confirmed live rival is
-/// left for `writePidFile` to report, because a daemon that cannot read a PID file
-/// should still carry mail (L-5).
+/// Originally inside `writePidFile` (post-fork), which was wrong: under `daemon -p`,
+/// the file named our own ancestor, so the daemon refused to start against itself.
+/// Running before the fork eliminates the ambiguity (X-16).
 pub fn checkNotAlreadyRunning(path: []const u8) !void {
     const holder = livePidFileHolder(path) orelse return;
     if (holder == c.getpid() or holder == c.getppid()) return;
@@ -191,12 +133,9 @@ pub fn checkNotAlreadyRunning(path: []const u8) !void {
     return error.AlreadyRunning;
 }
 
-/// Write the current PID to a file.
-///
-/// Unconditional by design. Whether another instance is running is decided by
-/// `checkNotAlreadyRunning` before the fork; repeating the test here would
-/// re-introduce the `daemon -p` failure this pair exists to avoid, because at this
-/// point the file legitimately names a process that is not us.
+/// Write current PID to file. Unconditional; the pre-fork `checkNotAlreadyRunning`
+/// handles conflicts. Repeating the test here would re-introduce the `daemon -p`
+/// failure: the file now names a process (us) that is not the supervisor's.
 pub fn writePidFile(path: []const u8) !void {
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
@@ -251,17 +190,10 @@ pub const ManagedSignals = struct {
     pub const SIGINT = 2;
     pub const SIGPIPE = 13;
 
-    /// Block the managed signals in the calling thread so they can only be
-    /// taken by `sigwait` in the signal loop.
-    ///
-    /// Call this before spawning *any* thread, not merely before the worker
-    /// pool. `sigprocmask` affects one thread, and a new thread inherits the
-    /// mask in force when it is created, so every thread spawned before this
-    /// call keeps the signals unblocked. That is not cosmetic: while the main
-    /// thread is away from `sigwait` running a reload, the kernel delivers a
-    /// SIGHUP to the first thread that does not block it, and the default
-    /// action there terminates the process — with no core and no kernel log
-    /// line, because SIGHUP does not dump core (audit X-7).
+    /// Block signals before spawning any thread. A thread inherits the mask
+    /// in force at creation; unblocked threads receive the default handler
+    /// (e.g., SIGHUP terminates with no core, audit X-7). Must be called
+    /// before any thread creation, not only before the worker pool.
     pub fn blockForKqueue() void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGHUP);
@@ -271,11 +203,9 @@ pub const ManagedSignals = struct {
         _ = c.sigprocmask(c.SIG.BLOCK, &set, null);
     }
 
-    /// Wait for a shutdown signal (SIGTERM/SIGINT) using sigwait,
-    /// then write to the shutdown pipe to wake all worker threads.
-    ///
-    /// Call blockForKqueue() before spawning any thread so signals are
-    /// blocked in all of them and delivered only via sigwait here.
+    /// Wait for SIGTERM/SIGINT via sigwait, then close the shutdown pipe.
+    /// Closing triggers EV_EOF on all worker kqueues, waking every worker.
+    /// Call `blockForKqueue()` before spawning threads.
     pub fn waitForShutdown(shutdown_pipe_wr: posix.fd_t) void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGTERM);
@@ -291,17 +221,10 @@ pub const ManagedSignals = struct {
         posix.close(shutdown_pipe_wr);
     }
 
-    /// Signal loop that handles both SIGHUP (reload) and SIGTERM/SIGINT (shutdown).
-    ///
-    /// On SIGHUP: calls the reload callback, then continues waiting.
-    /// On SIGTERM/SIGINT: closes the shutdown pipe and returns.
-    ///
-    /// This replaces waitForShutdown() when live reload is desired.
-    ///
-    /// Call blockForKqueue() before spawning any thread. Note that this loop is
-    /// only a sigwait candidate while it is actually parked in sigwait: for as
-    /// long as `reload_fn` is running, a signal arriving must go to some other
-    /// thread, and any thread that does not block it will act on it.
+    /// Signal loop: SIGHUP triggers reload; SIGTERM/SIGINT closes the shutdown
+    /// pipe and exits. Only a sigwait candidate when actually parked in sigwait;
+    /// during reload, signals go to unblocked threads.
+    /// Call `blockForKqueue()` before spawning threads.
     pub fn signalLoop(shutdown_pipe_wr: posix.fd_t, reload_fn: ?*const fn () void) void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGTERM);
@@ -340,25 +263,16 @@ test "write and remove pid file" {
     try std.testing.expect(pid > 0);
 }
 
-// --- L-5: a PID file held by a live process ----------------------------------
-//
-// THE FIRST VERSION OF THIS TEST ENCODED THE BUG IT WAS MEANT TO CATCH. It wrote
-// the test process's own PID into the file and asserted a refusal, on the
-// reasoning that "the test process is itself a live PID, so this is exactly the
-// condition a second instance would find". It is not. It conflates *some* live
-// process with a *different* live process, and that conflation is the whole
-// defect: under `daemon -p` the pid in the file is our own ancestor, so the
-// daemon refused to start against itself. The test passed, and the lab did not.
-//
-// So the two cases are now separated, and the self case asserts the opposite of
-// what it used to.
+// --- L-5: PID file held by live process ----------------------------------
+// The first test version wrote its own PID and asserted refusal, conflating
+// "some live PID" with "a different live PID" — the defect itself. The self-case
+// and rival-case are now separated.
 
 test "a pid file naming ourselves is not a second instance" {
     const path = "/tmp/securemilter-test-self.pid";
     defer removePidFile(path);
 
-    // What `daemon -p` leaves behind: the supervisor records the pid of the
-    // process it execs, which is us, before we have written anything.
+    // `daemon -p` leaves the supervisor's PID (us) before `writePidFile` runs.
     try writePidFile(path);
 
     try checkNotAlreadyRunning(path);
@@ -368,22 +282,19 @@ test "a pid file held by another live process is refused" {
     const path = "/tmp/securemilter-test-live.pid";
     defer removePidFile(path);
 
-    // PID 1 is alive on any running system, is not us, and is not our parent.
-    // Under an unprivileged test runner `kill(1, 0)` fails with EPERM rather than
-    // ESRCH -- which `livePidFileHolder` must read as "exists but is not ours to
-    // signal", not as "gone".
+    // PID 1 is alive, not us, not our parent. `kill(1, 0)` may fail EPERM,
+    // which `livePidFileHolder` reads as "exists" not "gone".
     {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
         try file.writeAll("1\n");
     }
 
-    // The specific error matters: this is the one pid-file fault `bootstrap`
-    // refuses to start on. Every other one is logged and survived, because a
-    // daemon that cannot write a PID file should still carry mail.
+    // `AlreadyRunning` is the specific fault `bootstrap` refuses on; others
+    // are logged and survived (a daemon that cannot write a PID file carries mail).
     try std.testing.expectError(error.AlreadyRunning, checkNotAlreadyRunning(path));
 
-    // And the refusal left the file alone rather than truncating it.
+    // The refusal must not truncate the file.
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
     var buf: [64]u8 = undefined;
@@ -393,9 +304,9 @@ test "a pid file held by another live process is refused" {
 }
 
 test "writing the pid file does not re-test for a rival" {
-    // The check belongs before the fork and must not be duplicated after it. If it
-    // creeps back into `writePidFile`, `daemon -p` breaks again: at this point the
-    // file legitimately names a process that is not us.
+    // The pre-fork check must not be duplicated in `writePidFile`.
+    // At this point the file names a live process (us), so a duplicate
+    // check would break `daemon -p`.
     const path = "/tmp/securemilter-test-nocheck.pid";
     defer removePidFile(path);
 
@@ -443,8 +354,7 @@ test "a malformed pid file is taken over rather than refused" {
     const path = "/tmp/securemilter-test-junk.pid";
     defer removePidFile(path);
 
-    // Garbage, an empty file and a nonsense number all mean "nobody can prove an
-    // instance is running", which must not become a permanent refusal to start.
+    // Malformed files mean no running instance; must not permanently block start.
     for ([_][]const u8{ "not-a-pid\n", "", "-1\n", "0\n" }) |content| {
         {
             const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
@@ -455,13 +365,8 @@ test "a malformed pid file is taken over rather than refused" {
     }
 }
 
-// --- X-16(a): the readiness handshake ----------------------------------------
-//
-// These run against a real pipe rather than a real fork. The protocol is what is
-// worth testing and it is fully observable from one process: a byte means the
-// daemon came up, EOF without a byte means it died on the way, and neither
-// arriving means it is wedged. Forking inside the test runner would test
-// `posix.fork` and cost the ability to assert anything.
+// --- X-16: readiness handshake -------------------------------------------
+// Tests the protocol (byte = up, EOF = failed, silence = wedged) without real forks.
 
 test "X-16: the ready byte releases the parent" {
     const fds = try posix.pipe();
@@ -472,10 +377,8 @@ test "X-16: the ready byte releases the parent" {
 }
 
 test "X-16: a child that dies before signalling fails the parent" {
-    // This is the measured defect. The daemon exits during startup, its copy of
-    // the write end closes, and the parent sees EOF with no byte. Before this
-    // handshake existed the parent had already exited 0 and `rc.d` reported a
-    // started service with nothing listening.
+    // Measured defect: child exits before signalling; parent sees EOF with no byte.
+    // Before this handshake, `service start` reported success with nothing listening.
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
@@ -484,10 +387,8 @@ test "X-16: a child that dies before signalling fails the parent" {
 }
 
 test "X-16: a wedged child does not hang the parent forever" {
-    // The write end stays open and silent, which is what a daemon stuck resolving
-    // DNS or blocked on a lock looks like. Waiting forever would turn a hung start
-    // into a hung `service start`, so the wait is bounded and the timeout is
-    // distinguishable from a clean failure.
+    // Open write end with no signal = wedged daemon (e.g., blocked on DNS/lock).
+    // A bounded timeout prevents `service start` from hanging forever.
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);

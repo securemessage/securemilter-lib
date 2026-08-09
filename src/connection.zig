@@ -101,22 +101,17 @@ pub const Header = header_mod.Header;
 pub const HeaderSplit = header_mod.HeaderSplit;
 pub const splitLeadingSpace = header_mod.splitLeadingSpace;
 
-/// Caps on the parts of a message an unauthenticated peer controls.
+/// Caps on attacker-controlled message parts.
 ///
-/// A milter accumulates a private copy of the headers and body so it can hash
-/// them at end-of-message. Nothing in the protocol bounds how much a sender may
-/// push: individual packets are capped at 1 MiB by `codec.zig`, but the *number*
-/// of packets is not, so an unbounded body became unbounded resident memory
-/// (audit X-4, measured at roughly 1:1 with bytes streamed).
+/// The milter accumulates headers and body for end-of-message hashing. Packet
+/// count is unbounded (individual packets capped at 1 MiB by `codec.zig`), so
+/// without caps an unbounded body becomes unbounded resident memory (audit X-4).
 ///
-/// A cap is only half the fix. Silently truncating and carrying on is worse than
-/// the leak, because every daemon here exists to hash this content: a hash over a
-/// truncated copy describes a message the MTA is not delivering. So tripping a
-/// cap sets an overflow flag, and the flag makes the accumulated copy
-/// unavailable rather than merely short — see `getBody`.
+/// Exceeding a cap sets an overflow flag and makes the accumulated data
+/// unavailable (not truncated): hashing a truncated copy produces a verdict
+/// about content the MTA is not delivering. See `getBody`.
 ///
-/// These are read once when a connection is accepted. Changing them takes effect
-/// on restart, not on SIGHUP.
+/// Read once at connection accept. Changed on restart, not SIGHUP.
 pub const Limits = struct {
     /// Maximum accumulated body bytes. 0 disables the cap.
     ///
@@ -124,43 +119,28 @@ pub const Limits = struct {
     /// large mail stops being signed or verified.
     max_body_bytes: usize = 10 * 1024 * 1024,
 
-    /// Maximum number of accumulated headers. 0 disables the cap.
+    /// Maximum header count. 0 disables.
     ///
-    /// Set well above realistic mail rather than tight: DKIM canonicalization
-    /// rescans the header list per signature, so the cap's job is to stop the
-    /// quadratic case (tens of thousands of tiny headers fitting inside
-    /// `max_header_bytes`), not to police ordinary messages. Mail that has
-    /// crossed several lists and forwarders can legitimately carry 150+ headers
-    /// between `Received:`, scanner `X-*` and a long ARC chain — 50 ARC sets is
-    /// 150 headers on its own and is RFC 8617 legal — and a cap that tripped on
-    /// those would turn deep forwarding into a temperror.
+    /// Set high: DKIM canonicalization rescans per signature (quadratic with many
+    /// small headers), so this stops the amplification case. Legitimate mail can
+    /// carry 150+ headers (lists, scanners, 50 ARC sets = 150 ARC headers alone).
     max_headers: usize = 500,
 
-    /// Maximum total accumulated header bytes, names plus values. 0 disables
-    /// the cap. Needed independently of `max_headers`: a single header value
-    /// may approach the 1 MiB packet ceiling, so a count alone still admits
-    /// hundreds of megabytes.
+    /// Maximum total header bytes (names + values). 0 disables.
+    /// Needed separately: a single value can approach 1 MiB, so count alone
+    /// still admits hundreds of megabytes.
     max_header_bytes: usize = 1024 * 1024,
 
-    /// Maximum `DKIM-Signature` headers a verifier will process for one
-    /// message. 0 disables the cap.
+    /// Maximum DKIM-Signature headers verified per message. 0 disables.
+    /// Each costs DNS + RSA verify; unbounded = remote CPU/DNS amplification
+    /// (audit D-4, measured 355x). Matches OpenDKIM's `MaxSignatures`.
     ///
-    /// Each one costs a DNS lookup plus an RSA verify, so an unbounded count is
-    /// remote CPU and DNS amplification (audit D-4, measured 355x). Matches
-    /// OpenDKIM's `MaxSignatures`.
-    ///
-    /// Deliberately not applied to ARC instance counts: RFC 8617 5.1.1 permits
-    /// 50 sets, `securearc` already refuses chains longer than that, and
-    /// rejecting an RFC-legal 21-set chain to save work would be a conformance
-    /// bug dressed up as hardening. ARC's exposure is bounded by `max_headers`.
+    /// Not applied to ARC: RFC 8617 §5.1.1 permits 50 sets, already enforced
+    /// by `securearc`; `max_headers` bounds ARC exposure.
     max_signatures: usize = 20,
 
-    /// Read the caps from a config section, keeping the defaults above for any
-    /// option the operator did not set.
-    ///
-    /// Shared by every daemon deliberately: four copies of this would be four
-    /// chances for one milter to enforce a different ceiling than its
-    /// neighbours, which an attacker only has to find once.
+    /// Read caps from config, falling back to struct defaults.
+    /// Shared across all four daemons; inconsistent caps expose the weakest.
     pub fn fromSection(section: *const config.Config.Section) Limits {
         const defaults = Limits{};
         return .{
@@ -187,12 +167,8 @@ pub const Connection = struct {
     helo_name: ?[]const u8,
     mail_from_raw: ?[]const u8,
     recipients: std.ArrayList([]const u8),
-    /// Accumulated message body, one contiguous buffer.
-    ///
-    /// Kept flat rather than as a chunk list so that the cap in `appendBody` is
-    /// a single comparison, and so that `getBody` needs no concatenation pass —
-    /// the old chunk list doubled peak memory at end-of-message and had to
-    /// report allocation failure as an empty body.
+    /// Accumulated message body, flat buffer (not chunk list).
+    /// Flat: single comparison for `appendBody` cap, no concatenation in `getBody`.
     body: std.ArrayList(u8),
     listener_index: usize,
     limits: Limits,
@@ -216,25 +192,13 @@ pub const Connection = struct {
     /// Format: bare IP string (e.g., "10.99.0.1") or "local" for Unix sockets.
     peer_addr: [64]u8 = undefined,
     peer_addr_len: u8 = 0,
-    /// The connecting SMTP client's address, as carried by SMFIC_CONNECT.
-    ///
-    /// This is the milter protocol's own equivalent of the `hostaddr` argument
-    /// libmilter passes to `xxfi_connect()`, which sendmail documents as "the
-    /// host address, as determined by a getpeername(2) call on the SMTP socket".
-    /// It is where every libmilter-based filter -- OpenDKIM, OpenDMARC and the
-    /// rest -- gets the connecting address, and it arrives on every connection
-    /// with nothing to configure.
-    ///
-    /// Held SEPARATELY from the `{client_addr}` macro because that macro is
-    /// OPTIONAL: Postfix's default `milter_connect_macros` is
-    /// `j {daemon_name} {daemon_addr} v _` and does not include it, so a milter
-    /// that reads only the macro sees nothing at all on a stock MTA. Read this
-    /// through `clientAddr()` rather than directly.
+    /// SMTP client address from SMFIC_CONNECT (milter protocol equivalent of
+    /// libmilter's `hostaddr` / `getpeername(2)`). Held separately from the
+    /// `{client_addr}` macro: that macro is optional and absent from Postfix's
+    /// default `milter_connect_macros`. Read via `clientAddr()`.
     connect_addr: ?[]const u8 = null,
-    /// Address family reported by SMFIC_CONNECT. Distinguishes "there is no IP
-    /// because this is a local or unix-socket submission" from "there was an IP
-    /// and it did not parse", which are different answers for a caller that has
-    /// to decide between `none` and `permerror`.
+    /// Address family from SMFIC_CONNECT. Distinguishes "no IP (local/unix
+    /// submission)" from "IP present but unparseable" (none vs permerror).
     connect_family: commands.Family = .unknown,
 
     pub fn init(allocator: Allocator, fd: posix.fd_t, listener_index: usize, limits: Limits) Connection {
@@ -409,30 +373,21 @@ pub const Connection = struct {
         self.helo_name = try self.allocator.dupe(u8, name);
     }
 
-    /// Store the client address and family from SMFIC_CONNECT.
-    ///
-    /// Connection-level, so it is deliberately not cleared by `resetMessage`:
-    /// the client does not change between messages on one SMTP session.
+    /// Store client address/family from SMFIC_CONNECT.
+    /// Connection-level: not cleared by `resetMessage` (client unchanged within session).
     pub fn setConnectInfo(self: *Connection, info: commands.ConnectInfo) !void {
         if (self.connect_addr) |old| self.allocator.free(old);
         self.connect_addr = try self.allocator.dupe(u8, info.address);
         self.connect_family = info.family;
     }
 
-    /// The connecting SMTP client's address, or null when there genuinely is not
-    /// one to report.
+    /// SMTP client address, or null when none exists (unix socket, local submission).
+    /// Prefers `{client_addr}` macro; falls back to SMFIC_CONNECT address (absent
+    /// from default Postfix `milter_connect_macros`).
     ///
-    /// Prefers the `{client_addr}` macro when the MTA sent it, and falls back to
-    /// the address SMFIC_CONNECT carried. The fallback is the part that matters:
-    /// without it this returns nothing on a default Postfix, because the macro is
-    /// not in the default connect macro list.
-    ///
-    /// RETURNS AN OPTIONAL ON PURPOSE, and callers must not paper over it with a
-    /// display string. Substituting a placeholder like "unknown" and carrying on
-    /// is how a missing address turned into an affirmative SPF `fail`: the
-    /// placeholder parsed as neither IPv4 nor IPv6, every mechanism declined to
-    /// match it, and evaluation ran to the terminal `-all`. A caller that cannot
-    /// proceed without an address must say so rather than invent one.
+    /// Returns optional: callers must not substitute a placeholder. "unknown" was
+    /// previously parsed as neither IPv4 nor IPv6, causing every SPF mechanism to
+    /// decline and evaluation to reach the terminal `-all` (false `fail`).
     pub fn clientAddr(self: *const Connection) ?[]const u8 {
         if (self.macros.client_addr) |m| {
             if (m.len > 0) return m;
@@ -458,14 +413,9 @@ pub const Connection = struct {
         self.recipients.clearRetainingCapacity();
     }
 
-    /// Append a body chunk from SMFIC_BODY.
-    ///
-    /// Returns `error.BodyTooLarge` once `limits.max_body_bytes` would be
-    /// exceeded, or the allocator's error if the buffer cannot grow. Either way
-    /// the partial body is discarded and `body_overflow` latched: keeping it
-    /// would hold memory that can no longer be used for anything, which is the
-    /// leak this cap exists to stop. Subsequent calls return immediately, so a
-    /// sender that keeps streaming past the cap adds no further memory.
+    /// Append a body chunk. On cap or allocation failure: discards accumulated
+    /// body, latches `body_overflow`, subsequent calls return immediately (no
+    /// further memory growth from continued streaming).
     pub fn appendBody(self: *Connection, data: []const u8) !void {
         if (self.body_overflow) return error.BodyTooLarge;
 
@@ -486,11 +436,9 @@ pub const Connection = struct {
 
     /// The accumulated body, or null if it is not the whole body.
     ///
-    /// Deliberately an optional rather than a slice. This previously returned an
-    /// empty slice when it could not assemble the body, which callers could not
-    /// tell from a genuinely empty body — so they went on to hash nothing and
-    /// either reported a bogus verdict or signed a body hash for content the
-    /// message did not carry. Null forces the caller to decide.
+    /// Optional rather than empty slice: previously callers could not distinguish
+    /// an incomplete body from a genuinely empty one, producing bogus verdicts.
+    /// Null forces the caller to decide.
     pub fn getBody(self: *const Connection) ?[]const u8 {
         if (self.body_overflow) return null;
         return self.body.items;
@@ -576,13 +524,12 @@ test "body cap discards the partial copy and stops growing" {
     try conn.appendBody("0123456789");
     try std.testing.expectEqual(@as(usize, 10), conn.body.items.len);
 
-    // Crossing the cap drops what was accumulated: it can no longer be used to
-    // hash anything, so retaining it would be the very leak being fixed.
+    // Past the cap: discard partial body (unusable for hashing), stop growing.
     try std.testing.expectError(error.BodyTooLarge, conn.appendBody("abcdefg"));
     try std.testing.expect(conn.body_overflow);
     try std.testing.expectEqual(@as(usize, 0), conn.body.capacity);
 
-    // A sender that ignores the rejection and keeps streaming gains nothing.
+    // Continued streaming after cap: no additional memory allocated.
     for (0..1000) |_| {
         try std.testing.expectError(error.BodyTooLarge, conn.appendBody("padding padding padding"));
     }

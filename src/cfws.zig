@@ -1,24 +1,15 @@
 const std = @import("std");
 const mem = std.mem;
 
-/// RFC 5322 lexical structure: comments and quoted strings.
+/// RFC 5322 comments and quoted strings.
 ///
-/// Structured header fields are not flat text. A `;` inside a comment or a
-/// quoted string is ordinary data, not a separator, and a parser that scans
-/// with `indexOfScalar` cannot tell the difference. That mattered in the
-/// `Authentication-Results` parser (audit M-6): a comment containing
-/// `; spf=pass` was read as a genuine SPF result, and a `header.d=` written
-/// inside a comment on one method was picked up as the property of another.
-///
-/// The scanners here are shared so that every consumer of a structured field
-/// agrees on where the tokens are. That agreement is load-bearing for the X-1
-/// forged-header removal, which is only sound while the code deciding *whether
-/// to strip* sees exactly what the code *reading the value* sees.
-/// Advance past folding whitespace and complete comments, including nested
-/// ones. Returns the index of the first character that is neither.
-///
-/// An unterminated comment consumes the remainder: the alternative is to treat
-/// its contents as live tokens, which is precisely the confusion being removed.
+/// A `;` inside a comment or quoted string is data, not a separator. The A-R
+/// parser (audit M-6) previously used `indexOfScalar` and read a comment
+/// containing `; spf=pass` as a genuine result. Shared so every consumer
+/// agrees on token boundaries (required for sound X-1 header stripping).
+/// Skip FWS and complete comments (including nested). Returns index of first
+/// non-FWS non-comment byte. Unterminated comment consumes remainder (prevents
+/// its contents from being parsed as live tokens).
 pub fn skip(s: []const u8, start: usize) usize {
     var i = start;
     while (i < s.len) {
@@ -40,10 +31,8 @@ fn skipComment(s: []const u8, start: usize) usize {
             '\\' => i += 1, // quoted-pair: the next octet is data, even ')'
             '(' => depth += 1,
             ')' => {
-                // Guarded rather than `depth -= 1`: every call site enters on a
-                // '(' so depth is at least 1, but this runs on attacker bytes
-                // and an underflow panic in ReleaseSafe would be a denial of
-                // service earned by a single stray parenthesis.
+                // Guarded: depth starts at 1 but runs on attacker bytes; an
+                // underflow panic in ReleaseSafe would be DoS from a stray ')'.
                 if (depth <= 1) return i + 1;
                 depth -= 1;
             },

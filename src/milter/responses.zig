@@ -35,32 +35,11 @@ pub fn simple(code: Code) [1]u8 {
 ///
 /// Format: name NUL value NUL
 ///
-/// `leading_space` says whether this packet must carry the space that separates
-/// the colon from the value. **It is not cosmetic, and it has no default on
-/// purpose.**
-///
-/// `SMFIP_HDR_LEADSPC` is a two-sided bargain. D-23 asked for it to get header
-/// values on the *input* side exactly as they appeared on the wire, because
-/// `c=simple` hashes the field verbatim and the MTA otherwise eats one space.
-/// The half that went unnoticed is that the same flag transfers ownership of
-/// that space on the *output* side too: once a milter negotiates it, Postfix
-/// stops inserting a space after the colon in headers that milter adds, and
-/// expects the milter to supply it.
-///
-/// Neither daemon that asked for the flag supplied it, so every header they
-/// added shipped as `Authentication-Results:mail.example.org;` while the two
-/// daemons that never asked emitted `Authentication-Results: ...`. One delivered
-/// message carried both forms, from the same host, over the same Postfix.
-/// RFC 5322 tolerates the missing space -- FWS after the colon is optional --
-/// but every RFC 8601 example writes it, and four daemons in one ADMD disagreeing
-/// about their own header is the actual defect.
-///
-/// Required rather than defaulted for the reason recorded in L-2: a parameter
-/// that quietly supplies a value when a call site forgets is the mechanism of
-/// the bug, not the fix. Every caller must state which side of the bargain it
-/// is on, and the only correct source for that answer is
-/// `conn.negotiated_protocol.header_leading_space` -- what the MTA *agreed* to,
-/// never what the daemon asked for.
+/// `leading_space`: whether the packet carries the space after the colon.
+/// Not cosmetic, no default (L-2 mechanism: a default hides missing call sites).
+/// `SMFIP_HDR_LEADSPC` transfers ownership of the space to the milter on output;
+/// callers must use `conn.negotiated_protocol.header_leading_space`, never what
+/// they requested (D-23: four daemons disagreed on their own header format).
 pub fn addHeader(
     allocator: std.mem.Allocator,
     name: []const u8,

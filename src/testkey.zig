@@ -1,34 +1,15 @@
-//! The one implementation of "does the key in DNS match the key on disk".
+//! Shared `-testkey` implementation: compares DNS public key to local private key.
 //!
-//! `securedkim-testkey` and `securearc-testkey` were 244 and 246 lines that
-//! differed in 18: a program name, some usage prose, and two sentences of the
-//! same warning written twice (refactor plan stage 5.1). Everything that made
-//! them a *tool* -- the argument loop, the TXT lookup, the `p=` extraction, the
-//! key load, the comparison -- was duplicated, and neither copy had a test or a
-//! conformance case pointing at it. Two untested copies of one thing is not twice
-//! the coverage of one untested thing; it is two things that can disagree about
-//! whether an operator's key is deployed correctly, which is the only question
-//! this tool exists to answer.
+//! `securedkim-testkey` and `securearc-testkey` were 244/246 lines differing in
+//! 18 (name, usage prose, one warning). Two untested copies can disagree about
+//! whether an operator's key is deployed correctly.
 //!
-//! WHY THE CRYPTO PACKAGE ARRIVES AS A PARAMETER. This file needs `cli` and `dns`
-//! from this library and key loading from `securemilter_crypto`, and the two
-//! packages are both dependency-free roots: neither imports the other. Adding
-//! `securemilter_crypto` to this library's dependencies would link OpenSSL into
-//! `securespf` and `securedmarc`, which have no keys and no use for it, to give a
-//! diagnostic tool a shorter import line. So the caller -- which already has both
-//! -- passes the one it has, and the graph stays as it is.
+//! Crypto package is a parameter (not a dependency) to avoid linking OpenSSL
+//! into `securespf` and `securedmarc` (which have no keys).
 //!
-//! NOTHING HERE IS COVERED BY A CONFORMANCE SUITE, unlike everything else stage 5
-//! consolidated, and nothing here can be covered by a unit test either: the
-//! generic cannot be instantiated in this library's own test build, because that
-//! would need the crypto dependency this file exists to avoid. There is also no
-//! RFC to be conformant to -- the tool compares two strings.
-//!
-//! What it has instead is `test/testkey_verify.py`, which drives both binaries
-//! against the shared DNS fake and pins 18 behaviours each. `-p` exists so that is
-//! possible at all -- see `Options.usage`. Teeth-checked by hardcoding one
-//! product's name in place of `opts.daemon`, which fails exactly one check, in the
-//! other product only.
+//! Not covered by conformance suites or unit tests (cannot instantiate the
+//! generic without crypto dependency). Covered by `test/testkey_verify.py`
+//! which drives both binaries against the shared DNS fake (18 behaviours each).
 
 const std = @import("std");
 const mem = std.mem;
@@ -47,14 +28,8 @@ pub const Options = struct {
     /// will refuse the key, not that some daemon somewhere will.
     daemon: []const u8,
 
-    /// The `-h` text. Per product because the DKIM and ARC tools describe
-    /// different things to different people, and usage prose is documentation
-    /// rather than logic -- sharing it would mean one of the two lying.
-    ///
-    /// It has to document `-p`, which the flag loop below accepts: without a port
-    /// this tool can only talk to 53, and a fake resolver on 53 needs root. Both
-    /// copies omitted it while their sibling `securedkim-check` had it, so neither
-    /// could be run against the suite's own DNS server.
+    /// Per-product usage text. Must document `-p` (port flag, required for
+    /// running against the test suite's fake resolver without root).
     usage: []const u8,
 };
 

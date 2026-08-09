@@ -34,15 +34,10 @@ pub const Options = struct {
     max_connections: u32,
     num_listeners: u32,
 
-    /// Spawn any long-lived threads the daemon needs — in practice the DNS health
-    /// monitor.
-    ///
-    /// A callback rather than a step, for two reasons. It keeps this module from
-    /// importing `dns`, which imports `daemon` and would make a cycle. And it puts the
-    /// daemon's thread creation at THE ONE POINT IN THE SEQUENCE WHERE IT IS SAFE,
-    /// chosen here rather than by each caller: after `daemonize`, because fork keeps
-    /// only the calling thread, and after the managed signals are blocked, because a
-    /// thread created before that inherits a mask which does not block them (X-7).
+    /// Spawn long-lived threads (e.g., DNS health monitor). A callback avoids
+    /// import cycles (`dns` imports `daemon`) and ensures creation at the safe
+    /// point: after daemonize (only calling thread survives fork) and after
+    /// signal blocking (new threads inherit the mask; audit X-7).
     spawn_threads: ?*const fn () void = null,
 };
 
@@ -57,15 +52,10 @@ pub const Bootstrap = struct {
     ready_fd: ?posix.fd_t = null,
     signal_ready: *const fn (posix.fd_t) void = daemon.signalReady,
 
-    /// Tell the waiting parent this daemon is serving. Call it once listeners are
-    /// bound and the worker pool is running, and not before.
-    ///
-    /// `run` deliberately does not do this itself. Everything that actually makes the
-    /// daemon useful — binding, the worker pool — happens after `run` returns, which
-    /// is the whole reason the parent's exit status was meaningless (X-16). Signalling
-    /// from inside `run` would move the lie rather than remove it.
-    ///
-    /// Idempotent, and a no-op in the foreground.
+    /// Signal readiness once listeners and workers are running. Not called by `run`
+    /// itself: everything useful (binding, worker pool) happens after `run` returns,
+    /// which is why the parent exit status was meaningless (X-16). Signalling inside
+    /// `run` would move the defect, not fix it. Idempotent; no-op in foreground.
     pub fn notifyReady(self: *Bootstrap) void {
         if (self.ready_fd) |fd| {
             self.ready_fd = null;
@@ -82,14 +72,9 @@ pub const Bootstrap = struct {
     }
 };
 
-/// The syscall-level steps, injectable.
-///
-/// THE INDIRECTION EXISTS SO THE ORDER CAN BE TESTED. Five of the ordering relations
-/// below were each a filed defect, and not one of them can be exercised directly in a
-/// unit test: a test process cannot fork, setuid, or mask its own signals without
-/// wrecking the test runner. Substituting recording stubs makes the sequence
-/// observable, which is the difference between the constraints being *documented* —
-/// they were, in four separate files — and being *enforced*.
+/// Injectable syscall-level steps. Substitution makes the sequence observable for
+/// tests: five ordering constraints below were each filed defects; none can be
+/// exercised in a unit test (no fork/setuid/signal masking without wrecking the runner).
 pub const Ops = struct {
     daemonize: *const fn () anyerror!posix.fd_t = daemon.daemonize,
     reinit_log: *const fn () void = log_mod.initThread,
@@ -106,40 +91,20 @@ pub const Ops = struct {
 /// Bring the daemon up: daemonize, block signals, spawn threads, claim the PID file,
 /// raise the fd budget, drop privileges.
 ///
-/// THE ORDER IS THE POINT OF THIS FUNCTION. It was written out four times, once per
-/// daemon, with each constraint restated as a comment — which is how X-7 came to be
-/// fixed in one copy while the others waited. The constraints, and what breaks:
+/// Ordering constraints (each was a filed defect; order enforces them):
+/// 0. Check running instance before `daemonize` (only answerable before fork, audit L-5).
+/// 1. `daemonize` before threads (`fork` carries only calling thread).
+/// 2. Block signals before threads (inherit mask; unblocked threads take default actions, audit X-7).
+/// 3. Reinit log after `daemonize` (PID changed).
+/// 4. PID file before privilege drop (`/var/run` not writable by unprivileged user).
+/// 5. Raise fd limit before privilege drop (`setrlimit` needs root).
+/// 6. Umask first (filters at creation; cannot apply after file exists).
 ///
-///   0. The already-running check before `daemonize`. It is only answerable while we
-///      are still the process a supervisor named; after the double fork the parent has
-///      exited, we belong to init, and `daemon -p`'s own entry is indistinguishable
-///      from a rival's — which made the daemon refuse to start against itself (L-5).
-///   1. `daemonize` before any thread. `fork` carries over only the calling thread, so
-///      a thread started earlier simply does not exist in the daemon.
-///   2. Signals blocked before any thread. `sigprocmask` affects one thread and a new
-///      thread inherits the mask in force when it is created. Miss this and, while the
-///      main thread is away from `sigwait` running a reload, SIGHUP goes to the first
-///      thread that does not block it and the default action kills the process — no
-///      core, no log line, because SIGHUP does not dump core. That is X-7, and it
-///      survived six runs of the probe written to catch it.
-///   3. Log re-initialised after `daemonize`, because the PID changed and the log lines
-///      carry it.
-///   4. PID file written before privileges are dropped: /var/run is not writable by the
-///      unprivileged user.
-///   5. fd limit raised before privileges are dropped: `setrlimit` above the soft limit
-///      needs root.
-///   6. The umask set before anything is created. It is not a permission that can be
-///      applied afterwards — it filters the mode at creation — so a mask installed
-///      after the PID file is written, or after the caller binds its listeners, is
-///      simply not in effect for the files it was configured to protect. Ordered
-///      first because "every file from here on" is the only version of this rule with
-///      no exceptions to remember.
-///
-/// A failed PID file write is logged and survived — the daemon still works, it is
-/// merely harder to signal. A failed `daemonize` or privilege drop is fatal, because
-/// continuing would mean running attached, or as root, without being asked to. So is a
-/// confirmed second instance, which is why that check is step 0 and not part of the
-/// write.
+/// A failed PID file write is logged and survived (daemon still carries mail).
+/// Failed `daemonize` or privilege drop is fatal (running attached or as root without
+/// being asked). A confirmed second instance is fatal (audit L-5); `SO_REUSEPORT` lets
+/// a second copy bind and split mail silently (diagnosed weeks later from inconsistent
+/// A-R headers). The ready-byte handshake (X-16) reports refusal back to `service start`.
 pub fn run(opts: Options) !Bootstrap {
     return runWithOps(opts, .{});
 }
@@ -233,13 +198,8 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     };
 }
 
-/// The disposition line: why this process is about to stop existing.
-///
-/// Pure, and separate from the emission, BECAUSE THE LOG OFFERS NOTHING TO OBSERVE --
-/// it writes to a datagram socket or to stderr and returns void. A test can assert on
-/// this; it cannot assert on `log_mod.err`. The thing worth pinning is that the error
-/// is NAMED, since the whole defect was an operator with no way to tell which of a
-/// dozen failures had happened.
+/// Fatal error message format. Named errors are pinned because the original defect
+/// was an operator with no way to tell which of many failures occurred.
 pub fn fatalMessage(buf: []u8, e: anyerror) []const u8 {
     return std.fmt.bufPrint(buf, "fatal: exiting on {s}", .{@errorName(e)}) catch
         // Only reachable if `buf` cannot hold even the error name. Still says the one
@@ -247,36 +207,11 @@ pub fn fatalMessage(buf: []u8, e: anyerror) []const u8 {
         "fatal: exiting on an error whose name did not fit";
 }
 
-/// Announce a fatal failure through the log, then hand the error back to propagate.
-///
-/// Used as the whole body of `main`:
-///
-///     pub fn main() !void {
-///         run() catch |e| return bootstrap.fatal(e);
-///     }
-///
-/// THE SHAPE IS THE POINT, not the function. `daemonize` is the first thing `run`
-/// does, and it points stderr at /dev/null -- so from that instant the error Zig's
-/// start code prints for an error returned by `main` goes nowhere, and syslog is the
-/// only channel left. Every fallible step after it (the shutdown pipe, the worker
-/// pool, and whatever is added later) therefore had exactly one way to report: a
-/// `try` whose error was written to a closed descriptor. Measured on a daemon told to
-/// bind an unusable address: parent exit status 0, nothing listening, no process, and
-/// a last log line reading "starting" (X-16).
-///
-/// Reporting at the single point where every error converges is what makes this
-/// robust to a `try` added later. Per-site `catch` blocks were the alternative and
-/// are how X-7 came to be fixed in one of four copies.
-///
-/// The error is returned rather than swallowed so the exit status stays non-zero.
-/// That is necessary but NOT sufficient, and deliberately not the whole fix: the
-/// parent has already exited 0 by the time this runs, so `rc.d` still reports a
-/// started service. Closing that needs a readiness handshake across the fork, which
-/// is X-16(a) and a change of protocol rather than of reporting.
-///
-/// A failure that already logged its own diagnostic gets a second line here. That is
-/// intended: the diagnostic says what was wrong with the input, this says what became
-/// of the process, and only one of the two is guaranteed to exist.
+/// Log fatal error, return error for non-zero exit status. Used as `main`'s catch body.
+/// From `daemonize`, stderr is /dev/null; syslog is the only remaining channel (X-16).
+/// Every fallible step after it (shutdown pipe, worker pool) had exactly one reporting
+/// path: a `try` writing to a closed descriptor. A readiness handshake (X-16) closes
+/// the gap between the parent exit and the actual failure.
 pub fn fatal(e: anyerror) anyerror {
     var buf: [256]u8 = undefined;
     log_mod.err("{s}", .{fatalMessage(&buf, e)});

@@ -52,26 +52,11 @@ pub const Config = struct {
             return parseSize(raw) orelse default;
         }
 
-        /// Read a permission mask, in octal. Null means the option is absent.
-        ///
-        /// OCTAL UNCONDITIONALLY, which is a deliberate narrowing of what
-        /// opendkim accepts. Its config reader parses integers with `strtol`
-        /// base 0, so a leading zero selects octal and anything else is decimal.
-        /// For every value an operator actually writes the two agree, because a
-        /// mask is written `0022` or `0117`. They diverge only on a value typed
-        /// without the leading zero, where base 0 reads `117` as one hundred and
-        /// seventeen -- 0o165, `rwxr-x--x` -- and grants a mask nobody asked
-        /// for. A permission mask has no meaningful decimal spelling, so there
-        /// is nothing to lose by not guessing.
-        ///
-        /// A MALFORMED VALUE IS AN ERROR, unlike `getInt` and `getSize` which
-        /// fall back to their default. Those describe capacity, where landing on
-        /// a sane number is better than refusing to start. This one describes who
-        /// may open a socket that signs mail, and quietly substituting the
-        /// inherited mask for a value the operator wrote down and got slightly
-        /// wrong is how a socket ends up more permissive than the file says it
-        /// is. Same reasoning as `parseListenerSocket` refusing a malformed
-        /// `Socket` rather than falling back to loopback (X-14).
+        /// Read permission mask in octal. Null = option absent.
+        /// Octal unconditionally (deliberate narrowing from `strtol` base 0): a mask
+        /// has no meaningful decimal spelling (`117` vs `0117` diverges). Malformed
+        /// values are errors (not defaults): a wrong mask grants more permission than
+        /// the file states (audit X-14).
         pub fn getMode(self: *const Section, key: []const u8) !?std.posix.mode_t {
             const raw = self.entries.get(key) orelse return null;
             const trimmed = std.mem.trim(u8, raw, " \t");
@@ -79,23 +64,13 @@ pub const Config = struct {
             return std.fmt.parseInt(std.posix.mode_t, trimmed, 8) catch return error.InvalidMode;
         }
 
-        /// Read a comma-separated option into an owned slice of trimmed,
-        /// non-empty parts. Absent or all-empty yields a zero-length slice.
+        /// Read comma-separated list: trimmed, non-empty parts. Zero-length if absent/empty.
+        /// Five hand-rolled copies existed (one per daemon + `securearc`); one leaked
+        /// on SIGHUP due to `toOwnedSlice` ownership transfer. One copy with a test fixes it.
         ///
-        /// This existed four times, once per daemon, hand-rolled for
-        /// `DnsNameserver` and a fifth time in `securearc` for
-        /// `LocalAuthMethods`. Each copy ran the same six-line dance: build an
-        /// `ArrayListUnmanaged`, split, trim, skip empties, `toOwnedSlice`. The
-        /// dance has one subtlety -- `toOwnedSlice` turns a list that unwinds
-        /// itself via `errdefer` into a bare slice that does not -- and one of
-        /// the five got it wrong, leaking on every SIGHUP against a config with
-        /// a typo in it. Five copies of a subtle ownership transfer is the
-        /// defect; one copy with a test is the fix.
-        ///
-        /// THE RETURNED STRINGS BORROW FROM THE `Config`. Only the outer slice
-        /// is owned, so `allocator.free(result)` is the whole cleanup -- and a
-        /// caller that outlives its `Config` must duplicate the contents, which
-        /// is what every `Reloadable.init` already does.
+        /// Returned strings borrow from `Config`; `allocator.free(result)` cleans the
+        /// outer slice. Callers outliving their `Config` must duplicate contents (done
+        /// by every `Reloadable.init`).
         pub fn getCsvList(
             self: *const Section,
             allocator: Allocator,
@@ -384,14 +359,9 @@ test "getCsvList trims, skips empties, and applies the default" {
 // `std.testing.allocator` underneath reports anything left outstanding -- so a
 // missing `errdefer` in here fails this test instead of leaking in a daemon.
 //
-// THE ITEM COUNT IS LOAD-BEARING. The first version of this test used eight
-// entries and PASSED with the `errdefer` deleted, which is worse than having no
-// test: eight items fit one allocation, and `toOwnedSlice` then shrinks it in
-// place, so the only failure point was the very first `alloc` -- at which the
-// list owned nothing and there was nothing to leak. A list long enough to be
-// reallocated several times is what puts a failure point *after* the list has
-// memory, which is the only case the `errdefer` exists for. Verified to fail
-// when the `errdefer` is removed.
+// The item count is load-bearing: only a long list (reallocated) puts failure
+// after memory is owned -- the case `errdefer` exists for. Verified to fail
+// when `errdefer` is removed.
 test "getCsvList leaves nothing outstanding when an allocation fails" {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     defer buf.deinit(std.testing.allocator);

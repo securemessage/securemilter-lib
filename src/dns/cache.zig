@@ -1,35 +1,18 @@
 //! Per-worker DNS answer cache.
 //!
-//! Split out of `resolver.zig` because it shares nothing with the query engine
-//! but an allocator: it never touches a socket, a nameserver, or `Result`, and
-//! reaches only for `packet.Answer` and the negative taxonomy below. Eight of
-//! that file's eleven tests were already testing this and nothing else.
-//!
-//! The negative-answer taxonomy -- `NegativeKind` and `isTransientError` --
-//! comes with it rather than staying behind. `CacheEntry` is shaped around
-//! `NegativeKind`, so that much had to move or the dependency would run both
-//! ways; `isTransientError` follows because the two are one classification and
-//! `Resolver` never calls it. Every caller reaches it through `dns.zig`, and
-//! the test that pins the distinction -- a dropped packet must not look like an
-//! authoritative "no such name" -- exercises both halves at once. Splitting
-//! them would put half a rule in each file.
-//!
-//! `resolver.zig` re-exports all three, so `dns.zig` and the four daemons are
-//! unchanged.
+//! Includes the negative-answer taxonomy (`NegativeKind`, `isTransientError`)
+//! because `CacheEntry` is shaped around it. `resolver.zig` re-exports all
+//! three; the public API is unchanged.
 
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const packet = @import("packet.zig");
 
-/// Why a name produced no usable answer.
-///
-/// SPF cannot reconstruct this distinction after the fact and needs it:
-/// RFC 7208 §4.6.4 counts an authoritative "no such name" as a *void lookup*
-/// and lets evaluation continue, whereas a SERVFAIL or a timeout is transient
-/// and must become `temperror`. Collapsing the two into one error made a
-/// momentary nameserver hiccup look like proof that a mechanism did not match,
-/// which is how a legitimate sender ends up rejected by a `-all`.
+/// Why a name produced no usable answer. SPF (RFC 7208 §4.6.4) must
+/// distinguish authoritative NXDOMAIN (void lookup, continue) from SERVFAIL/
+/// timeout (transient, temperror). Collapsing both into one error let a
+/// nameserver hiccup look like proof a mechanism did not match → false `-all`.
 pub const NegativeKind = enum {
     /// RCODE 3. The name itself does not exist.
     name_error,
