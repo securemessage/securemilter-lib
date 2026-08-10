@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 const log_mod = @import("log.zig");
+const credentials = @import("credentials.zig");
 
 /// Ready byte: 'K' signals the daemon is serving.
 /// A fixed value prevents misreading an unrelated descriptor value as success.
@@ -132,35 +133,64 @@ pub fn checkNotAlreadyRunning(path: []const u8) !void {
     return error.AlreadyRunning;
 }
 
-/// Ensure the PID file's parent directory exists and is writable by the
-/// target user, so `removePidFile` succeeds after privilege drop.
-/// Must be called while still root (before `dropPrivileges`).
-pub fn ensurePidDirectory(pid_path: []const u8, user_spec: ?[]const u8) void {
-    const dir = std.fs.path.dirnamePosix(pid_path) orelse return;
+/// Ensure the directory that will hold `file_path` exists, is traversable,
+/// and — when `owner` is given — belongs to it.  Used for both the PID file
+/// directory and Unix socket directories; the daemon writes into them only
+/// after the privilege drop, so this must run while the process is still root.
+///
+/// Ownership carries two consequences, not one.  The visible one is that the
+/// unprivileged daemon can unlink its PID file and socket at shutdown.  The
+/// subtle one is BSD group-inheritance: a new file takes its group from the
+/// directory, so the directory's group is what puts the milter socket in the
+/// group Postfix connects with.
+///
+/// Failures are logged and survived: whatever cannot be prepared here fails
+/// again a moment later — writePidFile, bind() — where it is already handled,
+/// and a daemon that carries mail beats one that refuses over a chmod.
+pub fn ensureRuntimeDirectory(file_path: []const u8, owner: ?credentials.UserGroup) void {
+    const dir = std.fs.path.dirnamePosix(file_path) orelse return;
     if (dir.len == 0) return;
 
+    ensureDirectory(dir);
+    if (owner) |ug| chownDirectory(dir, ug);
+}
+
+/// Create `dir` if it is missing, at mode 0755: owner rwx (the daemon can
+/// unlink), group+other r-x (Postfix can traverse to reach the socket inside).
+///
+/// The mode is set explicitly because `makeDirAbsolute` filters through the
+/// process umask, which for a milter is typically 0117 — 0660 on a directory,
+/// no execute, not traversable.  Only a directory this call creates is
+/// touched: the mode of one that already exists is the operator's, not ours.
+fn ensureDirectory(dir: []const u8) void {
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
+        error.PathAlreadyExists => return,
         else => {
-            log_mod.warn("pid directory: {}", .{err});
+            log_mod.warn("mkdir {s}: {}", .{ dir, err });
             return;
         },
     };
 
-    const user = user_spec orelse return;
-    const sep = std.mem.indexOfScalar(u8, user, ':');
-    const username = if (sep) |i| user[0..i] else user;
-
-    var name_buf: [256:0]u8 = undefined;
-    if (username.len == 0 or username.len >= name_buf.len) return;
-    @memcpy(name_buf[0..username.len], username);
-    name_buf[username.len] = 0;
-
-    const pw = c.getpwnam(&name_buf) orelse return;
-
-    var d = std.fs.openDirAbsolute(dir, .{}) catch return;
+    var d = std.fs.openDirAbsolute(dir, .{}) catch |err| {
+        log_mod.warn("open {s}: {}", .{ dir, err });
+        return;
+    };
     defer d.close();
-    posix.fchown(d.fd, pw.uid, pw.gid) catch {};
+    posix.fchmod(d.fd, 0o755) catch |err| log_mod.warn("chmod {s}: {}", .{ dir, err });
+}
+
+/// Give `dir` to the resolved runtime identity.  Pre-existing directories are
+/// chowned too — one the operator created but left root-owned would otherwise
+/// fail the daemon at bind() or PID removal, after the privileges to fix it
+/// are gone.
+fn chownDirectory(dir: []const u8, owner: credentials.UserGroup) void {
+    var d = std.fs.openDirAbsolute(dir, .{}) catch |err| {
+        log_mod.warn("open {s}: {}", .{ dir, err });
+        return;
+    };
+    defer d.close();
+    posix.fchown(d.fd, owner.uid, owner.gid) catch |err|
+        log_mod.warn("chown {s}: {}", .{ dir, err });
 }
 
 /// Write current PID to file. Unconditional; the pre-fork `checkNotAlreadyRunning`

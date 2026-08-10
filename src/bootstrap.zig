@@ -11,6 +11,7 @@ const posix = std.posix;
 const daemon = @import("daemon.zig");
 const credentials = @import("credentials.zig");
 const log_mod = @import("log.zig");
+const listener_mod = @import("listener.zig");
 
 /// What a daemon needs to come up, in one place.
 pub const Options = struct {
@@ -33,6 +34,11 @@ pub const Options = struct {
     worker_threads: u32,
     max_connections: u32,
     num_listeners: u32,
+
+    /// Listener addresses. Unix socket parent directories are created and
+    /// chowned to the target user while still privileged, so bind() works
+    /// after privilege drop without external setup.
+    listen_addresses: []const listener_mod.ListenAddress = &.{},
 
     /// Spawn long-lived threads (e.g., DNS health monitor). A callback avoids
     /// import cycles (`dns` imports `daemon`) and ensures creation at the safe
@@ -81,7 +87,7 @@ pub const Ops = struct {
     block_signals: *const fn () void = daemon.ManagedSignals.blockForKqueue,
     signal_ready: *const fn (posix.fd_t) void = daemon.signalReady,
     check_not_running: *const fn ([]const u8) anyerror!void = daemon.checkNotAlreadyRunning,
-    ensure_pid_directory: *const fn ([]const u8, ?[]const u8) void = daemon.ensurePidDirectory,
+    ensure_runtime_dir: *const fn ([]const u8, ?credentials.UserGroup) void = daemon.ensureRuntimeDirectory,
     write_pid_file: *const fn ([]const u8) anyerror!void = daemon.writePidFile,
     remove_pid_file: *const fn ([]const u8) void = daemon.removePidFile,
     raise_file_limit: *const fn (u64) void = daemon.raiseFileLimit,
@@ -148,10 +154,31 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
 
     // (4) still privileged here.
     //
-    // Create the PID directory (e.g. /var/run/securespf/) and chown it to the
-    // target user so `removePidFile` can unlink after privilege drop. This
-    // replaces the RC script's prestart `install -d`.
-    ops.ensure_pid_directory(opts.pid_file, opts.user);
+    // The runtime directories — the PID file's (e.g. /var/run/securespf/) and
+    // any Unix socket's — are created and given to the target user now, while
+    // the process can still do both: everything that lands in them (the PID
+    // file below, bind() after `run` returns, both unlinks at shutdown)
+    // happens after the privilege drop.
+    //
+    // The spec is resolved once, so every directory and the drop itself agree
+    // on the identity. A spec that does not resolve is survivable HERE because
+    // it cannot be the last word: `drop_privileges` resolves the same spec
+    // below and refuses the start, which makes the skipped chown moot.
+    const owner: ?credentials.UserGroup = if (opts.user) |spec|
+        credentials.resolveUserGroup(spec) catch |err| blk: {
+            log_mod.warn("resolving '{s}' for runtime directories failed: {}", .{ spec, err });
+            break :blk null;
+        }
+    else
+        null;
+
+    ops.ensure_runtime_dir(opts.pid_file, owner);
+    for (opts.listen_addresses) |la| {
+        switch (la) {
+            .unix => |ux| ops.ensure_runtime_dir(ux.path, owner),
+            .tcp => {},
+        }
+    }
 
     // Whether the file is ours is tracked, rather than inferred later from the file
     // existing: if the write failed, some other instance may own that path and
@@ -231,7 +258,7 @@ pub fn fatal(e: anyerror) anyerror {
 // the PID file is claimed before or after the fd limit is free, and a test that pinned
 // the whole order would fail on a change that breaks nothing.
 
-const Step = enum { check_running, daemonize, reinit_log, block_signals, spawn_threads, ensure_pid_dir, write_pid, remove_pid, raise_fd, drop_privs, signal_ready, set_umask };
+const Step = enum { check_running, daemonize, reinit_log, block_signals, spawn_threads, ensure_runtime_dir, write_pid, remove_pid, raise_fd, drop_privs, signal_ready, set_umask };
 
 var recorded: [16]Step = undefined;
 var recorded_len: usize = 0;
@@ -263,8 +290,8 @@ fn recBlockSignals() void {
 fn recSpawnThreads() void {
     record(.spawn_threads);
 }
-fn recEnsurePidDir(_: []const u8, _: ?[]const u8) void {
-    record(.ensure_pid_dir);
+fn recEnsureRuntimeDir(_: []const u8, _: ?credentials.UserGroup) void {
+    record(.ensure_runtime_dir);
 }
 fn recWritePid(_: []const u8) anyerror!void {
     record(.write_pid);
@@ -291,7 +318,7 @@ const recording_ops = Ops{
     .reinit_log = recReinitLog,
     .block_signals = recBlockSignals,
     .signal_ready = recSignalReady,
-    .ensure_pid_directory = recEnsurePidDir,
+    .ensure_runtime_dir = recEnsureRuntimeDir,
     .write_pid_file = recWritePid,
     .remove_pid_file = recRemovePid,
     .raise_file_limit = recRaiseFd,
@@ -384,6 +411,31 @@ test "the fd limit is raised while still privileged" {
     // rather than as an error here.
     _ = try runRecorded(test_opts);
     try expectBefore(.raise_fd, .drop_privs);
+}
+
+test "runtime directories are prepared while root, one per directory that gets written" {
+    // Both consumers in order: `write_pid` puts a file inside the PID directory a
+    // moment later, and the unix listener binds after `run` returns — by which
+    // time creating or chowning anything under /var/run is no longer possible.
+    var opts = test_opts;
+    const addrs = [_]listener_mod.ListenAddress{
+        .{ .unix = .{ .path = "/tmp/securemilter-bootstrap-test/milter.sock" } },
+        .{ .tcp = .{ .host = "127.0.0.1", .port = 8891 } },
+    };
+    opts.listen_addresses = &addrs;
+    _ = try runRecorded(opts);
+
+    try expectBefore(.ensure_runtime_dir, .write_pid);
+    try expectBefore(.ensure_runtime_dir, .drop_privs);
+
+    // The PID file's directory and the unix listener's. The TCP listener has no
+    // directory to prepare, and preparing one for it would be a path parsed out
+    // of an address that does not contain one.
+    var n: usize = 0;
+    for (recorded[0..recorded_len]) |s| {
+        if (s == .ensure_runtime_dir) n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
 }
 
 test "the umask is set before anything is created" {
