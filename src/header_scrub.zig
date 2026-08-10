@@ -6,29 +6,10 @@ const codec = @import("milter/codec.zig");
 const responses = @import("milter/responses.zig");
 const log = @import("log.zig");
 
-/// Removal of forged `Authentication-Results` header fields.
+/// Remove forged or stale `Authentication-Results` headers for an ADMD.
 ///
-/// RFC 8601 §5: an MTA adding an A-R field MUST delete any pre-existing
-/// instance that claims to have been added inside its own trust boundary,
-/// otherwise a remote sender can simply assert its own authentication
-/// results. A milter chain complicates that rule, because the *legitimate*
-/// results a downstream milter consumes were also added inside the trust
-/// boundary — by the milters that ran earlier in the same session.
-///
-/// The policy below resolves that by scoping removal to methods rather than
-/// to the header as a whole:
-///
-///   - `own_methods`  — results this daemon produces itself. Any pre-existing
-///                      claim for them is either stale or forged, and is about
-///                      to be replaced, so it is always removed.
-///   - `local_methods` — results other daemons of this ADMD produce. Only
-///                      consulted when `strip_foreign` is set.
-///   - `strip_foreign` — remove headers asserting methods that are neither
-///                      ours nor produced anywhere in this ADMD.
-///   - `strip_all`    — trust-boundary mode: remove every header claiming our
-///                      authserv-id, regardless of method. Correct for the
-///                      first milter in a chain and for hosts that run no
-///                      other authentication milter.
+/// The policy can remove this daemon's methods, foreign methods, or every
+/// result claiming the local authserv-id.
 pub const StripPolicy = struct {
     own_methods: []const []const u8 = &.{},
     local_methods: []const []const u8 = &.{},
@@ -53,8 +34,7 @@ pub fn stripAuthResults(
 ) u32 {
     if (!policy.strip_all and !policy.strip_foreign and policy.own_methods.len == 0) return 0;
 
-    // Pass 1: identify victims, recording both the connection-list position
-    // and the 1-based occurrence index among A-R headers that the MTA uses.
+    // Record list positions and the MTA's 1-based A-R occurrence indices.
     const Victim = struct { list_pos: usize, ar_index: u32 };
     var victims: std.ArrayListUnmanaged(Victim) = .{};
     defer victims.deinit(conn.allocator);
@@ -72,9 +52,7 @@ pub fn stripAuthResults(
 
     const can_delete = conn.negotiated_actions.change_headers;
     if (!can_delete) {
-        // Refusing to guess: leaving the header in the message while hiding it
-        // from our own evaluation would ship a message whose visible results
-        // disagree with the ones we acted on.
+        // Leave headers unchanged: callers must evaluate the message as delivered.
         log.err("cannot remove {d} forged {s} header(s) claiming authserv-id {s}: MTA did not grant SMFIF_CHGHDRS", .{ victims.items.len, HEADER_NAME, authserv_id });
         return 0;
     }
@@ -102,9 +80,7 @@ fn shouldStrip(header_value: []const u8, policy: StripPolicy) bool {
     if (policy.strip_all) return true;
     if (auth_results.assertsAnyMethod(header_value, policy.own_methods)) return true;
     if (policy.strip_foreign) {
-        // Anything this ADMD does not evaluate cannot legitimately carry our
-        // authserv-id. `own_methods` are covered above but are still listed
-        // so a header mixing local and foreign results is judged once.
+        // A local authserv-id may assert only methods this ADMD evaluates.
         var allowed: [32][]const u8 = undefined;
         const n = joinMethods(&allowed, policy.own_methods, policy.local_methods);
         if (auth_results.assertsMethodOutside(header_value, allowed[0..n])) return true;
@@ -131,10 +107,9 @@ test "own-method policy strips only headers asserting that method" {
     const spf_only = StripPolicy{ .own_methods = &.{"spf"} };
 
     try std.testing.expect(shouldStrip("mail.example.org; spf=pass smtp.mailfrom=x@a.test", spf_only));
-    // Mixed forgery: one header asserting spf= also carries the dkim= claim,
-    // so removing it takes the whole forgery with it.
+    // Removing one claimed local method removes its whole header.
     try std.testing.expect(shouldStrip("mail.example.org; spf=pass; dkim=pass header.d=a.test", spf_only));
-    // A genuine upstream DKIM result must survive for DMARC to read it.
+    // Upstream results for other local evaluators must remain available.
     try std.testing.expect(!shouldStrip("mail.example.org; dkim=pass header.d=a.test", spf_only));
 }
 

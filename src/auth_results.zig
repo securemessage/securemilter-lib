@@ -3,15 +3,9 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const cfws = @import("cfws.zig");
 
-/// RFC 8601 Authentication-Results header builder and parser.
+/// A single RFC 8601 Authentication-Results method result.
 ///
-/// Format: Authentication-Results: authserv-id; method=result (comment) property.type=value
-///
-/// Example:
-///   Authentication-Results: mail.example.com;
-///       spf=pass (sender IP is 192.0.2.1) smtp.mailfrom=example.com;
-///       dkim=pass header.d=example.com header.s=selector1
-/// A single authentication method result.
+/// Serialized as `method=result (reason) ptype.property=value`.
 pub const MethodResult = struct {
     method: []const u8,
     result: []const u8,
@@ -25,41 +19,10 @@ pub const MethodResult = struct {
     };
 };
 
-/// The marker `securedkim` puts on a result from a key published `t=y`, and that
-/// `securedmarc` refuses to count as an aligned pass (audit D-11).
+/// Marker for a DKIM result produced with a testing (`t=y`) key.
 ///
-/// RFC 6376 §3.6.1 requires that verifiers "MUST NOT treat messages from Signers
-/// in testing mode differently from unsigned email", while also allowing that
-/// "Verifiers MAY wish to track testing mode results to assist the Signer". Those
-/// pull in opposite directions only if the result and the action are conflated.
-/// The result is reported truthfully -- a signer publishes a testing key precisely
-/// to learn whether it verifies, and `dkim=none` would withhold the one fact they
-/// asked for -- and the *action* is suppressed instead.
-///
-/// OpenDKIM draws the line in the same place, and its A-R output was checked
-/// rather than assumed: `dkimf_ar_all_sigs` never consults `DKIM_SIGFLAG_TESTKEY`,
-/// so a test key is reported as a plain `dkim=pass` with no annotation whatever.
-/// The flag is read in exactly two places, both of which skip the signature when
-/// choosing a domain for *reputation*. Result reported, action suppressed.
-///
-/// We need the marker OpenDKIM does without because the boundary is different.
-/// Its reputation code is in-process and reads `DKIM_SIGINFO` flags directly;
-/// `securedmarc` is a separate daemon whose only input is this header, so the fact
-/// has to survive serialization or it does not reach the code that must act on it.
-///
-/// RFC 8601 §2.4 defines exactly this mechanism -- the `policy` ptype indicates
-/// "some local policy mechanism was applied that augments or even replaces ... the
-/// result returned by the authentication mechanism" -- and its worked example is
-/// nearly ours: `dkim=policy policy.dkim-rules=unsigned-subject`. It notes these
-/// are "arbitrary names selected by (and presumably used within) the ADMD", not
-/// registered with IANA. We augment rather than replace, which §2.4's "augments or
-/// even replaces" permits, because replacing would discard the real result.
-///
-/// Safe for anyone else's parser: §2.3 says "Results reported using unknown ptypes
-/// MUST NOT be used in making handling decisions. They can be safely ignored."
-///
-/// One definition, referenced by both daemons. Two hand-typed copies is how the
-/// four daemons came to disagree about the space after a colon.
+/// SecureDKIM reports the verification result and adds this local `policy`
+/// property; SecureDMARC preserves the result but excludes it from alignment.
 pub const testing_key_marker = struct {
     pub const ptype = "policy";
     pub const property = "dkim-rules";
@@ -103,10 +66,9 @@ pub fn build(allocator: Allocator, authserv_id: []const u8, results: []const Met
 
 /// May this byte stand unquoted in a `pvalue`?
 ///
-/// RFC 8601 §2.2 gives `pvalue` as an RFC 2045 `value` (token / quoted-string) or
-/// an address/domain. The set below is the intersection that needs no quoting and
-/// still covers every legitimate value we emit -- domains, addresses and
-/// selectors. Everything else, `;` and SP included, gets quoted.
+/// RFC 8601 §2.2 permits an RFC 2045 `value` (token / quoted-string) or an
+/// address/domain. This safe bare subset covers common domain, address, and
+/// selector forms; every other value, including `;` and SP, is quoted.
 fn isPvalueSafe(ch: u8) bool {
     return switch (ch) {
         'A'...'Z', 'a'...'z', '0'...'9' => true,
@@ -117,26 +79,9 @@ fn isPvalueSafe(ch: u8) bool {
 
 /// Write one `pvalue`, quoting it when it cannot stand bare.
 ///
-/// THE VALUES REACHING HERE ARE CHOSEN BY THE SENDER: `smtp.helo` is the SMTP
-/// HELO string verbatim, `smtp.mailfrom` comes off the envelope, and
-/// `header.d`/`header.s` are tags lifted from a DKIM-Signature. Appended raw --
-/// as they were -- a `;` closed our result group and opened one of the sender's,
-/// inside a header carrying our own authserv-id and written after the X-1
-/// scrubber had already run. Measured against the lab, not reasoned about:
-/// `HELO x;spf=pass header.d=victim.example` was delivered as
-/// `spf=fail ... smtp.helo=x;spf=pass header.d=victim.example`, and through the
-/// relay that text ended up inside the AAR, under the seal. Postfix rewrites both
-/// the `;` and the space to `?` in Received while handing the milter the original
-/// string, which is why nothing downstream of us ever showed it.
-///
-/// Quoting rather than stripping: a quoted-string is what the grammar already
-/// provides for, `parseResults` has always read one, and it keeps the operator's
-/// diagnostic -- the odd HELO stays legible instead of being silently mangled.
-///
-/// Control bytes are replaced, never merely quoted. CR and LF are illegal inside
-/// a quoted-string and would end the header field outright; X-5 established that
-/// header-derived values reach a milter with bare-LF folding intact, so this is a
-/// reachable path to injecting a whole header rather than a stray token.
+/// Values may originate with the sender. Quoting keeps delimiters inside the
+/// property value; control bytes are replaced because they cannot appear in a
+/// quoted string without creating a header-injection boundary.
 fn appendPvalue(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
     var needs_quoting = value.len == 0;
     for (value) |ch| {
@@ -165,13 +110,9 @@ fn appendPvalue(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8
     try buf.append(allocator, '"');
 }
 
-/// Write comment text, keeping it inside its parentheses.
+/// Write comment text, escaping comment delimiters and control bytes.
 ///
-/// Every `reason` we pass today is one of our own literals, so nothing here is
-/// sender-chosen yet. It is escaped anyway because the parenthesis is one
-/// unbalanced character away from being the same defect as `appendPvalue`
-/// documents, and the next caller to pass a sender-derived reason will not think
-/// to check.
+/// This keeps future sender-derived reasons inside the RFC 8601 comment.
 fn appendComment(allocator: Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
     for (text) |ch| {
         if (ch < 0x20 or ch == 0x7f) {
@@ -221,11 +162,8 @@ pub fn authservId(header_value: []const u8) []const u8 {
 
 /// Iterator over the `method=result` pairs of an Authentication-Results value.
 ///
-/// `parseResults` is a thin allocating wrapper around this iterator, so any
-/// code that decides whether a header *asserts* a given method sees exactly
-/// what a consumer of that header would read. That equivalence is what makes
-/// forged-header removal sound: a header cannot be interpreted as carrying a
-/// result that the removal logic failed to notice.
+/// Consumers and forged-header removal share this parser so they cannot disagree
+/// about which methods a header asserts.
 pub const ResultIterator = struct {
     rest: []const u8,
 
@@ -322,10 +260,9 @@ pub fn assertsMethodOutside(header_value: []const u8, allowed: []const []const u
     return false;
 }
 
-/// Parse an Authentication-Results header to extract method results.
+/// Parse method results from an Authentication-Results header.
 ///
-/// This is a simplified parser that extracts method=result pairs.
-/// Used by SecureDMARC to read SPF and DKIM results from upstream milters.
+/// SecureDMARC uses these upstream SPF and DKIM results.
 pub fn parseResults(allocator: Allocator, header_value: []const u8) !ParsedHeader {
     var parsed = ParsedHeader{
         .authserv_id = authservId(header_value),
@@ -355,13 +292,10 @@ pub const ParsedHeader = struct {
     pub const ParsedResult = struct {
         method: []const u8,
         result: []const u8,
-        /// The properties belonging to *this* result: the text between its
-        /// result token and the next real semicolon.
+        /// Properties between this result token and the next syntactic semicolon.
         ///
-        /// Keeping the span per result is the whole point (audit M-6). Reading
-        /// `header.d=` by searching the entire header value lets DMARC pair a
-        /// domain from one assertion with the result of another, which is a
-        /// bypass when the two disagree.
+        /// Keeping this span prevents a property from one assertion being paired
+        /// with the verdict of another.
         props: []const u8 = "",
 
         pub fn properties(self: ParsedResult) PropertyIterator {
@@ -432,23 +366,16 @@ test "D-11: a testing-key result keeps its real verdict and carries the policy m
     const header = try build(std.testing.allocator, "mail.example.com", results);
     defer std.testing.allocator.free(header);
 
-    // The real result survives. `dkim=none` here would withhold from the signer
-    // the single fact a testing key is published to establish.
+    // A testing key reports its actual DKIM verdict.
     try std.testing.expect(mem.indexOf(u8, header, "dkim=pass") != null);
     try std.testing.expect(mem.indexOf(u8, header, "header.d=example.com") != null);
 
-    // The exact octets `securedmarc` matches on. Pinned as a literal rather than
-    // built from the constants: a test assembled from the same constants as the
-    // code would still pass if someone renamed the property, and the whole point
-    // of this string is that two separate daemons agree on it.
+    // Pin the cross-daemon wire format independently of the shared constants.
     try std.testing.expect(mem.indexOf(u8, header, "policy.dkim-rules=testing-key") != null);
 }
 
 test "D-11: the testing-key marker survives the parser that reads it" {
-    // The producing side is only half of it. This marker crosses a process
-    // boundary, so what matters is that the parser on the far side recovers the
-    // same ptype/property/value -- if the emitted form did not round-trip,
-    // securedkim would be marking results that securedmarc could never see.
+    // The marker crosses daemons, so it must round-trip through the parser.
     const results = &[_]MethodResult{.{
         .method = "dkim",
         .result = "pass",
@@ -473,8 +400,6 @@ test "D-11: the testing-key marker survives the parser that reads it" {
 
         var props = PropertyIterator{ .rest = method_result.props };
         while (props.next()) |p| {
-            // The iterator hands back the whole `ptype.property` token as `name`,
-            // so that is what the far side has to compare against.
             if (mem.eql(u8, p.name, testing_key_marker.ptype ++ "." ++ testing_key_marker.property) and
                 mem.eql(u8, p.value, testing_key_marker.value))
             {
@@ -554,8 +479,7 @@ test "build none" {
 }
 
 test "M-6: a semicolon in a comment does not manufacture a result" {
-    // Everything from '(' is one comment. There is no spf result in this
-    // header; a scan for ';' used to find one and report spf=pass.
+    // A semicolon inside a comment is not a result separator.
     const forged = "mail.example.com; dkim=fail (note; spf=pass ) header.d=a.test";
 
     var parsed = try parseResults(std.testing.allocator, forged);
@@ -566,9 +490,7 @@ test "M-6: a semicolon in a comment does not manufacture a result" {
 }
 
 test "M-6: the scrubber and the consumer agree about the comment" {
-    // The X-1 removal is only sound while these two see the same results. If
-    // the parser ever stops treating the comment as opaque, this fails next to
-    // the test above rather than silently opening a strip bypass.
+    // Scrubbing must use the same comment-aware interpretation as consumers.
     const forged = "mail.example.com; dkim=fail (note; spf=pass ) header.d=a.test";
 
     try std.testing.expect(!assertsAnyMethod(forged, &.{"spf"}));
@@ -576,8 +498,7 @@ test "M-6: the scrubber and the consumer agree about the comment" {
 }
 
 test "M-6: a property belongs to its own result" {
-    // The bypass: 'header.d=victim.test' sits in a comment on the spf result,
-    // and a whole-value search for "header.d=" paired it with the dkim=pass.
+    // Properties in comments cannot be paired with another result's verdict.
     const value = "mail.example.com; spf=fail (header.d=victim.test ) ; dkim=pass header.d=attacker.test";
 
     var parsed = try parseResults(std.testing.allocator, value);
@@ -622,17 +543,7 @@ test "M-6: a result followed only by a comment still parses" {
     try std.testing.expectEqualStrings("pass", parsed.getResult("spf").?);
 }
 
-// A sender-chosen property value must not be able to forge a result.
-//
-// The lab payload, verbatim: `HELO x;spf=pass header.d=victim.example`. Both the
-// semicolon and the space reach the milter -- Postfix rewrites them to `?` in
-// Received, which is why this never showed downstream -- and appended raw they
-// closed our `spf=fail` group and opened one of the sender's, inside a header
-// carrying our own authserv-id. `spf` is the method used here on purpose: the
-// X-1 scrubber in each daemon removes only the methods that daemon produces, and
-// securespf's has already run by the time it stamps, so nothing downstream
-// removes it. Delivered intact, and through the relay it landed inside the AAR
-// under the ARC seal.
+// Sender-controlled property values must not forge additional results.
 test "a semicolon in a property value cannot open a new result group" {
     const value = try build(std.testing.allocator, "mail.example.org", &.{
         .{
@@ -649,33 +560,20 @@ test "a semicolon in a property value cannot open a new result group" {
     var parsed = try parseResults(std.testing.allocator, value);
     defer parsed.deinit(std.testing.allocator);
 
-    // One group, not two. The forged one would also be an `spf`, so counting is
-    // what catches it -- `getResult("spf")` returns the first either way.
+    // Counting detects the forged duplicate even when the method name matches.
     try std.testing.expectEqual(@as(usize, 1), parsed.results.items.len);
     try std.testing.expectEqualStrings("fail", parsed.results.items[0].result);
 
-    // And the payload survives as data: still one property, still the whole
-    // string, so an operator reading the header sees the odd HELO rather than a
-    // silently truncated one.
-    //
-    // Returned WITH its quotes, because `property` hands back the pvalue as it
-    // appears rather than unquoting it. That is the safe direction and is left
-    // alone deliberately: a quoted value can only fail to match a domain it is
-    // compared against, never match one it should not, so alignment cannot be
-    // talked into a pass by quoting. Unquoting here would be more faithful to
-    // RFC 8601 and is a separate change with its own alignment analysis.
+    // The value remains data and stays quoted; parsing does not unquote pvalues.
     try std.testing.expectEqualStrings(
         "\"x;spf=pass header.d=victim.example\"",
         parsed.results.items[0].property("smtp.helo").?,
     );
-    // Nothing acquired a domain it was not given.
     try std.testing.expect(parsed.results.items[0].property("header.d") == null);
 }
 
 test "a control byte in a property value cannot end the header field" {
-    // Reachable per X-5: header-derived values arrive with bare-LF folding
-    // intact, and securedkim puts a signature's `d=` into `header.d`. A raw LF
-    // here would terminate the field and make the rest a new header.
+    // A control byte must not terminate this field and inject another.
     const value = try build(std.testing.allocator, "mail.example.org", &.{
         .{
             .method = "dkim",
@@ -687,7 +585,7 @@ test "a control byte in a property value cannot end the header field" {
     });
     defer std.testing.allocator.free(value);
 
-    // The only CRLF in the output is the one `build` folds with.
+    // `build` adds only its own folding CRLF.
     try std.testing.expectEqual(@as(usize, 1), mem.count(u8, value, "\r\n"));
     try std.testing.expect(mem.indexOf(u8, value, "\r\nX-Injected") == null);
 }
@@ -711,8 +609,7 @@ test "a quote in a property value cannot end the quoted string" {
 }
 
 test "ordinary values are still emitted bare" {
-    // The quoting must not fire on the values we actually emit, or every A-R in
-    // production changes shape and the diff hides the one case that matters.
+    // Common emitted values retain their standard unquoted representation.
     const value = try build(std.testing.allocator, "mail.example.org", &.{
         .{
             .method = "dkim",

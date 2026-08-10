@@ -7,45 +7,11 @@ const codec = @import("milter/codec.zig");
 const responses = @import("milter/responses.zig");
 const log = @import("log.zig");
 
-/// Writing an `Authentication-Results` field, and what to do when that fails.
-///
-/// The counterpart to `header_scrub`, which removes forged A-R fields: this
-/// writes the genuine one. It exists as a shared module because all four daemons
-/// had the same defect in their own copy of this code (audit X-9).
-///
-/// Each daemon built the header value, built the milter packet and wrote it, and
-/// swallowed every failure along the way:
-///
-/// ```
-/// const value = auth_results.build(...) catch return continue;   // no header
-/// const payload = responses.addHeader(...) catch return continue; // no header
-/// codec.writePacket(conn.fd, payload) catch {};                   // no header
-/// return accept;                                                  // "success"
-/// ```
-///
-/// A message then reached the next hop with **no result for that method** while
-/// the daemon reported success. That is not a cosmetic omission, because the
-/// daemons read each other's output: `securedmarc` derives its verdict from the
-/// `spf=` and `dkim=` fields the others wrote, so a silently dropped `spf=`
-/// stamp makes DMARC evaluate on partial evidence and can invert its verdict. A
-/// message that would have passed on an aligned SPF pass can be rejected under
-/// `p=reject` because this host could not allocate a header.
-///
-/// The rule, the same one A-12a established for the ARC chain: **a local fault
-/// is never charged to the sender.** If we cannot record what we found, we defer
-/// and let the sender retry, rather than delivering a message that misrepresents
-/// what we checked.
 /// Build and write one `Authentication-Results` field.
 ///
-/// The whole value and its packet are built before anything is written, so an
-/// allocation failure cannot leave a partial header on the wire. That ordering
-/// matters for the same reason it did in X-8: a milter `addHeader` packet cannot
-/// be recalled once written.
-///
-/// `leading_space` must come from `conn.negotiated_protocol.header_leading_space`
-/// -- what the MTA agreed to, not what the daemon requested. Under
-/// `SMFIP_HDR_LEADSPC` the milter owns the space after the colon; see
-/// `responses.addHeader` for why that is not cosmetic and why it has no default.
+/// A caller must defer the message if this fails, rather than delivering without
+/// the result. The complete value and milter packet are built before writing.
+/// `leading_space` comes from negotiated protocol capabilities.
 pub fn stamp(
     allocator: Allocator,
     fd: posix.fd_t,
@@ -62,16 +28,10 @@ pub fn stamp(
     try codec.writePacket(fd, payload);
 }
 
-/// The milter response to send when `stamp` fails: defer, and say why.
+/// Return a temporary failure when `stamp` fails and log the missing method.
 ///
-/// Returned rather than sent, because the success path differs between daemons
-/// and roles — some accept, some continue — while the *failure* policy must be
-/// identical everywhere. That uniformity is the point of X-9: four daemons had
-/// four different silent behaviours for the same fault.
-///
-/// `method` names the result that was lost (`"spf"`, `"dkim"`, `"dmarc"`,
-/// `"arc"`) so an operator reading the log knows which verdict is missing and
-/// therefore which downstream decision was affected.
+/// Callers retain their distinct success actions, but all must defer rather than
+/// deliver without the local authentication result.
 pub fn deferCode(err: anyerror, method: []const u8) u8 {
     log.err(
         "deferring: could not record the {s} result ({s}); delivering without it would " ++
@@ -108,14 +68,8 @@ test "stamp writes one complete Authentication-Results field" {
 }
 
 test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not" {
-    // The defect this guards: two daemons negotiated `header_leading_space` for
-    // D-23's benefit on the input side and kept writing output as though they
-    // had not, so Postfix -- which stops inserting the space once the flag is
-    // agreed -- delivered `Authentication-Results:mail.test;` from them and
-    // `Authentication-Results: mail.test;` from the two that never asked.
-    //
-    // Asserted on the wire bytes rather than on the rendered header, because the
-    // rendered header is the MTA's business and this is the only part we own.
+    // The negotiated flag transfers ownership of this separator to the milter.
+    // Assert the packet bytes, which are the part this module owns.
     for ([_]bool{ false, true }) |leading_space| {
         const fds = try posix.pipe2(.{ .NONBLOCK = true });
         defer posix.close(fds[0]);
@@ -129,10 +83,7 @@ test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not
         const n = try posix.read(fds[0], &buf);
         const packet = buf[0..n];
 
-        // On the wire: uint32 length, then 'h' name NUL value NUL. The length
-        // prefix is `codec.writePacket`'s, not `addHeader`'s -- getting that
-        // wrong is what made the first version of this test read a byte out of
-        // the middle of the header name and still look plausible.
+        // Packet layout: length prefix, `h`, name NUL, then value NUL.
         const name = "Authentication-Results";
         const value_start = 4 + 1 + name.len + 1;
         try std.testing.expect(packet.len > value_start);
@@ -149,12 +100,7 @@ test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not
 }
 
 test "stamp writes nothing at all when it cannot build the header" {
-    // Stated as a property over every allocation `stamp` performs, so it cannot
-    // rot as the internals of `build` or `addHeader` change: for each failure
-    // point the socket must receive either the whole field or nothing.
-    //
-    // A half-written A-R field would be worse than a missing one -- the next hop
-    // would parse whatever arrived as a complete statement about the message.
+    // Every allocation failure must leave the socket without a partial field.
     var fail_index: usize = 0;
     var saw_success = false;
     var saw_failure = false;
@@ -191,8 +137,7 @@ test "stamp writes nothing at all when it cannot build the header" {
 }
 
 test "a stamping failure defers rather than accepting" {
-    // The defect being guarded against is a daemon that reports success after
-    // failing to record its own result.
+    // A missing local result must defer, not report success.
     const code = deferCode(error.OutOfMemory, "spf");
     try std.testing.expectEqual(@intFromEnum(responses.Code.tempfail), code);
     try std.testing.expect(code != @intFromEnum(responses.Code.accept));
