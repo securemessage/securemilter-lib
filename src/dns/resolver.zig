@@ -164,10 +164,9 @@ pub const Resolver = struct {
         // A TC=1 answer is incomplete, and RFC 7766 §5 makes retrying it over TCP
         // mandatory rather than optional. EDNS0 raises the ceiling but does not
         // remove it, and a resolver may still answer TC=1 with an *empty* answer
-        // section -- which a caller cannot tell apart from NXDOMAIN. Before this
-        // existed, `truncated` was parsed, asserted in the tests, and then read
-        // by nobody, so Yahoo scored spf=none and every Microsoft 365 sender
-        // scored dkim=permerror.
+        // section -- which a caller cannot tell apart from NXDOMAIN. Ignoring
+        // `truncated` here would score real senders with oversized records
+        // (e.g. Microsoft 365's DKIM keys) as if the record did not exist.
         //
         // A failed retry deliberately falls through to whatever the UDP answer
         // held, rather than erroring. A partial answer is still better evidence
@@ -258,13 +257,11 @@ pub const Resolver = struct {
     /// One server's worth of UDP attempts, or null when it did not answer.
     ///
     /// The socket's family must be the SERVER's, and the configured list may
-    /// mix families, so the socket is per server rather than per query. The
-    /// previous shape created one AF.INET socket per query: a v6 nameserver
-    /// then failed at sendto with EADDRNOTAVAIL in 0ms, which surfaced as
-    /// "DNS lookup failed transiently" against a resolver that was answering
-    /// drill on the same address. Caught by the 9.3 v6-only lab set, where
-    /// EVERY nameserver is v6. The TCP path below already does this right
-    /// (`addr.any.family`); this is the UDP side of the same rule.
+    /// mix families, so the socket is per server rather than per query: a fixed
+    /// AF.INET socket would fail at sendto with EADDRNOTAVAIL against a v6
+    /// nameserver, in 0ms, surfacing as "DNS lookup failed transiently" against
+    /// a resolver that answers correctly. The TCP path below already does this
+    /// right (`addr.any.family`); this is the UDP side of the same rule.
     fn udpServerQuery(self: *Resolver, addr: net.Address, query: []const u8) !?[]u8 {
         const sock = try posix.socket(
             @intCast(addr.any.family),
@@ -410,12 +407,10 @@ fn parseNameserver(host: []const u8, port: u16) !net.Address {
 }
 
 test "UDP query to an IPv6 nameserver" {
-    // Caught by the 9.3 v6-only lab set (2026-08-08): sendAndReceive created
-    // one AF.INET socket per query, so a v6 nameserver failed at sendto with
-    // EADDRNOTAVAIL in 0ms and every lookup on the v6-only jails came back
-    // "DNS lookup failed transiently" while drill answered on the same
-    // address. The responder below binds ::1 ONLY, so a v4 socket cannot
-    // reach it in principle -- the test cannot pass vacuously.
+    // A resolver that opened a fixed AF.INET socket per query would fail at
+    // sendto with EADDRNOTAVAIL against a v6-only nameserver. The responder
+    // below binds ::1 ONLY, so a v4 socket cannot reach it in principle -- the
+    // test cannot pass vacuously.
     const srv = try posix.socket(posix.AF.INET6, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     defer posix.close(srv);
     const bind_addr = try net.Address.parseIp6("::1", 0);

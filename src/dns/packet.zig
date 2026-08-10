@@ -510,17 +510,17 @@ test "pointer past end of packet" {
 }
 
 test "valid pointer chain in answer name" {
-    // Craft a response with an answer whose name uses a pointer chain:
-    // At offset 12: literal "a" (1 byte label + root) — used as pointer target
-    // Answer at offset 15 uses a pointer to offset 12
+    // Craft a response with an answer whose name is a pointer to a literal
+    // "a\0" placed after the answer's own fixed fields, so the pointer target
+    // does not overlap the TYPE/CLASS/TTL/RDLENGTH/RDATA bytes that follow it.
     var data = [_]u8{0} ** 40;
     mem.writeInt(u16, data[0..2], 0x9999, .big); // ID
     mem.writeInt(u16, data[6..8], 1, .big); // ANCOUNT=1
     // qdcount=0, so answer section starts at offset 12
 
-    // Answer name: pointer to offset 20 which has "a\0"
+    // Answer name: pointer to offset 28
     data[12] = 0xC0;
-    data[13] = 20;
+    data[13] = 28;
     // TYPE=A(1)
     mem.writeInt(u16, data[14..16], 1, .big);
     // CLASS=IN(1)
@@ -535,16 +535,7 @@ test "valid pointer chain in answer name" {
     data[26] = 2;
     data[27] = 1;
 
-    // At offset 20: literal name "a\0" (the pointer target)
-    data[20] = 1;
-    data[21] = 'a';
-    data[22] = 0; // Wait, this overlaps with TTL bytes
-
-    // The overlap makes this test invalid. Reconstruct without overlap:
-    // Let's put the pointer target AFTER the answer data, at offset 28
-    data[12] = 0xC0;
-    data[13] = 28; // pointer to offset 28
-    // Name target at offset 28
+    // At offset 28: literal name "a\0" (the pointer target)
     data[28] = 1;
     data[29] = 'a';
     data[30] = 0;

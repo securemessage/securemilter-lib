@@ -257,20 +257,18 @@ pub threadlocal var logger: Logger = Logger{
 
 /// The one live logging configuration, HELD BY VALUE AND NOT BY POINTER.
 ///
-/// It used to be a `*const LogConfig` aimed at whatever the caller passed, with a doc
-/// comment requiring that the caller's config outlive every logger. All four daemons
-/// broke that rule in the same way: the config was a `const` local in `main`, so the
-/// pointer dangled the moment that frame returned.
+/// A `*const LogConfig` aimed at a caller-supplied config would require that
+/// config to outlive every logger -- but `main`'s config is naturally a `const`
+/// local, so a pointer to it dangles the moment that frame returns. The
+/// dangling pointer is latent for as long as nothing logs after `main`'s body,
+/// which `bootstrap`'s fatal-disposition line does (audit X-16): a read of a
+/// dead stack frame there prints the ident as `__[pid]: fatal: ...` on the one
+/// log line an operator has to diagnose a daemon that would not start.
 ///
-/// Latent for as long as nothing logged after `main`'s body -- and then X-16 added the
-/// one thing that does. The disposition line came out as `__[69398]: fatal: ...`,
-/// reading a dead stack frame for the ident, on the single log line an operator has to
-/// diagnose a daemon that would not start.
-///
-/// `LogConfig` is plain data -- the ident is an inline `[64]u8`, not a slice -- so
-/// copying costs one 70-byte assignment at startup and makes the lifetime question
-/// disappear rather than be documented. Every logger points here, and this outlives
-/// every thread.
+/// `LogConfig` is plain data -- the ident is an inline `[64]u8`, not a slice --
+/// so copying costs one 70-byte assignment at startup and removes the lifetime
+/// question rather than merely documenting it. Every logger points here, and
+/// this outlives every thread.
 var global_config: LogConfig = LogConfig.init(false, .mail, .info, "securemilter");
 
 /// Initialize the global logging configuration.
@@ -317,14 +315,10 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
 // -----------------------------------------------------------------------
 
 test "initGlobal copies, so a caller's stack local cannot dangle" {
-    // Found by X-16, not by reading: every daemon passed `&log_cfg` where `log_cfg`
-    // was a local in `main`. Nothing logged after that frame died, so it never showed
-    // -- until the fatal-disposition line did exactly that and printed its ident out
-    // of a dead stack frame as `__`.
-    //
-    // Simulating a returned frame is not something a test can do portably. Overwriting
-    // the caller's copy is the same aliasing question and is deterministic: if the
-    // global still points at `cfg`, it now reads the second value.
+    // Simulating a returned frame is not something a test can do portably.
+    // Overwriting the caller's copy after `initGlobal` is the same aliasing
+    // question and is deterministic: if the global still pointed at `cfg`
+    // instead of copying it, it would now read the second value (audit X-16).
     const saved = global_config;
     defer global_config = saved;
 

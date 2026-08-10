@@ -182,11 +182,11 @@ pub const Connection = struct {
     /// Actions the MTA granted during OPTNEG. A milter must not send a
     /// modification packet for an action that was not negotiated.
     negotiated_actions: negotiate.ActionFlags = .{},
-    /// Protocol flags the MTA granted during OPTNEG. Previously discarded: the
-    /// response was built and thrown away, so nothing downstream could know what
-    /// had been agreed. `header_leading_space` in particular changes what a
-    /// header value contains, and a milter that asks for it without checking
-    /// whether it got it would misread every header against an MTA that declined.
+    /// Protocol flags the MTA granted during OPTNEG. Must be retained, not just
+    /// used to build the response and discarded: `header_leading_space` in
+    /// particular changes what a header value contains, and a milter that asks
+    /// for it without checking whether it got it would misread every header
+    /// against an MTA that declined.
     negotiated_protocol: negotiate.ProtocolFlags = .{},
     /// Peer IP address of the milter TCP connection (the Postfix instance).
     /// Format: bare IP string (e.g., "10.99.0.1") or "local" for Unix sockets.
@@ -385,9 +385,9 @@ pub const Connection = struct {
     /// Prefers `{client_addr}` macro; falls back to SMFIC_CONNECT address (absent
     /// from default Postfix `milter_connect_macros`).
     ///
-    /// Returns optional: callers must not substitute a placeholder. "unknown" was
-    /// previously parsed as neither IPv4 nor IPv6, causing every SPF mechanism to
-    /// decline and evaluation to reach the terminal `-all` (false `fail`).
+    /// Returns optional: callers must not substitute a placeholder. A literal
+    /// "unknown" parses as neither IPv4 nor IPv6, so every SPF mechanism would
+    /// decline and evaluation would reach the terminal `-all` (false `fail`).
     pub fn clientAddr(self: *const Connection) ?[]const u8 {
         if (self.macros.client_addr) |m| {
             if (m.len > 0) return m;
@@ -436,9 +436,9 @@ pub const Connection = struct {
 
     /// The accumulated body, or null if it is not the whole body.
     ///
-    /// Optional rather than empty slice: previously callers could not distinguish
-    /// an incomplete body from a genuinely empty one, producing bogus verdicts.
-    /// Null forces the caller to decide.
+    /// Optional rather than empty slice: an incomplete body must be distinguishable
+    /// from a genuinely empty one, since either could otherwise produce a bogus
+    /// verdict. Null forces the caller to decide.
     pub fn getBody(self: *const Connection) ?[]const u8 {
         if (self.body_overflow) return null;
         return self.body.items;

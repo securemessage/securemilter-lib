@@ -65,8 +65,8 @@ pub const Config = struct {
         }
 
         /// Read comma-separated list: trimmed, non-empty parts. Zero-length if absent/empty.
-        /// Five hand-rolled copies existed (one per daemon + `securearc`); one leaked
-        /// on SIGHUP due to `toOwnedSlice` ownership transfer. One copy with a test fixes it.
+        /// One implementation shared by every daemon, so a `toOwnedSlice` ownership
+        /// mistake on SIGHUP cannot be made independently by each one.
         ///
         /// Returned strings borrow from `Config`; `allocator.free(result)` cleans the
         /// outer slice. Callers outliving their `Config` must duplicate contents (done

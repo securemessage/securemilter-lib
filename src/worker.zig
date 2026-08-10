@@ -502,10 +502,10 @@ pub const Worker = struct {
             _ = self.sendResponse(conn, @intFromEnum(responses.Code.@"continue"));
             return;
         };
-        // Store address before dispatching (same as helo/mail_from). Previously
-        // passed only to the callback, which no daemon registers; the address
-        // was lost, leaving only the optional {client_addr} macro (not in default
-        // Postfix `milter_connect_macros`).
+        // Store address before dispatching (same as helo/mail_from): the address
+        // must survive even when no daemon registers `on_connect`, since the
+        // optional {client_addr} macro is not in default Postfix
+        // `milter_connect_macros` and cannot be relied on as the only copy.
         conn.setConnectInfo(info) catch {};
         conn.state = .connected;
         const resp = if (self.callbacks.on_connect) |cb| cb(conn, info) else @intFromEnum(responses.Code.@"continue");

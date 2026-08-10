@@ -13,11 +13,10 @@ pub const startup_timeout_s: isize = 60;
 
 /// Double-fork daemonization: setsid, close fds, return readiness pipe.
 /// The parent reads the pipe; a byte means the daemon is serving, EOF means failure.
-/// Must signal via `signalReady` once listeners and workers are running.
-///
-/// Before this change, `daemonize` returned before listeners bound, so `service start`
-/// reported success while nothing listened. A typo in a listener address would
-/// silently produce exit 0, no listener, and unauthenticated mail (X-16).
+/// Must signal via `signalReady` once listeners and workers are running, not
+/// merely once daemonization completes: `service start` reporting success while
+/// nothing listened would let a typo in a listener address silently produce
+/// exit 0, no listener, and unauthenticated mail (audit X-16).
 pub fn daemonize() !posix.fd_t {
     // Create before first fork so both ends survive into grandchild.
     // CLOEXEC prevents exec'd children from inheriting the write end, which
@@ -119,9 +118,9 @@ fn livePidFileHolder(path: []const u8) ?c.pid_t {
 
 /// Check no other instance holds the PID file. Must run before `daemonize`.
 ///
-/// Originally inside `writePidFile` (post-fork), which was wrong: under `daemon -p`,
-/// the file named our own ancestor, so the daemon refused to start against itself.
-/// Running before the fork eliminates the ambiguity (X-16).
+/// Running this after the fork would make the file name our own ancestor under
+/// `daemon -p`, refusing to start against itself. Running before the fork
+/// eliminates the ambiguity (audit X-16).
 pub fn checkNotAlreadyRunning(path: []const u8) !void {
     const holder = livePidFileHolder(path) orelse return;
     if (holder == c.getpid() or holder == c.getppid()) return;
@@ -264,9 +263,8 @@ test "write and remove pid file" {
 }
 
 // --- L-5: PID file held by live process ----------------------------------
-// The first test version wrote its own PID and asserted refusal, conflating
-// "some live PID" with "a different live PID" — the defect itself. The self-case
-// and rival-case are now separated.
+// The self-case and rival-case are asserted separately, because "some live PID"
+// and "a different live PID" are not the same fact and must not be conflated.
 
 test "a pid file naming ourselves is not a second instance" {
     const path = "/tmp/securemilter-test-self.pid";
@@ -377,8 +375,8 @@ test "X-16: the ready byte releases the parent" {
 }
 
 test "X-16: a child that dies before signalling fails the parent" {
-    // Measured defect: child exits before signalling; parent sees EOF with no byte.
-    // Before this handshake, `service start` reported success with nothing listening.
+    // If the child exits before signalling, the parent must see EOF with no byte
+    // as a failure, not as a successful start with nothing listening.
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
