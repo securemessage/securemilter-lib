@@ -74,28 +74,19 @@ pub const ListenAddress = union(enum) {
     }
 };
 
-/// Resolve one `[listener:*]` section's `Socket` value, or fail loudly.
+/// Resolve one `[listener:*]` section's `Socket` value, or fail loudly (audit
+/// X-14).
 ///
-/// X-14. All four daemons previously wrote this as
-///
-///     const socket_str = section.get("Socket") orelse continue;
-///     const addr = ListenAddress.parse(socket_str) catch continue;
-///
-/// which discards an explicit operator instruction without a single word to
-/// syslog. Two things then made that unsafe rather than merely untidy:
-///
-///  1. If the discarded section was the *only* listener, the caller's
-///     "no listener sections" fallback fires and binds the loopback default
-///     instead. So the daemon does not fail to listen -- it listens somewhere
-///     else, having been told plainly where to listen. In the two daemons that
-///     carry a per-listener `Mode`, the fallback also supplies the *global*
-///     mode, so a mistyped `verify` listener can come up in whatever mode
-///     `[global] Mode` names. X-13's own note beside that fallback asks for a
-///     wide bind to be "written down deliberately, not inherited from an
-///     omitted config section" -- a typo made the section omitted.
-///  2. If it was one of several, that listener simply does not exist, and under
-///     Postfix's `milter_default_action = accept` an unreachable milter means
-///     mail is delivered unfiltered. Nothing distinguishes that from success.
+/// A missing or malformed `Socket` must never be silently discarded: if it was
+/// the only listener, the caller's "no listener sections" fallback would bind
+/// the loopback default instead -- so the daemon would not fail to listen, it
+/// would listen somewhere else, having been told plainly where to listen. In
+/// the two daemons that carry a per-listener `Mode`, that fallback also
+/// supplies the *global* mode, so a mistyped `verify` listener could come up in
+/// whatever mode `[global] Mode` names. If it was one of several listeners,
+/// that listener simply would not exist, and under Postfix's
+/// `milter_default_action = accept` an unreachable milter means mail is
+/// delivered unfiltered -- indistinguishable from success.
 ///
 /// So this refuses instead, and names the section and the value. There is no
 /// deployment that depends on a typo being ignored, and no man page promises a
@@ -262,9 +253,8 @@ test "parse inet with IPv6" {
     }
 }
 
-// X-14. `parse` used to accept any host string while `bind` accepts only a
-// literal IP, so a hostname passed config validation and then failed at bind --
-// by which point the failure had left the config parser and become a dead
+// X-14. `bind` accepts only a literal IP, so `parse` must reject a hostname
+// too: accepting one here and failing at bind turns a config error into a dead
 // worker thread. These pin the two halves to the same contract: if `parse`
 // accepts it, `bind` must be able to bind it.
 test "parse rejects a hostname, because bind cannot resolve one" {
@@ -287,10 +277,9 @@ test "parse rejects a repaired IPv6 literal (L-7)" {
 }
 
 test "parse rejects a misspelled scheme rather than reinterpreting it" {
-    // Each of these used to reach parseTcp as a whole and fail on the port,
-    // which is the right answer for the wrong reason -- and the caller
-    // discarded it silently either way. `inet6:` is the one an operator
-    // actually reaches for.
+    // Each of these falls through to parseTcp as a whole and fails on the
+    // port -- the right answer, since none is a recognised scheme. `inet6:`
+    // is the one an operator actually reaches for.
     try std.testing.expectError(error.InvalidPort, ListenAddress.parse("inet6:8891@::1"));
     try std.testing.expectError(error.InvalidPort, ListenAddress.parse("tcp:8891"));
     try std.testing.expectError(error.InvalidPort, ListenAddress.parse("unxi:/var/run/m.sock"));

@@ -12,7 +12,7 @@ const log_mod = @import("../log.zig");
 /// Maximum number of nameservers supported.
 pub const MAX_SERVERS = 8;
 
-/// Probe defaults, previously written as bare 53/5/2000 at four call sites.
+/// Probe defaults, named rather than repeated as bare literals at each call site.
 const PROBE_PORT = 53;
 const PROBE_INTERVAL_S = 5;
 const PROBE_TIMEOUT_MS = 2000;

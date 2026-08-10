@@ -9,11 +9,8 @@ const process = std.process;
 
 /// Exit status for an unrecoverable error.
 ///
-/// Was 1 in `securespf-check` and `securedkim-sign` and 2 everywhere else. The
-/// harnesses only test `returncode != 0`, so nothing depended on the difference --
-/// but a tool's exit status is the gate signal, and having it mean two things
-/// depending on which daemon you asked was a trap waiting for the first harness that
-/// tried to tell "the tool broke" from "the case failed".
+/// One value for every tool: a harness telling "the tool broke" from "the case
+/// failed" must not have that distinction depend on which daemon's tool it ran.
 pub const EXIT_FATAL: u8 = 2;
 
 /// Write all of `data` to `fd`, or give up silently.
@@ -64,11 +61,9 @@ pub fn Tool(comptime prog: []const u8) type {
 
         /// Report `msg` prefixed with the tool name and exit `EXIT_FATAL`.
         ///
-        /// `noreturn` rather than `void`. `securearc-check`'s copy was declared
-        /// `void` while every other one was `noreturn`, even though it ends in
-        /// `process.exit` just the same -- so the compiler could not prove control
-        /// flow stopped there, and a caller was free to write unreachable code after
-        /// it and get no warning.
+        /// `noreturn`, not `void`: it ends in `process.exit`, and declaring it
+        /// otherwise would let the compiler accept unreachable code after a call
+        /// to this with no warning.
         pub fn fatal(msg: []const u8) noreturn {
             errFn(prog);
             errFn(": ");

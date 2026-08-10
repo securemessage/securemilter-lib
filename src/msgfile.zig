@@ -12,12 +12,9 @@ const connection = @import("connection.zig");
 
 /// The daemon's own header type, not a copy of it.
 ///
-/// The earlier securearc copy defined its own structurally identical `Field` on
-/// the grounds that the module "sits below both and should not have to pick
-/// one". Here that reasoning inverts: this module sits beside `connection`, and
-/// picking its type is the whole point -- `had_space` is exactly the field a
-/// re-typed copy loses without saying so (audit D-23), and every consumer was
-/// converting back to it anyway.
+/// A re-typed copy would lose `had_space` without saying so (audit D-23), and
+/// every consumer needs it converted back anyway, so this module uses
+/// `connection`'s type directly rather than defining its own.
 pub const Header = connection.Header;
 
 const splitLeadingSpace = connection.splitLeadingSpace;
@@ -43,8 +40,6 @@ pub const Message = struct {
     /// verbatim rather than normalised to one space.
     ///
     /// Allocated from the message's own arena, so `deinit` is the only cleanup.
-    /// Both callers previously kept a hand-rolled free loop for this, and one of
-    /// them rendered the same field twice.
     pub fn rendered(self: *Message) ![]const []const u8 {
         const a = self.arena.allocator();
         const out = try a.alloc([]const u8, self.headers.len);
@@ -129,14 +124,12 @@ pub fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) 
 /// one, so this models both halves — `value` as the daemon sees it, and
 /// `had_space` so the field can be rebuilt verbatim for `simple`.
 ///
-/// **Exactly one SP, and never a TAB.** D-23's open question is answered: both
-/// Postfix 3.11.5 and FreeBSD base sendmail strip one leading SP if and only if
-/// one is present, and leave a TAB alone (§11.40, and
-/// `securemilter/measurements/d23-header-wsp/` in engineering-docs). This line
-/// used to strip a leading TAB
-/// as well, which no MTA does — so for `Name:<TAB>value` it handed the verifier
-/// a byte sequence production never produces, in the module whose one job is to
-/// predict production.
+/// **Exactly one SP, and never a TAB.** Both Postfix 3.11.5 and FreeBSD base
+/// sendmail strip one leading SP if and only if one is present, and leave a TAB
+/// alone (§11.40, and `securemilter/measurements/d23-header-wsp/` in
+/// engineering-docs, audit D-23). Stripping a leading TAB too would hand the
+/// verifier `Name:<TAB>value` split as no MTA ever delivers it, in the module
+/// whose one job is to predict production.
 ///
 /// Continuation lines keep their own leading whitespace, which is also what the
 /// MTA delivers.
@@ -184,8 +177,8 @@ test "one space after the colon is removed, further whitespace is data" {
 
     try std.testing.expectEqual(@as(usize, 3), msg.headers.len);
     try std.testing.expectEqualStrings("a@b.c", msg.headers[0].value);
-    // The second space survives, and D-23's question is now answered by
-    // measurement rather than pinned as a guess: the MTA removes one, not all.
+    // The second space survives: the MTA removes one leading SP, not all
+    // whitespace (audit D-23).
     try std.testing.expectEqualStrings(" two spaces", msg.headers[1].value);
     try std.testing.expectEqualStrings("none", msg.headers[2].value);
     try std.testing.expectEqualStrings("body\r\n", msg.body);
@@ -197,8 +190,8 @@ test "one space after the colon is removed, further whitespace is data" {
 }
 
 test "a leading TAB is data, not a separator" {
-    // Measured: neither Postfix nor sendmail strips a TAB. This parser used to,
-    // which made `Name:<TAB>value` unhashable under c=simple in exactly the tool
+    // Measured: neither Postfix nor sendmail strips a TAB, so stripping one here
+    // would make `Name:<TAB>value` unhashable under c=simple in exactly the tool
     // that exists to predict the daemon.
     const a = std.testing.allocator;
     var msg = try parseMessage(a, "X-Tab:\tvalue\r\n\r\n", true);

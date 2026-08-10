@@ -11,13 +11,14 @@ pub const Header = struct {
     /// Whether a space followed the colon on the wire (D-23).
     /// Without `SMFIP_HDR_LEADSPC` the MTA strips one leading SP if present (never
     /// TAB). `c=simple` hashes the field verbatim, so the wrong separator breaks
-    /// verification. This bit is unrecoverable after stripping: `Name:value` and
-    /// `Name: value` reach a milter identically.
-    /// Defaults `true` (pre-flag MTA behaviour); worker sets from wire once negotiated.
+    /// verification, and the bit is unrecoverable once stripped: `Name:value` and
+    /// `Name: value` reach a milter identically. Defaults `true` (pre-flag MTA
+    /// behaviour); the worker sets it from the wire once the flag is negotiated.
     had_space: bool = true,
 
-    /// Rebuild field as it appeared on the wire. Single definition of the
-    /// name:value separator (was 8 copies of `"{s}: {s}"`).
+    /// Rebuild field as it appeared on the wire. The single definition of the
+    /// name:value separator; every caller renders through this rather than
+    /// its own `"{s}: {s}"`.
     pub fn render(self: Header, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}:{s}{s}", .{
             self.name,

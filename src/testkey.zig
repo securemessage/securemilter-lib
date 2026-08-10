@@ -1,8 +1,7 @@
 //! Shared `-testkey` implementation: compares DNS public key to local private key.
 //!
-//! `securedkim-testkey` and `securearc-testkey` were 244/246 lines differing in
-//! 18 (name, usage prose, one warning). Two untested copies can disagree about
-//! whether an operator's key is deployed correctly.
+//! One implementation for both products that have keys, so they cannot disagree
+//! about whether an operator's key is deployed correctly.
 //!
 //! Crypto package is a parameter (not a dependency) to avoid linking OpenSSL
 //! into `securespf` and `securedmarc` (which have no keys).
@@ -179,11 +178,9 @@ pub fn Tool(comptime xcrypto: type, comptime opts: Options) type {
 
             if (crypto.keyFileMode(path)) |mode| {
                 if (mode & 0o077 != 0) {
-                    // `crypto.KEY_PERMISSIONS_ADVICE` rather than a third wording of
-                    // it. Both copies used to say "chmod 600 to fix" and stop there;
-                    // the shared advice also says to `chown` the key to the user the
-                    // daemon drops to, which is the half that had been missing and
-                    // the half that bites after a privilege drop.
+                    // `crypto.KEY_PERMISSIONS_ADVICE` includes `chown` to the user the
+                    // daemon drops to, not just `chmod 600`, since a mode fix alone
+                    // still fails after a privilege drop.
                     const msg = try std.fmt.allocPrint(
                         allocator,
                         "warning: {s} is mode {o}, {s}.\n" ++
@@ -197,9 +194,8 @@ pub fn Tool(comptime xcrypto: type, comptime opts: Options) type {
 
             const bits = crypto.signingKeyBits(&key);
             if (bits < crypto.RFC8301_MIN_RSA_BITS) {
-                // One wording for both products. "anything signed with it" covers a
-                // DKIM signature and an ARC seal without naming either, which is
-                // what the two copies were doing differently for no reason.
+                // "anything signed with it" covers a DKIM signature and an ARC
+                // seal without naming either, so this wording holds for both.
                 const msg = try std.fmt.allocPrint(
                     allocator,
                     "warning: this key is {d} bits. RFC 8301 3.2 requires at least {d}, and a\n" ++

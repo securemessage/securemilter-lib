@@ -58,8 +58,8 @@ test {
     _ = credentials;
     _ = bootstrap;
     _ = worker;
-    // `pool` was exported above but missing here, so its tests had never run.
-    // A module absent from this list still compiles and still looks tested.
+    // A module exported above but absent from this list still compiles and
+    // still looks tested, while its tests silently never run.
     _ = pool;
     _ = dns;
     _ = auth_results;

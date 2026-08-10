@@ -41,10 +41,6 @@ pub const Options = struct {
 /// without a slot would silently never be waited for, and configuration could
 /// be freed while it was reading.
 ///
-/// This was `spawnPool` and `spawnPoolWithReload`, the second taking seven
-/// positional arguments and the first existing only to pass two defaults to
-/// it. Every one of the four daemons called the long form, so the short one
-/// had no callers at all and the pair bought nothing.
 pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread) {
     const num_workers = opts.num_workers;
     const addresses = opts.addresses;
@@ -153,11 +149,9 @@ fn workerEntryReload(allocator: Allocator, worker: *Worker) void {
 // the *form* of an address -- for a unix socket that is only `sun_path` length,
 // because whether a directory exists is not a property of the string. So
 // `unix:/nonexistent-.../sock` is a well-formed listen address that cannot be
-// bound, and it is the case X-15 was filed for.
-//
-// Before the fix this returned a populated thread list: the failure happened
-// inside the spawned thread, where `return` is the only option, so the pool
-// reported success with nothing serving.
+// bound, and it is the case X-15 was filed for: binding inside the spawned
+// thread would leave `return` as the only option there, reporting a
+// successful pool with nothing serving.
 test "X-15: a worker that cannot bind fails the spawn instead of the thread" {
     const pipe = try posix.pipe();
     defer posix.close(pipe[0]);

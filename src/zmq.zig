@@ -98,10 +98,8 @@ pub const Publisher = struct {
         data_ptr[self.topic.len] = ' ';
         @memcpy(data_ptr[self.topic.len + 1 ..][0..payload.len], payload);
 
-        // ZMQ_DONTWAIT: non-blocking, drop if HWM reached
+        // ZMQ_DONTWAIT: non-blocking, drop if HWM reached.
         _ = c.zmq_msg_send(&msg, sock, c.ZMQ_DONTWAIT);
-        // zmq_msg_send takes ownership on success; on failure we must close
-        // But checking return is complex — zmq_msg_close is safe either way
     }
 
     /// Returns true if this publisher is connected (not a no-op stub).

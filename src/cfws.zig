@@ -3,10 +3,10 @@ const mem = std.mem;
 
 /// RFC 5322 comments and quoted strings.
 ///
-/// A `;` inside a comment or quoted string is data, not a separator. The A-R
-/// parser (audit M-6) previously used `indexOfScalar` and read a comment
-/// containing `; spf=pass` as a genuine result. Shared so every consumer
-/// agrees on token boundaries (required for sound X-1 header stripping).
+/// A `;` inside a comment or quoted string is data, not a separator: a naive
+/// scan would read a comment containing `; spf=pass` as a genuine result
+/// (audit M-6). Shared so every consumer agrees on token boundaries (required
+/// for sound X-1 header stripping).
 /// Skip FWS and complete comments (including nested). Returns index of first
 /// non-FWS non-comment byte. Unterminated comment consumes remainder (prevents
 /// its contents from being parsed as live tokens).
