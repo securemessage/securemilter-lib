@@ -42,10 +42,7 @@ pub const TxtIterator = struct {
     }
 };
 
-/// The answer cache and the negative-answer taxonomy now live in `cache.zig`;
-/// see that file for why the taxonomy went with the store. Re-exported here
-/// because `dns.zig` and the daemons reach for `resolver.NegativeKind` and
-/// `resolver.isTransientError`, and a file move is not a reason to change them.
+/// Cache and negative-answer types are re-exported from `cache.zig`.
 const cache_mod = @import("cache.zig");
 pub const NegativeKind = cache_mod.NegativeKind;
 pub const Cache = cache_mod.Cache;
@@ -64,12 +61,8 @@ pub const ResolverConfig = struct {
     negative_ttl: u32 = 60,
 };
 
-/// Synchronous DNS resolver with per-worker caching and multi-server
-/// round-robin with proactive health monitoring.
-///
-/// Uses a shared HealthMonitor (background probe thread) to skip
-/// unhealthy servers with zero delay. If no HealthMonitor is set,
-/// falls back to trying all servers with timeout-based failover.
+/// Synchronous DNS resolver with per-worker cache, round-robin, and optional
+/// health-monitor-based server selection.
 pub const Resolver = struct {
     allocator: Allocator,
     config: ResolverConfig,
@@ -92,24 +85,8 @@ pub const Resolver = struct {
                 @panic("DNS resolver: invalid nameserver address");
         }
 
-        // Own the nameserver strings instead of borrowing the caller's.
-        //
-        // A resolver now outlives what configured it: audit X-3 made it one per
-        // worker thread, kept across messages, while securearc's nameserver list
-        // belongs to an RCU configuration snapshot whose `deinit` frees exactly
-        // these strings. The ordering makes that concrete rather than
-        // theoretical -- a worker announces quiescence at the top of its loop,
-        // which is what licences the main thread to free a retired snapshot, and
-        // only THEN calls the reload hook that drops this resolver. In between,
-        // a live resolver holds a slice into freed memory.
-        //
-        // Nothing dereferences it today: after init only `timeout_ms` and
-        // `retries` are read, and queries go to the parsed `addrs` above. But
-        // that is an invariant no one wrote down and the compiler cannot check,
-        // and it turns into a use-after-free the first time someone re-reads the
-        // list -- to re-resolve a nameserver hostname, say, or to log which
-        // server answered. Copying a handful of short strings once per worker
-        // costs nothing measurable and makes the struct self-contained.
+        // Copy nameserver strings because a worker resolver can outlive the RCU
+        // configuration snapshot that supplied them.
         const owned_ns = allocator.alloc([]const u8, config.nameservers.len) catch
             @panic("DNS resolver: failed to allocate nameserver list");
         for (config.nameservers, 0..) |ns, i| {

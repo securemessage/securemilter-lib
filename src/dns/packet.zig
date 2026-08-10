@@ -49,32 +49,13 @@ pub const Response = struct {
     }
 };
 
-/// Advertised EDNS0 receive buffer, per DNS Flag Day 2020.
-///
-/// 1232 = 1280 (the IPv6 minimum MTU) - 40 (IPv6 header) - 8 (UDP header): the
-/// largest UDP response that cannot be IP-fragmented on any conforming path.
-/// Advertising 4096 instead invites fragmentation, which is both a PMTU hazard
-/// and the basis of cache-poisoning attacks that reassemble a forged second
-/// fragment. Anything above this size is TCP's job, not UDP's.
+/// EDNS0 UDP receive buffer: 1232 bytes avoids IPv6-path fragmentation.
 pub const edns_udp_payload_size: u16 = 1232;
 
-/// Build a DNS query packet for the given domain and record type.
+/// Build a DNS query packet with an EDNS0 OPT pseudo-record.
 ///
-/// Includes an EDNS0 OPT pseudo-RR. Without one, a responder is held to the 512
-/// byte limit of RFC 1035 §2.3.4 and must set TC=1 for anything larger -- and
-/// many resolvers then return TC=1 with an *empty* answer section, which is
-/// indistinguishable from "no such record" to a caller that does not retry.
-///
-/// That is not hypothetical. It silently broke two of the three largest mail
-/// providers in production: `yahoo.com` publishes 11 apex TXT records, so its SPF
-/// record was never seen and every message from Yahoo scored `spf=none`; and
-/// Microsoft CNAME-delegates DKIM selectors to long
-/// `*.outbound.protection.outlook.com` names whose 2048-bit key responses also
-/// exceed 512 bytes, so *every* Microsoft 365 sender scored `dkim=permerror`.
-/// Both resolve correctly the moment a buffer is advertised.
-///
-/// Returns a buffer containing the complete DNS packet.
-/// Caller owns the returned slice.
+/// Advertising the EDNS0 buffer avoids the legacy 512-byte UDP limit. The caller
+/// owns the returned packet.
 pub fn buildQuery(allocator: Allocator, domain: []const u8, rtype: RecordType, query_id: u16) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
