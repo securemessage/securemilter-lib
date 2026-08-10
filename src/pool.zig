@@ -1,17 +1,7 @@
-//! Building the worker pool, and owning the pieces until threads take them.
+//! Build the worker pool and own workers until their threads take them.
 //!
-//! Split from `worker.zig` along the seam those two things already had, and the same
-//! seam `bootstrap.zig` has against `daemon.zig`: that module is one worker's event
-//! loop, and this one is how many of them there are, in what order they are built, and
-//! who frees what when construction stops halfway.
-//!
-//! The split was owed. X-15 moved worker construction out of the spawned threads and
-//! onto the calling thread, which is what made the errors reportable — and took
-//! `worker.zig` from 657 lines to 722 in the process. The ceiling was raised
-//! deliberately, with a note saying it was expected to fall again. This is that.
-//!
-//! Nothing here changed in the move. The ownership rules below are load-bearing and
-//! were written against a measured leak, so they are transcribed rather than rewritten.
+//! Construction stays on the calling thread so startup failures remain reportable.
+//! The ownership rules below preserve cleanup on partial construction.
 
 const std = @import("std");
 const posix = std.posix;

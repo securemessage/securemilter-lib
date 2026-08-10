@@ -21,10 +21,10 @@ pub const ActionFlags = packed struct(u32) {
     _padding: u23 = 0,
 };
 
-/// Protocol flags — what SMTP stages the milter wants to skip.
+/// Protocol flags controlling MTA event delivery.
 ///
-/// Setting a flag tells the MTA NOT to send that event, reducing
-/// over-the-wire traffic for milters that don't need all stages.
+/// Most flags suppress an event; `header_leading_space` requests the separator
+/// after a header colon.
 pub const ProtocolFlags = packed struct(u32) {
     no_connect: bool = false,
     no_helo: bool = false,

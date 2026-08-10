@@ -1,15 +1,6 @@
-//! A wall-clock deadline for one evaluation.
+//! Shared wall-clock deadline for one evaluation.
 //!
-//! X-21: `securespf` was the only daemon that bounded its own work in time
-//! (`max_duration_ms`); the other three measured elapsed time only to log it,
-//! so a slow-but-working resolver could hold a worker for unbounded seconds
-//! past the MTA's own timeout. This is the shared form of that bound, used by
-//! every daemon's evaluation loop, so the four cannot drift on what "give up"
-//! means.
-//!
-//! Expiry must never become a verdict against the sender: every caller maps it
-//! to the daemon's "could not evaluate" answer (temperror / unknown), never
-//! fail -- the message was not judged, merely not judged in time.
+//! Callers map expiry to an indeterminate result, never a sender failure.
 
 const std = @import("std");
 

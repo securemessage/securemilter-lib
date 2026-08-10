@@ -46,10 +46,7 @@ pub const Publisher = struct {
         var hwm: c_int = 1000;
         _ = c.zmq_setsockopt(sock, c.ZMQ_SNDHWM, &hwm, @sizeOf(c_int));
 
-        // libzmq's TCP transport is IPv4-only UNLESS ZMQ_IPV6 is set -- a
-        // tcp://[v6] endpoint fails outright without it (EOPNOTSUPP, seen as
-        // "no events captured on the bus" on the 9.3 v6-only lab set). Sniff
-        // the bracketed literal; harmless for v4 endpoints either way.
+        // libzmq requires ZMQ_IPV6 for bracketed IPv6 TCP endpoints.
         if (endpoint) |ep| {
             if (mem.indexOf(u8, ep, "[")) |_| {
                 var one: c_int = 1;
@@ -131,11 +128,8 @@ test "publisher with invalid endpoint" {
 }
 
 test "a published frame crosses an IPv6 loopback endpoint" {
-    // libzmq's TCP transport is v4-only until ZMQ_IPV6 is set; without it the
-    // 9.3 v6-only lab set's collector failed its bind with EOPNOTSUPP and the
-    // event bus read as a silent hole. A connect-only check has no teeth here
-    // (zmq_connect defers resolution and reports success either way), so this
-    // is a real round trip: bind a SUB on [::1], publish, receive.
+    // `zmq_connect` can succeed before a subscriber is reachable, so exercise
+    // the IPv6 path with a real SUB bind, publish, and receive round trip.
     const addr = try std.net.Address.parseIp6("::1", 0);
     const sockfd = try posix.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     try posix.bind(sockfd, &addr.any, addr.getOsSockLen());

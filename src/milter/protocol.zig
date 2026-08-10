@@ -1,3 +1,5 @@
+//! Sendmail milter protocol codec, commands, responses, and negotiation.
+
 pub const commands = @import("commands.zig");
 pub const responses = @import("responses.zig");
 pub const negotiate = @import("negotiate.zig");

@@ -1,29 +1,7 @@
 //! Terminal output for the command-line tools.
 //!
-//! Nine tools across four repositories had their own `writeOut`/`writeErr`/`fatal`.
-//! That would be unremarkable duplication except that the copies had **diverged in a
-//! way that mattered**, and the majority had it wrong:
-//!
-//! Seven of nine wrote
-//!
-//! ```zig
-//! _ = posix.write(posix.STDOUT_FILENO, data) catch {};
-//! ```
-//!
-//! which **discards the byte count**. `write(2)` is permitted to transfer fewer bytes
-//! than requested and report how many; ignoring that silently truncates output. Two
-//! tools -- `securearc-seal` and `securedkim-sign` -- looped until the buffer was
-//! drained, which is correct.
-//!
-//! A short write needs a reason to happen, and the checkers have one: every
-//! conformance harness runs them under `subprocess.run(capture_output=True)`, so their
-//! stdout is a **pipe**, which is exactly where partial writes occur. A truncated
-//! result line reaches the harness as unparseable output and is reported as a case
-//! failure -- pointing at production code that is fine. That is the same class of
-//! harness-side fault that has twice produced phantom defects here (the DNS fake's
-//! character-iteration bug, and `c=simple/*` in the ARC suite).
-//!
-//! So this module takes the minority implementation, and the loop is the point of it.
+//! Shared helpers drain short writes, which can otherwise truncate checker output
+//! when a conformance harness captures it through a pipe.
 
 const std = @import("std");
 const posix = std.posix;

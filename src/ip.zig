@@ -1,12 +1,7 @@
-//! Strict IP literal parsing (RFC 4291 §2.2), in the one place that needs it.
+//! Shared strict RFC 4291 §2.2 IP literal parsing.
 //!
-//! Moved out of `securespf` for L-7, closing the last of S-7. The parser was
-//! written there because it decides which senders are authorized; it was
-//! *left* there when S-12 converted securespf's authorization sites, because
-//! the three remaining consumers — `listener.zig`, `dns/resolver.zig`,
-//! `dns/health.zig` — need a `net.Address` to bind or connect, and feeding
-//! them meant moving the parser into the library rather than swapping a call
-//! site. Copying it would have been the S-12 defect again, so it moved.
+//! One parser keeps SPF authorization, listener binding, and DNS configuration
+//! from accepting different address languages.
 //!
 //! Why the stdlib parser cannot be used here: `std.net.Ip6Address.parse`
 //! is wrong in both directions for our purposes.
