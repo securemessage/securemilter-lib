@@ -24,11 +24,7 @@ pub fn build(b: *std.Build) void {
     addLintStep(b);
 }
 
-/// Enforce the 400-line-per-file requirement as a build step.
-///
-/// The checker lives here rather than in each product repo because the products
-/// already depend on this package, and a rule copied into five build files is the
-/// exact shape of defect this audit spent its time on.
+/// Add the shared 400-line source-limit check.
 pub fn addLintStep(b: *std.Build) void {
     const lint = b.addSystemCommand(&.{"sh"});
     lint.addFileArg(b.path("tools/check-line-limit.sh"));
