@@ -132,6 +132,37 @@ pub fn checkNotAlreadyRunning(path: []const u8) !void {
     return error.AlreadyRunning;
 }
 
+/// Ensure the PID file's parent directory exists and is writable by the
+/// target user, so `removePidFile` succeeds after privilege drop.
+/// Must be called while still root (before `dropPrivileges`).
+pub fn ensurePidDirectory(pid_path: []const u8, user_spec: ?[]const u8) void {
+    const dir = std.fs.path.dirnamePosix(pid_path) orelse return;
+    if (dir.len == 0) return;
+
+    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            log_mod.warn("pid directory: {}", .{err});
+            return;
+        },
+    };
+
+    const user = user_spec orelse return;
+    const sep = std.mem.indexOfScalar(u8, user, ':');
+    const username = if (sep) |i| user[0..i] else user;
+
+    var name_buf: [256:0]u8 = undefined;
+    if (username.len == 0 or username.len >= name_buf.len) return;
+    @memcpy(name_buf[0..username.len], username);
+    name_buf[username.len] = 0;
+
+    const pw = c.getpwnam(&name_buf) orelse return;
+
+    var d = std.fs.openDirAbsolute(dir, .{}) catch return;
+    defer d.close();
+    posix.fchown(d.fd, pw.uid, pw.gid) catch {};
+}
+
 /// Write current PID to file. Unconditional; the pre-fork `checkNotAlreadyRunning`
 /// handles conflicts. Repeating the test here would re-introduce the `daemon -p`
 /// failure: the file now names a process (us) that is not the supervisor's.

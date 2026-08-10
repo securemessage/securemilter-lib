@@ -123,6 +123,10 @@ pub const BoundListener = struct {
     /// hit EBADF in posix.close (unreachable → abort).
     pub fn close(self: *BoundListener) void {
         if (self.fd < 0) return;
+        switch (self.address) {
+            .unix => |ux| std.fs.cwd().deleteFile(ux.path) catch {},
+            .tcp => {},
+        }
         self.server.stream.close();
         self.fd = -1;
     }
