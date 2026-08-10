@@ -2,22 +2,10 @@ const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
-/// Configuration generation counter, and the per-worker quiescent state that
-/// lets retired configuration be freed safely.
+/// Configuration generation and per-worker quiescent state for safe reclamation.
 ///
-/// The counter tells workers *that* something changed, so they can drop
-/// thread-local caches. On its own that is not enough to replace shared
-/// configuration: this type previously carried a comment asserting that
-/// "no deferred freeing is needed since config data is static lifetime
-/// (backed by the original parsed INI allocation or a replace-in-place swap)".
-/// The replace-in-place swap was the bug — it frees or tears memory a worker
-/// is reading (audit X-2). The slots below supply the missing half.
-///
-/// Each worker owns one slot and writes the current generation into it at the
-/// top of its event loop, which is the one point where it provably holds no
-/// reference to shared configuration. `minObserved` is therefore a generation
-/// that every worker has passed while holding nothing, which is exactly the
-/// condition for reclaiming anything retired at or before it. See `rcu.zig`.
+/// Workers publish their observed generation only between event-loop iterations,
+/// allowing values retired at or before `minObserved` to be freed.
 pub const ConfigGeneration = struct {
     global: std.atomic.Value(u64),
     /// One per worker. Empty until `initSlots`, which means "no readers" and
@@ -53,14 +41,9 @@ pub const ConfigGeneration = struct {
         self.slots = slots;
     }
 
-    /// Create one wakeup pipe per worker and keep the write ends. Returns the
-    /// read ends for the caller to hand to the workers, which own them.
+    /// Create worker wakeup pipes and retain their write ends.
     ///
-    /// Without this, reclamation stalls indefinitely on a quiet daemon: a
-    /// worker blocked in kevent() never reaches its quiescent point, and
-    /// because the safe generation is the *minimum* across workers, a single
-    /// idle worker pins it for all of them. Observed on the lab as 500
-    /// whitelists and 20 MB held after a reload storm.
+    /// Publishing a reload wakes idle workers so they can report quiescence.
     pub fn initWakeup(self: *ConfigGeneration, allocator: Allocator, worker_count: usize) ![]posix.fd_t {
         const write_ends = try allocator.alloc(posix.fd_t, worker_count);
         errdefer allocator.free(write_ends);

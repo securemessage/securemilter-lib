@@ -1,49 +1,8 @@
-//! Turning a message *file* into the view of a message a milter receives.
+//! Parse message files into the headers and body a milter receives.
 //!
-//! **This exists so a conformance checker cannot model the message differently
-//! from the daemon it certifies.** That is not a tidiness argument. A checker
-//! that parses a file its own way still produces a score, and the score looks
-//! like a statement about the product when it is a statement about the harness.
-//! It has happened three times on this project, each time arriving disguised as
-//! something else:
-//!
-//!  - the `c=simple/*` cases in the ARC validation suite, reported as a pile of
-//!    product defects;
-//!  - the DNS server in the DKIM suite that served key records one character at
-//!    a time, likewise;
-//!  - 2026-08-04, the dkimpy differential and the ARC signing suite sitting
-//!    green while the path they cover was completely dead, because the fixtures
-//!    wrote their key at 0644 and nothing re-ran them after the key-permission
-//!    check landed.
-//!
-//! Before this module was promoted here there were three copies of the same
-//! parser -- `securearc/msgfile.zig`, `securedkim/check.zig` and
-//! `securedkim/sign_cli.zig` -- and they had already drifted: only one of them
-//! could be told not to rewrite line endings, which is the switch the D-22
-//! differential needs, so the other two could not have found D-22 at all. Three
-//! copies is three chances to disagree with production and with each other.
-//!
-//! It lives in the library rather than in one daemon because it models
-//! `connection.Header` and `connection.splitLeadingSpace`, which live here, and
-//! because all four products' checkers must share it or the premise fails.
-//!
-//! The rules encoded here are deliberate models of production, each documented
-//! at its site: CRLF normalisation, folding preserved, and one space dropped
-//! after the colon. **Anything a milter does not do, this must not do either.**
-//!
-//! WHICH SUITE HAS TEETH FOR THIS FILE, measured on 2026-08-05 by forcing
-//! `had_space` to false and re-running everything:
-//!
-//!   dkimpy differential   204 -> 93 disagree      CATCHES IT
-//!   rfc6376 + 8463         26/26 still passed     blind
-//!   ARC validation        171/171 still passed    blind
-//!   ARC signing            17/17 still passed     blind
-//!
-//! So three of the four suites do not exercise the D-23 separator bit at all,
-//! and only the independent verifier notices when it is dropped. That is worth
-//! knowing before trusting a green run here: the unit tests in this file caught
-//! it immediately (2 failures), which is the argument for pinning behaviour
-//! beside the code rather than relying on the conformance totals.
+//! Shared CLI tooling uses this module to match daemon handling: CRLF
+//! normalization is configurable, folding is preserved, and the separator after
+//! a header colon is represented by `Header.had_space`.
 
 const std = @import("std");
 const mem = std.mem;

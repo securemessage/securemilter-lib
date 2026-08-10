@@ -3,45 +3,14 @@ const Allocator = std.mem.Allocator;
 
 const reload = @import("reload.zig");
 
-/// Read-copy-update container for configuration shared between the main
-/// thread and worker threads.
+/// Read-copy-update container for main-thread configuration and worker readers.
 ///
-/// The problem it solves: a daemon holds parsed configuration in a module
-/// global, workers read it while handling messages, and SIGHUP replaces it.
-/// Assigning the new value over the old one frees memory a worker may be
-/// reading, or tears a struct mid-read. Doing it without freeing leaks a
-/// whole config per reload instead.
+/// The writer atomically publishes immutable values and retires replaced values.
+/// A `get` result remains valid until that worker's next event-loop quiescent
+/// point. Retired values are freed once every worker has advanced past them.
 ///
-/// The reader holds a pointer to an immutable value and the writer never
-/// mutates a published value. A reload builds a *new* value, publishes the
-/// pointer atomically, and defers freeing the old one until no worker can
-/// still be looking at it.
-///
-/// # The invariant that makes this safe
-///
-/// **A reference returned by `get` is valid until the worker next reaches the
-/// top of its event loop.** Workers announce quiescence there and nowhere
-/// else, so a reference acquired while handling a message stays valid for the
-/// whole of that message — including pointers that escape a lookup helper
-/// into the code that signs with them. Never stash a reference somewhere that
-/// outlives one event-loop iteration; re-acquire it instead.
-///
-/// # Reclamation
-///
-/// Freeing is deferred rather than waited for. Workers block in `kevent` with
-/// no timeout, so an idle worker may not reach a quiescent point for an
-/// arbitrarily long time; a writer that waited for every worker to acknowledge
-/// would hang the signal loop on an idle daemon. Instead the old value goes on
-/// a retire list stamped with the generation at which it was replaced, and is
-/// freed once every worker has been observed at or past that generation. In
-/// practice a busy daemon reclaims on the next reload; an idle one holds the
-/// memory until it sees traffic, which is exactly when it stops mattering.
-///
-/// # Concurrency contract
-///
-/// One writer. `publish`, `sweep` and `deinit` are for the main thread only
-/// and are not safe to call concurrently with each other. `get` is safe from
-/// any number of readers.
+/// Only the main thread may call `publish`, `sweep`, or `deinit`; `get` is
+/// safe for concurrent readers.
 pub fn Rcu(comptime T: type) type {
     return struct {
         const Self = @This();
