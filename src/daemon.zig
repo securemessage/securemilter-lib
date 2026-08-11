@@ -12,12 +12,14 @@ const ready_byte: u8 = 'K';
 /// must fail rather than hang forever.
 pub const startup_timeout_s: isize = 60;
 
-/// Double-fork daemonization: setsid, close fds, return readiness pipe.
-/// The parent reads the pipe; a byte means the daemon is serving, EOF means failure.
-/// Must signal via `signalReady` once listeners and workers are running, not
-/// merely once daemonization completes: `service start` reporting success while
-/// nothing listened would let a typo in a listener address silently produce
-/// exit 0, no listener, and unauthenticated mail (audit X-16).
+/// Double-fork daemonization: setsid, close fds, return the readiness
+/// pipe's write end. The parent (see `awaitReady`) reads the other end: a
+/// byte means the daemon is serving, EOF means it failed before that.
+///
+/// The caller must not treat a returned fd alone as success and must wait
+/// for `signalReady` to actually be called once listeners are bound and
+/// workers are running — daemonizing only forks and detaches, it proves
+/// nothing about whether the daemon goes on to listen.
 pub fn daemonize() !posix.fd_t {
     // Create before first fork so both ends survive into grandchild.
     // CLOEXEC prevents exec'd children from inheriting the write end, which
@@ -119,9 +121,9 @@ fn livePidFileHolder(path: []const u8) ?c.pid_t {
 
 /// Check no other instance holds the PID file. Must run before `daemonize`.
 ///
-/// Running this after the fork would make the file name our own ancestor under
-/// `daemon -p`, refusing to start against itself. Running before the fork
-/// eliminates the ambiguity (audit X-16).
+/// After the fork, the file may name our own ancestor (`daemon -p`) rather
+/// than a rival, and the two cannot be told apart; running before the fork
+/// avoids that ambiguity.
 pub fn checkNotAlreadyRunning(path: []const u8) !void {
     const holder = livePidFileHolder(path) orelse return;
     if (holder == c.getpid() or holder == c.getppid()) return;
@@ -249,9 +251,10 @@ pub const ManagedSignals = struct {
     pub const SIGPIPE = 13;
 
     /// Block signals before spawning any thread. A thread inherits the mask
-    /// in force at creation; unblocked threads receive the default handler
-    /// (e.g., SIGHUP terminates with no core, audit X-7). Must be called
-    /// before any thread creation, not only before the worker pool.
+    /// in force at creation; an unblocked thread would receive these
+    /// signals via the default handler (e.g. SIGHUP terminates the process
+    /// with no core). Must be called before any thread creation, not only
+    /// before the worker pool.
     pub fn blockForKqueue() void {
         var set = std.mem.zeroes(c.sigset_t);
         _ = c.sigaddset(&set, SIGHUP);
@@ -321,15 +324,16 @@ test "write and remove pid file" {
     try std.testing.expect(pid > 0);
 }
 
-// --- L-5: PID file held by live process ----------------------------------
-// The self-case and rival-case are asserted separately, because "some live PID"
-// and "a different live PID" are not the same fact and must not be conflated.
+// --- PID file held by a live process --------------------------------------
+// The self-case and rival-case are asserted separately: "a live PID" and
+// "a different live PID" are distinct conditions with different outcomes.
 
 test "a pid file naming ourselves is not a second instance" {
     const path = "/tmp/securemilter-test-self.pid";
     defer removePidFile(path);
 
-    // `daemon -p` leaves the supervisor's PID (us) before `writePidFile` runs.
+    // Simulates `daemon -p`, which writes the supervisor's PID (us) before
+    // `writePidFile` runs.
     try writePidFile(path);
 
     try checkNotAlreadyRunning(path);
@@ -340,15 +344,13 @@ test "a pid file held by another live process is refused" {
     defer removePidFile(path);
 
     // PID 1 is alive, not us, not our parent. `kill(1, 0)` may fail EPERM,
-    // which `livePidFileHolder` reads as "exists" not "gone".
+    // which `livePidFileHolder` must still read as "exists", not "gone".
     {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
         try file.writeAll("1\n");
     }
 
-    // `AlreadyRunning` is the specific fault `bootstrap` refuses on; others
-    // are logged and survived (a daemon that cannot write a PID file carries mail).
     try std.testing.expectError(error.AlreadyRunning, checkNotAlreadyRunning(path));
 
     // The refusal must not truncate the file.
@@ -422,10 +424,11 @@ test "a malformed pid file is taken over rather than refused" {
     }
 }
 
-// --- X-16: readiness handshake -------------------------------------------
-// Tests the protocol (byte = up, EOF = failed, silence = wedged) without real forks.
+// --- readiness handshake ---------------------------------------------------
+// Tests the pipe protocol (byte = up, EOF = failed, no event = wedged)
+// directly, without a real fork.
 
-test "X-16: the ready byte releases the parent" {
+test "the ready byte releases the parent" {
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
@@ -433,9 +436,9 @@ test "X-16: the ready byte releases the parent" {
     try awaitReady(fds[0], 5);
 }
 
-test "X-16: a child that dies before signalling fails the parent" {
-    // If the child exits before signalling, the parent must see EOF with no byte
-    // as a failure, not as a successful start with nothing listening.
+test "a child that dies before signalling fails the parent" {
+    // EOF with no byte read must be reported as a failure, not as a
+    // successful start with nothing listening.
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
@@ -443,9 +446,10 @@ test "X-16: a child that dies before signalling fails the parent" {
     try std.testing.expectError(error.StartupFailed, awaitReady(fds[0], 5));
 }
 
-test "X-16: a wedged child does not hang the parent forever" {
-    // Open write end with no signal = wedged daemon (e.g., blocked on DNS/lock).
-    // A bounded timeout prevents `service start` from hanging forever.
+test "a wedged child does not hang the parent forever" {
+    // Write end open with nothing written simulates a daemon blocked before
+    // it can signal (e.g. on DNS or a lock). The bounded timeout must fire
+    // rather than hang `service start` forever.
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
@@ -453,9 +457,9 @@ test "X-16: a wedged child does not hang the parent forever" {
     try std.testing.expectError(error.StartupTimedOut, awaitReady(fds[0], 0));
 }
 
-test "X-16: the parent rejects a byte it did not agree to" {
-    // An unrelated inherited descriptor writing into the pipe must not be read as
-    // a successful start.
+test "the parent rejects a byte it did not agree to" {
+    // Any byte other than `ready_byte` must not be read as a successful
+    // start, in case an unrelated inherited descriptor writes into the pipe.
     const fds = try posix.pipe();
     defer posix.close(fds[0]);
 
