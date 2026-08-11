@@ -35,9 +35,10 @@ pub const Options = struct {
     max_connections: u32,
     num_listeners: u32,
 
-    /// Listener addresses. Unix socket parent directories are created and
-    /// chowned to the target user while still privileged, so bind() works
-    /// after privilege drop without external setup.
+    /// Listener addresses. For each `.unix` entry, the parent directory is
+    /// created and chowned to `user` while still privileged (see
+    /// `ensure_runtime_dir` in `Ops`), so `bind()` succeeds after the
+    /// privilege drop without requiring the directory to exist beforehand.
     listen_addresses: []const listener_mod.ListenAddress = &.{},
 
     /// Spawn long-lived threads (e.g., DNS health monitor). A callback avoids
@@ -152,18 +153,12 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     // (1) and (2) are both satisfied at this point, and nowhere earlier.
     if (opts.spawn_threads) |spawn| spawn();
 
-    // (4) still privileged here.
-    //
-    // The runtime directories — the PID file's (e.g. /var/run/securespf/) and
-    // any Unix socket's — are created and given to the target user now, while
-    // the process can still do both: everything that lands in them (the PID
-    // file below, bind() after `run` returns, both unlinks at shutdown)
-    // happens after the privilege drop.
-    //
-    // The spec is resolved once, so every directory and the drop itself agree
-    // on the identity. A spec that does not resolve is survivable HERE because
-    // it cannot be the last word: `drop_privileges` resolves the same spec
-    // below and refuses the start, which makes the skipped chown moot.
+    // (4) still privileged here. Create and chown the PID file's directory
+    // and each Unix listener's directory before dropping privileges, since
+    // only root can chown. `resolveUserGroup` runs once so these directories
+    // and the drop below use the same uid/gid. If resolution fails here, the
+    // chown is skipped, but `drop_privileges` resolves the same spec below
+    // and fails the start on the same error.
     const owner: ?credentials.UserGroup = if (opts.user) |spec|
         credentials.resolveUserGroup(spec) catch |err| blk: {
             log_mod.warn("resolving '{s}' for runtime directories failed: {}", .{ spec, err });
@@ -414,9 +409,9 @@ test "the fd limit is raised while still privileged" {
 }
 
 test "runtime directories are prepared while root, one per directory that gets written" {
-    // Both consumers in order: `write_pid` puts a file inside the PID directory a
-    // moment later, and the unix listener binds after `run` returns — by which
-    // time creating or chowning anything under /var/run is no longer possible.
+    // ensure_runtime_dir must run before write_pid, which writes into the PID
+    // directory, and before drop_privs, after which mkdir/chown under
+    // /var/run is no longer possible.
     var opts = test_opts;
     const addrs = [_]listener_mod.ListenAddress{
         .{ .unix = .{ .path = "/tmp/securemilter-bootstrap-test/milter.sock" } },
@@ -428,9 +423,8 @@ test "runtime directories are prepared while root, one per directory that gets w
     try expectBefore(.ensure_runtime_dir, .write_pid);
     try expectBefore(.ensure_runtime_dir, .drop_privs);
 
-    // The PID file's directory and the unix listener's. The TCP listener has no
-    // directory to prepare, and preparing one for it would be a path parsed out
-    // of an address that does not contain one.
+    // One call for the PID file's directory, one for the unix listener's.
+    // The TCP listener has no filesystem path and must not produce a call.
     var n: usize = 0;
     for (recorded[0..recorded_len]) |s| {
         if (s == .ensure_runtime_dir) n += 1;

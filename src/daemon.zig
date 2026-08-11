@@ -133,20 +133,19 @@ pub fn checkNotAlreadyRunning(path: []const u8) !void {
     return error.AlreadyRunning;
 }
 
-/// Ensure the directory that will hold `file_path` exists, is traversable,
-/// and — when `owner` is given — belongs to it.  Used for both the PID file
-/// directory and Unix socket directories; the daemon writes into them only
-/// after the privilege drop, so this must run while the process is still root.
+/// Create the directory containing `file_path` if it does not exist, and
+/// chown it to `owner` if given. Used for the PID file directory and for
+/// Unix socket directories. Must be called while still root, since only
+/// root can chown; only unprivileged code writes into the directory
+/// afterward (writePidFile, bind()).
 ///
-/// Ownership carries two consequences, not one.  The visible one is that the
-/// unprivileged daemon can unlink its PID file and socket at shutdown.  The
-/// subtle one is BSD group-inheritance: a new file takes its group from the
-/// directory, so the directory's group is what puts the milter socket in the
-/// group Postfix connects with.
+/// Chowning lets the unprivileged process later unlink its PID file and
+/// socket at shutdown. It also sets the group new files get created with
+/// inside the directory (BSD group-inheritance), which determines the
+/// group of any Unix socket bound there and therefore who can connect to it.
 ///
-/// Failures are logged and survived: whatever cannot be prepared here fails
-/// again a moment later — writePidFile, bind() — where it is already handled,
-/// and a daemon that carries mail beats one that refuses over a chmod.
+/// All failures are logged and non-fatal: `writePidFile` and `bind()` fail
+/// on the same underlying condition and are already handled there.
 pub fn ensureRuntimeDirectory(file_path: []const u8, owner: ?credentials.UserGroup) void {
     const dir = std.fs.path.dirnamePosix(file_path) orelse return;
     if (dir.len == 0) return;
@@ -155,13 +154,13 @@ pub fn ensureRuntimeDirectory(file_path: []const u8, owner: ?credentials.UserGro
     if (owner) |ug| chownDirectory(dir, ug);
 }
 
-/// Create `dir` if it is missing, at mode 0755: owner rwx (the daemon can
-/// unlink), group+other r-x (Postfix can traverse to reach the socket inside).
+/// Create `dir` at mode 0755 if it does not exist: owner rwx, group/other
+/// r-x, so the directory is traversable.
 ///
-/// The mode is set explicitly because `makeDirAbsolute` filters through the
-/// process umask, which for a milter is typically 0117 — 0660 on a directory,
-/// no execute, not traversable.  Only a directory this call creates is
-/// touched: the mode of one that already exists is the operator's, not ours.
+/// The mode is set explicitly with `fchmod` after creation because
+/// `makeDirAbsolute` applies the process umask, and a milter's umask
+/// (typically 0117) would strip the execute bits a directory needs to be
+/// traversable. Does not touch the mode of a directory that already exists.
 fn ensureDirectory(dir: []const u8) void {
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => return,
@@ -179,10 +178,9 @@ fn ensureDirectory(dir: []const u8) void {
     posix.fchmod(d.fd, 0o755) catch |err| log_mod.warn("chmod {s}: {}", .{ dir, err });
 }
 
-/// Give `dir` to the resolved runtime identity.  Pre-existing directories are
-/// chowned too — one the operator created but left root-owned would otherwise
-/// fail the daemon at bind() or PID removal, after the privileges to fix it
-/// are gone.
+/// chown `dir` to `owner`. Also chowns directories that already existed
+/// (e.g. created by the operator and left root-owned), since the daemon has
+/// no way to fix ownership itself once privileges are dropped.
 fn chownDirectory(dir: []const u8, owner: credentials.UserGroup) void {
     var d = std.fs.openDirAbsolute(dir, .{}) catch |err| {
         log_mod.warn("open {s}: {}", .{ dir, err });

@@ -29,18 +29,17 @@ pub const UserGroup = struct {
     gid: c.gid_t,
 };
 
-/// Resolve `user` or `user:group` (opendkim `UserID` format) to numeric ids,
-/// changing nothing. `:group` overrides the user's primary group.
+/// Parse `user` or `user:group` (opendkim `UserID` format) into numeric ids
+/// via getpwnam/getgrnam. Makes no syscalls that change process state.
+/// `:group` overrides the user's primary group.
 ///
-/// This is the single interpretation of the spec: `dropPrivileges` becomes the
-/// identity it returns, and `daemon.ensureRuntimeDirectory` hands the runtime
-/// directories to it. Those two must never disagree — a looser second parser
-/// lived in `daemon.zig` briefly, and which group it picked is what decides
-/// the milter socket's group (BSD inheritance from the directory), i.e.
-/// whether Postfix can connect at all.
+/// Shared by `dropPrivileges` and `daemon.ensureRuntimeDirectory`, so the
+/// process identity and the runtime directory ownership are always derived
+/// from the same spec.
 ///
-/// Both names are resolved before anything is returned, so an unknown group
-/// is a clean refusal rather than a half-applied identity.
+/// Both the username and, if present, the group name are looked up before
+/// returning, so an unresolvable group produces an error rather than a
+/// `UserGroup` with only the uid resolved.
 pub fn resolveUserGroup(spec: []const u8) !UserGroup {
     const sep = std.mem.indexOfScalar(u8, spec, ':');
     const username = if (sep) |i| spec[0..i] else spec;
@@ -56,9 +55,7 @@ pub fn resolveUserGroup(spec: []const u8) !UserGroup {
 
     var gid = pw.gid;
     if (groupname) |g| {
-        // A separate buffer on purpose: reusing `user_buf` would leave it
-        // holding the group name, and the two lookups read too similarly for
-        // that to stay noticed.
+        // Own buffer, distinct from user_buf, to null-terminate the group name.
         var group_buf: [256:0]u8 = undefined;
         if (g.len == 0) return error.InvalidUserSpec;
         if (g.len >= group_buf.len) return error.GroupNameTooLong;
@@ -94,11 +91,8 @@ pub fn setUmask(mask: c.mode_t) void {
 /// Drop is verified after (real + effective uid/gid checked): a partial drop
 /// where effective moved but real did not would leave the process able to restore.
 pub fn dropPrivileges(spec: []const u8) !void {
-    // With `:group`, the daemon runs in a group it is not necessarily a member
-    // of — a 0660 socket owned by that group restricts access to Postfix (and
-    // nothing else) without depending on no other local accounts. Resolution is
-    // complete before the first syscall, so an unknown name is a clean refusal
-    // rather than a half-completed drop.
+    // Resolve before any privilege-changing syscall, so an unknown user or
+    // group is rejected without partially dropping privileges.
     const target = try resolveUserGroup(spec);
 
     if (target.uid == 0) return error.RefusingToDropToRoot;
@@ -138,9 +132,8 @@ test "an over-long username is refused before getpwnam sees it" {
 }
 
 test "the uid-0 guard is not bypassed by naming a group" {
-    // The guard fires on the resolved uid whether or not a group is named, so
-    // `root:wheel` cannot walk past the refusal by making the spec look like a
-    // deliberate choice.
+    // The uid==0 check runs on the resolved uid regardless of whether the
+    // spec names a group.
     try std.testing.expectError(error.RefusingToDropToRoot, dropPrivileges("root:wheel"));
 }
 
@@ -163,10 +156,9 @@ test "an over-long group name is refused before getgrnam sees it" {
 }
 
 test "a spec resolves to numeric ids, with `:group` overriding the primary group" {
-    // The success path is assertable here in a way it never was through
-    // `dropPrivileges`: resolution changes no process state, and root is the
-    // one account whose ids are fixed. wheel (0) is root's primary group;
-    // daemon (1) is a FreeBSD base group no port can move.
+    // resolveUserGroup changes no process state, unlike dropPrivileges, so
+    // the success path can be asserted directly. root's ids are fixed: wheel
+    // (0) is root's primary group, daemon (1) is a stock FreeBSD group.
     const plain = try resolveUserGroup("root");
     try std.testing.expectEqual(@as(c.uid_t, 0), plain.uid);
     try std.testing.expectEqual(@as(c.gid_t, 0), plain.gid);
