@@ -41,6 +41,34 @@ pub const HARD_LIMIT: usize = 998;
 /// and unfolding restores the original single logical line.
 const CONTINUATION = "\r\n\t";
 
+/// Convert a folded header value to milter-protocol wire form.
+///
+/// The Folder's CRLF folds are the canonical form — the bytes DKIM/ARC hash.
+/// The milter protocol is NOT SMTP: smfi_addheader(3) states a folded value
+/// carries "a line feed ... NOT ... preceded by a carriage return; the MTA
+/// will add this automatically". Sending the CRLF form lets the MTA's own
+/// LF-to-CRLF conversion double every fold into a blank line, which ends the
+/// header block for every downstream parser (observed: a sealed message whose
+/// ARC-Seal's `b=` landed in the body, breaking the DKIM body hash at an
+/// independent verifier).
+pub fn toWire(allocator: Allocator, value: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, value, '\r') == null)
+        return allocator.dupe(u8, value);
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < value.len) {
+        if (value[i] == '\r' and i + 1 < value.len and value[i + 1] == '\n') {
+            try out.append(allocator, '\n');
+            i += 2;
+        } else {
+            try out.append(allocator, value[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Appends a header field body, folding it to stay inside the line limits.
 ///
 /// Tracks the current column so the caller does not have to. Start it with the
@@ -430,4 +458,52 @@ test "longestLine measures without the CRLF" {
     try std.testing.expectEqual(@as(usize, 5), longestLine("abcde"));
     try std.testing.expectEqual(@as(usize, 5), longestLine("abcde\r\n"));
     try std.testing.expectEqual(@as(usize, 5), longestLine("ab\r\nabcde\r\nx"));
+}
+
+test "toWire strips the CR from every fold and nowhere else" {
+    const allocator = std.testing.allocator;
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    var f = Folder.init(&buf, allocator, "ARC-Seal:".len + 1);
+    try f.append("", "i=1");
+    try f.append("; ", "cv=none");
+    try f.append("; ", "a=rsa-sha256");
+    try f.append("; ", "d=a-domain-long-enough-to-force-a-fold.example.com");
+    try f.append("; ", "s=arc2026");
+    try f.append("; ", "b=");
+    try f.appendChunked("C" ** 344);
+    // The case being guarded: the canonical form really did fold with CRLF.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, CONTINUATION) != null);
+
+    const wire = try toWire(allocator, buf.items);
+    defer allocator.free(wire);
+
+    // No carriage return survives, folds are LF+TAB, and nothing else moved.
+    try std.testing.expect(std.mem.indexOfScalar(u8, wire, '\r') == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "\n\t") != null);
+    var stripped: std.ArrayList(u8) = .{};
+    defer stripped.deinit(allocator);
+    for (wire) |ch| {
+        if (ch != '\n' and ch != '\t') try stripped.append(allocator, ch);
+    }
+    var reference: std.ArrayList(u8) = .{};
+    defer reference.deinit(allocator);
+    for (buf.items) |ch| {
+        if (ch != '\r' and ch != '\n' and ch != '\t') try reference.append(allocator, ch);
+    }
+    try std.testing.expectEqualStrings(reference.items, stripped.items);
+}
+
+test "toWire leaves an LF-only or unfolded value untouched" {
+    const allocator = std.testing.allocator;
+    const plain = "i=1; cv=none";
+    const wire_plain = try toWire(allocator, plain);
+    defer allocator.free(wire_plain);
+    try std.testing.expectEqualStrings(plain, wire_plain);
+
+    const lf = "i=1;\n\tcv=none";
+    const wire_lf = try toWire(allocator, lf);
+    defer allocator.free(wire_lf);
+    try std.testing.expectEqualStrings(lf, wire_lf);
 }

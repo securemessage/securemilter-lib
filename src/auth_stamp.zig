@@ -3,6 +3,7 @@ const mem = std.mem;
 const posix = std.posix;
 const Allocator = mem.Allocator;
 const auth_results = @import("auth_results.zig");
+const header_fold = @import("header_fold.zig");
 const codec = @import("milter/codec.zig");
 const responses = @import("milter/responses.zig");
 const log = @import("log.zig");
@@ -37,10 +38,15 @@ pub fn stamp(
     const value = try auth_results.build(allocator, authserv_id, results);
     defer allocator.free(value);
 
+    // The builder folds with CRLF, the canonical form; the milter protocol
+    // carries folds as bare LF (smfi_addheader(3): the MTA adds the CR).
+    const wire_value = try header_fold.toWire(allocator, value);
+    defer allocator.free(wire_value);
+
     // Index 0: above every header the MTA has shown us. Any A-R this daemon
     // was going to remove has already been removed by `header_scrub`, which
     // addresses fields by per-name occurrence and so is unaffected by this.
-    const payload = try responses.insertHeader(allocator, 0, "Authentication-Results", value, leading_space);
+    const payload = try responses.insertHeader(allocator, 0, "Authentication-Results", wire_value, leading_space);
     defer allocator.free(payload);
 
     try codec.writePacket(fd, payload);
@@ -158,6 +164,37 @@ test "stamp writes nothing at all when it cannot build the header" {
 
     try std.testing.expect(saw_failure);
     try std.testing.expect(saw_success);
+}
+
+test "a folded value reaches the wire with LF folds and no carriage return" {
+    // The builder folds a long property list with CRLF (the canonical form);
+    // the milter protocol carries folds as bare LF, or the MTA's own LF-to-CRLF
+    // pass doubles every fold into a blank line and the field ends early for
+    // every downstream parser.
+    const fds = try posix.pipe2(.{ .NONBLOCK = true });
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try stamp(std.testing.allocator, fds[1], "mail.test", &.{
+        .{
+            .method = "spf",
+            .result = "pass",
+            .properties = &.{
+                .{ .ptype = "smtp", .property = "mailfrom", .value = "a-rather-long-domain-name.example.com" },
+                .{ .ptype = "smtp", .property = "helo", .value = "another-rather-long-hostname.example.org" },
+                .{ .ptype = "smtp", .property = "client-ip", .value = "192.0.2.123" },
+            },
+        },
+    }, false);
+
+    var buf: [1024]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    const packet = buf[0..n];
+
+    try std.testing.expect(mem.indexOfScalar(u8, packet, '\r') == null);
+    try std.testing.expect(mem.indexOf(u8, packet, "\n\t") != null);
+    try std.testing.expect(mem.indexOf(u8, packet, "smtp.mailfrom=a-rather-long-domain-name.example.com") != null);
+    try std.testing.expect(mem.indexOf(u8, packet, "smtp.client-ip=192.0.2.123") != null);
 }
 
 test "a stamping failure defers rather than accepting" {

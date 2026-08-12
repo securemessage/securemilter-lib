@@ -46,6 +46,10 @@ pub fn addHeader(
     value: []const u8,
     leading_space: bool,
 ) ![]u8 {
+    // The milter protocol carries header-value folds as bare LF; a CR here
+    // means a caller skipped header_fold.toWire and the MTA will double every
+    // fold into a blank line, ending the header block early downstream.
+    std.debug.assert(std.mem.indexOfScalar(u8, value, '\r') == null);
     const space: usize = if (leading_space) 1 else 0;
     const len = 1 + name.len + 1 + space + value.len + 1;
     const buf = try allocator.alloc(u8, len);
@@ -81,6 +85,8 @@ pub fn insertHeader(
     value: []const u8,
     leading_space: bool,
 ) ![]u8 {
+    // Same contract as addHeader: wire folds are bare LF, never CRLF.
+    std.debug.assert(std.mem.indexOfScalar(u8, value, '\r') == null);
     const space: usize = if (leading_space) 1 else 0;
     const len = 1 + 4 + name.len + 1 + space + value.len + 1;
     const buf = try allocator.alloc(u8, len);
@@ -106,6 +112,8 @@ pub fn changeHeader(
     name: []const u8,
     value: []const u8,
 ) ![]u8 {
+    // Same contract as addHeader: wire folds are bare LF, never CRLF.
+    std.debug.assert(std.mem.indexOfScalar(u8, value, '\r') == null);
     const len = 1 + 4 + name.len + 1 + value.len + 1;
     const buf = try allocator.alloc(u8, len);
 
