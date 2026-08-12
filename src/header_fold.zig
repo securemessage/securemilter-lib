@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const cfws = @import("cfws.zig");
 
 /// RFC 5322 §2.1.1 SHOULD. The target this module folds to.
 pub const SOFT_LIMIT: usize = 78;
@@ -105,6 +106,47 @@ pub const Folder = struct {
             try self.buf.appendSlice(self.allocator, rest[0..take]);
             self.column += take;
             rest = rest[take..];
+        }
+    }
+
+    /// End the line unconditionally: emit `separator`'s punctuation, then the
+    /// continuation prefix. This is `append` with the fit test removed, for a
+    /// value whose layout convention fixes some fold points regardless of
+    /// length — Authentication-Results puts one method per line.
+    pub fn breakLine(self: *Folder, separator: []const u8) !void {
+        const syntax = std.mem.trimRight(u8, separator, " \t");
+        try self.buf.appendSlice(self.allocator, syntax);
+        try self.buf.appendSlice(self.allocator, CONTINUATION);
+        self.column = 1; // the TAB
+    }
+
+    /// Write a structured value (tag lists, Authentication-Results bodies),
+    /// folding before whichever token would cross the limit.
+    ///
+    /// `text` is split at its whitespace runs; each maximal non-whitespace run
+    /// is one token except that a comment and a quoted string are each indivisible —
+    /// a fold must never land inside either. A whitespace run that survives
+    /// becomes exactly one space, so a value inherited from an earlier
+    /// emission (already folded, at columns right for its old field name) is
+    /// unfolded and refolded by the same call. As everywhere in this module, a
+    /// fold replaces whitespace but never deletes punctuation: a `;` abutting
+    /// a token stays abutting it.
+    pub fn appendStructured(self: *Folder, separator: []const u8, text: []const u8) !void {
+        var i: usize = 0;
+        var first = true;
+        while (i < text.len) {
+            var wsp_end = i;
+            while (wsp_end < text.len and std.ascii.isWhitespace(text[wsp_end])) wsp_end += 1;
+            if (wsp_end == text.len) break; // trailing whitespace carries no token
+            const sep: []const u8 = if (first) separator else if (wsp_end > i) " " else "";
+            i = wsp_end;
+
+            // tokenEnd skips a quoted string but stops at a comment start, so
+            // the comment case is taken explicitly.
+            const tok_end = if (text[i] == '(') cfws.skipComment(text, i) else cfws.tokenEnd(text, i, "");
+            try self.append(sep, text[i..tok_end]);
+            i = tok_end;
+            first = false;
         }
     }
 };
@@ -294,6 +336,94 @@ fn normalizeWsp(allocator: Allocator, text: []const u8) ![]u8 {
         in_wsp = is_wsp;
     }
     return out.toOwnedSlice(allocator);
+}
+
+test "breakLine folds regardless of fit" {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+
+    var f = Folder.init(&buf, std.testing.allocator, "Authentication-Results:".len + 1);
+    try f.append("", "mail.example.org");
+    try f.breakLine(";");
+    try f.append("", "spf=pass");
+
+    try std.testing.expectEqualStrings("mail.example.org;\r\n\tspf=pass", buf.items);
+}
+
+test "appendStructured folds at token boundaries and loses nothing" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+
+    const text = "spf=pass smtp.mailfrom=a-rather-long-domain-name.example.com " ++
+        "smtp.helo=another.long-hostname.example.org";
+    var f = Folder.init(&buf, allocator, "Authentication-Results:".len + 1);
+    try f.appendStructured("", text);
+
+    // It folded, and every line counting the field name stays inside the SHOULD.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, CONTINUATION) != null);
+    const whole = try std.mem.concat(allocator, u8, &.{ "Authentication-Results: ", buf.items });
+    defer allocator.free(whole);
+    try std.testing.expect(longestLine(whole) <= SOFT_LIMIT);
+
+    // Fold, unfold, compare with runs of whitespace normalised: equal, and the
+    // semicolon count survives — the invariant whose absence once let a
+    // swallowed separator reach the lab.
+    const unfolded = try testUnfold(allocator, buf.items);
+    defer allocator.free(unfolded);
+    const norm_a = try normalizeWsp(allocator, unfolded);
+    defer allocator.free(norm_a);
+    const norm_b = try normalizeWsp(allocator, text);
+    defer allocator.free(norm_b);
+    try std.testing.expectEqualStrings(norm_b, norm_a);
+}
+
+test "appendStructured refolds an already-folded value at the new columns" {
+    // A value inherited from an earlier emission — folded for a narrower field
+    // name — unfolds and refolds for this one rather than keeping folds that
+    // no longer land inside the limit.
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+
+    const inherited = "mail.example.org;\r\n\tspf=pass smtp.mailfrom=a-rather-long-domain.example.com;\r\n\tdkim=pass header.d=a-rather-long-domain.example.com";
+    var f = Folder.init(&buf, allocator, "ARC-Authentication-Results:".len + 1);
+    try f.appendStructured("i=1; ", inherited);
+
+    const whole = try std.mem.concat(allocator, u8, &.{ "ARC-Authentication-Results: ", buf.items });
+    defer allocator.free(whole);
+    try std.testing.expect(longestLine(whole) <= SOFT_LIMIT);
+
+    const unfolded = try testUnfold(allocator, buf.items);
+    defer allocator.free(unfolded);
+    const norm_a = try normalizeWsp(allocator, unfolded);
+    defer allocator.free(norm_a);
+    try std.testing.expectEqualStrings(
+        "i=1; mail.example.org; spf=pass smtp.mailfrom=a-rather-long-domain.example.com; dkim=pass header.d=a-rather-long-domain.example.com",
+        norm_a,
+    );
+    // Every semicolon survived: three separators in, three out.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, unfolded, ";"));
+}
+
+test "appendStructured never splits a comment or a quoted string" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+
+    const text = "dmarc=fail (p=reject and a reason long enough to matter) header.from=\"a quoted; value with spaces.example\"";
+    var f = Folder.init(&buf, allocator, "Authentication-Results:".len + 1);
+    try f.appendStructured("", text);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, CONTINUATION) != null);
+
+    // Both indivisible tokens survive whole and in order, however the lines
+    // fell around them.
+    const unfolded = try testUnfold(allocator, buf.items);
+    defer allocator.free(unfolded);
+    const norm = try normalizeWsp(allocator, unfolded);
+    defer allocator.free(norm);
+    try std.testing.expectEqualStrings(text, norm);
 }
 
 test "longestLine measures without the CRLF" {

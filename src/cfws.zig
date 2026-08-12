@@ -23,7 +23,11 @@ pub fn skip(s: []const u8, start: usize) usize {
 }
 
 /// Index just past the comment beginning at `s[start] == '('`.
-fn skipComment(s: []const u8, start: usize) usize {
+///
+/// Public so a folder can treat a comment as one indivisible token: a fold may
+/// precede or follow a comment but never land inside one without the caller
+/// opting into CFWS-aware placement.
+pub fn skipComment(s: []const u8, start: usize) usize {
     var i = start;
     var depth: usize = 0;
     while (i < s.len) : (i += 1) {

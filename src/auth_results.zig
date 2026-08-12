@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const cfws = @import("cfws.zig");
+const header_fold = @import("header_fold.zig");
 
 /// A single RFC 8601 Authentication-Results method result.
 ///
@@ -33,32 +34,52 @@ pub const testing_key_marker = struct {
 ///
 /// Returns the header value (without the "Authentication-Results:" prefix).
 /// Caller owns the returned slice.
+///
+/// The value is folded to the RFC 5322 §2.1.1 limits: one method per line, as
+/// before, and now also within a method whose own properties would run the
+/// line past 78 characters — a `dkim=pass header.d=` for a long domain reaches
+/// that on its own. Folding is FWS, so a consumer that unfolds (RFC 5322
+/// §2.2.3) reads exactly the value the arguments describe.
 pub fn build(allocator: Allocator, authserv_id: []const u8, results: []const MethodResult) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
 
-    try buf.appendSlice(allocator, authserv_id);
+    // The column counts the field name and its separating space: RFC 5322's
+    // limit applies to the whole line, and they occupy the first one.
+    var folder = header_fold.Folder.init(&buf, allocator, "Authentication-Results:".len + 1);
+    try folder.append("", authserv_id);
 
     for (results) |mr| {
-        try buf.appendSlice(allocator, ";\r\n\t");
-        try buf.appendSlice(allocator, mr.method);
-        try buf.append(allocator, '=');
-        try buf.appendSlice(allocator, mr.result);
+        // One method per line, unconditionally: the boundary fold is the
+        // header's layout convention, not a response to length.
+        try folder.breakLine(";");
+
+        // Assemble the method group unfolded, then let the Folder place it:
+        // appendStructured folds at the group's own token boundaries, which a
+        // token-by-token construction here would only duplicate.
+        var segment: std.ArrayList(u8) = .{};
+        defer segment.deinit(allocator);
+
+        try segment.appendSlice(allocator, mr.method);
+        try segment.append(allocator, '=');
+        try segment.appendSlice(allocator, mr.result);
 
         if (mr.reason) |reason| {
-            try buf.appendSlice(allocator, " (");
-            try appendComment(allocator, &buf, reason);
-            try buf.append(allocator, ')');
+            try segment.appendSlice(allocator, " (");
+            try appendComment(allocator, &segment, reason);
+            try segment.append(allocator, ')');
         }
 
         for (mr.properties) |prop| {
-            try buf.append(allocator, ' ');
-            try buf.appendSlice(allocator, prop.ptype);
-            try buf.append(allocator, '.');
-            try buf.appendSlice(allocator, prop.property);
-            try buf.append(allocator, '=');
-            try appendPvalue(allocator, &buf, prop.value);
+            try segment.append(allocator, ' ');
+            try segment.appendSlice(allocator, prop.ptype);
+            try segment.append(allocator, '.');
+            try segment.appendSlice(allocator, prop.property);
+            try segment.append(allocator, '=');
+            try appendPvalue(allocator, &segment, prop.value);
         }
+
+        try folder.appendStructured("", segment.items);
     }
 
     return buf.toOwnedSlice(allocator);
@@ -585,7 +606,7 @@ test "a control byte in a property value cannot end the header field" {
     });
     defer std.testing.allocator.free(value);
 
-    // `build` adds only its own folding CRLF.
+    // `build` adds only its own folding CRLF: the one between-method fold.
     try std.testing.expectEqual(@as(usize, 1), mem.count(u8, value, "\r\n"));
     try std.testing.expect(mem.indexOf(u8, value, "\r\nX-Injected") == null);
 }
@@ -644,4 +665,59 @@ test "a reason comment cannot escape its parentheses" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.results.items.len);
     try std.testing.expectEqualStrings("pass", parsed.results.items[0].result);
+}
+
+test "a method line longer than the limit folds within the method" {
+    // The defect this fixes: folding happened only between methods, so one
+    // method with a few long properties ran straight past 78.
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{
+            .method = "dkim",
+            .result = "pass",
+            .properties = &.{
+                .{ .ptype = "header", .property = "d", .value = "a-rather-long-domain-name.example.com" },
+                .{ .ptype = "header", .property = "s", .value = "a-selector-that-is-also-long-2026" },
+            },
+        },
+    });
+    defer std.testing.allocator.free(value);
+
+    // It must actually have folded beyond the method boundary, or this proves
+    // nothing: the boundary alone yields one fold, the overflow a second.
+    try std.testing.expect(mem.count(u8, value, "\r\n\t") >= 2);
+
+    // Every line, counting the field name on the first, inside the SHOULD.
+    const whole = try mem.concat(std.testing.allocator, u8, &.{ "Authentication-Results: ", value });
+    defer std.testing.allocator.free(whole);
+    try std.testing.expect(header_fold.longestLine(whole) <= header_fold.SOFT_LIMIT);
+
+    // Folding loses nothing: unfold, and every token is still there, and a
+    // consumer parsing the folded form directly (cfws treats CR/LF as
+    // whitespace) sees the same result.
+    try std.testing.expect(mem.indexOf(u8, value, "header.d=a-rather-long-domain-name.example.com") != null);
+    try std.testing.expect(mem.indexOf(u8, value, "header.s=a-selector-that-is-also-long-2026") != null);
+
+    var parsed = try parseResults(std.testing.allocator, value);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("pass", parsed.getResult("dkim").?);
+}
+
+test "a short value keeps exactly the pre-folding shape" {
+    // The boundary fold between methods predates the within-method fold; a
+    // value that fits is byte-identical to what build has always emitted, and
+    // nothing downstream re-learns to read it.
+    const value = try build(std.testing.allocator, "mail.example.org", &.{
+        .{ .method = "spf", .result = "pass", .properties = &.{.{
+            .ptype = "smtp",
+            .property = "mailfrom",
+            .value = "example.com",
+        }} },
+        .{ .method = "dkim", .result = "fail" },
+    });
+    defer std.testing.allocator.free(value);
+
+    try std.testing.expectEqualStrings(
+        "mail.example.org;\r\n\tspf=pass smtp.mailfrom=example.com;\r\n\tdkim=fail",
+        value,
+    );
 }
