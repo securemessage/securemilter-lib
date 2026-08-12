@@ -12,6 +12,21 @@ const log = @import("log.zig");
 /// A caller must defer the message if this fails, rather than delivering without
 /// the result. The complete value and milter packet are built before writing.
 /// `leading_space` comes from negotiated protocol capabilities.
+///
+/// PREPENDED, NOT APPENDED, and that is a requirement rather than a preference.
+/// RFC 8601 §4.1: the field "MUST be treated as though it were a trace header
+/// field ... and hence MUST NOT be reordered and MUST be prepended to the
+/// message", so that the position records where in the chain of handling MTAs
+/// the authentication was done. §4 adds that a handler which can only append is
+/// "strictly speaking ... not compliant with this specification". This used
+/// SMFIR_ADDHEADER, which appends, and was therefore in exactly that category.
+///
+/// WHAT THIS IS NOT. Appending never placed the field in the message BODY: the
+/// MTA writes an appended field at the end of the header block and emits the
+/// blank separator after it, which was confirmed against a delivered message
+/// before this change. The defect is trace ordering and RFC compliance, not
+/// body corruption -- with four milters appending, the oldest result ends up
+/// nearest the body and a consumer cannot tell which hop ran last.
 pub fn stamp(
     allocator: Allocator,
     fd: posix.fd_t,
@@ -22,7 +37,10 @@ pub fn stamp(
     const value = try auth_results.build(allocator, authserv_id, results);
     defer allocator.free(value);
 
-    const payload = try responses.addHeader(allocator, "Authentication-Results", value, leading_space);
+    // Index 0: above every header the MTA has shown us. Any A-R this daemon
+    // was going to remove has already been removed by `header_scrub`, which
+    // addresses fields by per-name occurrence and so is unaffected by this.
+    const payload = try responses.insertHeader(allocator, 0, "Authentication-Results", value, leading_space);
     defer allocator.free(payload);
 
     try codec.writePacket(fd, payload);
@@ -65,6 +83,12 @@ test "stamp writes one complete Authentication-Results field" {
     try std.testing.expect(mem.indexOf(u8, packet, "Authentication-Results") != null);
     try std.testing.expect(mem.indexOf(u8, packet, "spf=pass") != null);
     try std.testing.expect(mem.indexOf(u8, packet, "smtp.mailfrom=example.com") != null);
+
+    // RFC 8601 §4.1 requires prepending, so this must be SMFIR_INSHEADER at
+    // index 0 and not SMFIR_ADDHEADER. Asserted on the wire bytes because it is
+    // the MTA's view of them that decides where the field lands.
+    try std.testing.expectEqual(@as(u8, 'i'), packet[4]);
+    try std.testing.expectEqual(@as(u32, 0), mem.readInt(u32, packet[5..9], .big));
 }
 
 test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not" {
@@ -83,9 +107,9 @@ test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not
         const n = try posix.read(fds[0], &buf);
         const packet = buf[0..n];
 
-        // Packet layout: length prefix, `h`, name NUL, then value NUL.
+        // Packet layout: length prefix, `i`, index(4), name NUL, then value NUL.
         const name = "Authentication-Results";
-        const value_start = 4 + 1 + name.len + 1;
+        const value_start = 4 + 1 + 4 + name.len + 1;
         try std.testing.expect(packet.len > value_start);
         try std.testing.expectEqual(@as(u8, 0), packet[value_start - 1]);
 

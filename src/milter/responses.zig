@@ -63,20 +63,34 @@ pub fn addHeader(
 /// Build an SMFIR_INSHEADER payload.
 ///
 /// Format: index(uint32) name NUL value NUL
+///
+/// `index` is a position in the whole header block, 0 being above every
+/// existing header -- not the per-name occurrence index that `changeHeader`
+/// takes.
+///
+/// `leading_space` carries the same meaning and the same obligation as in
+/// `addHeader`: under `SMFIP_HDR_LEADSPC` the milter owns the space after the
+/// colon. It was missing here while `addHeader` had it, which made this
+/// function a trap -- switching a caller from appending to inserting would have
+/// silently dropped the separator and reintroduced D-23, where four daemons
+/// disagreed on their own header format.
 pub fn insertHeader(
     allocator: std.mem.Allocator,
     index: u32,
     name: []const u8,
     value: []const u8,
+    leading_space: bool,
 ) ![]u8 {
-    const len = 1 + 4 + name.len + 1 + value.len + 1;
+    const space: usize = if (leading_space) 1 else 0;
+    const len = 1 + 4 + name.len + 1 + space + value.len + 1;
     const buf = try allocator.alloc(u8, len);
 
     buf[0] = @intFromEnum(Code.insert_header);
     std.mem.writeInt(u32, buf[1..5], index, .big);
     @memcpy(buf[5 .. 5 + name.len], name);
     buf[5 + name.len] = 0;
-    @memcpy(buf[6 + name.len .. 6 + name.len + value.len], value);
+    if (leading_space) buf[6 + name.len] = ' ';
+    @memcpy(buf[6 + name.len + space ..][0..value.len], value);
     buf[len - 1] = 0;
 
     return buf;
@@ -142,12 +156,35 @@ test "add header" {
 }
 
 test "insert header" {
-    const buf = try insertHeader(std.testing.allocator, 0, "X-Prepend", "first");
+    const buf = try insertHeader(std.testing.allocator, 0, "X-Prepend", "first", false);
     defer std.testing.allocator.free(buf);
 
     try std.testing.expectEqual(@as(u8, 'i'), buf[0]);
     const idx = std.mem.readInt(u32, buf[1..5], .big);
     try std.testing.expectEqual(@as(u32, 0), idx);
+    try std.testing.expectEqualStrings("X-Prepend", buf[5..14]);
+    try std.testing.expectEqual(@as(u8, 0), buf[14]);
+    try std.testing.expectEqualStrings("first", buf[15..20]);
+    try std.testing.expectEqual(@as(u8, 0), buf[20]);
+}
+
+test "insert header carries the separator only under SMFIP_HDR_LEADSPC" {
+    // Same obligation addHeader has. Asserted on the bytes, because the whole
+    // point of D-23 was that nobody could see which side owned the space.
+    inline for (.{ true, false }) |leading_space| {
+        const buf = try insertHeader(std.testing.allocator, 0, "N", "v", leading_space);
+        defer std.testing.allocator.free(buf);
+
+        // 'i', index, "N", NUL, then the value with or without its space.
+        const value_start = 1 + 4 + 1 + 1;
+        if (leading_space) {
+            try std.testing.expectEqual(@as(u8, ' '), buf[value_start]);
+            try std.testing.expectEqual(@as(u8, 'v'), buf[value_start + 1]);
+        } else {
+            try std.testing.expectEqual(@as(u8, 'v'), buf[value_start]);
+        }
+        try std.testing.expectEqual(@as(u8, 0), buf[buf.len - 1]);
+    }
 }
 
 test "change header delete" {
