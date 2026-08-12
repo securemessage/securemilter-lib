@@ -137,6 +137,52 @@ pub const BoundListener = struct {
     }
 };
 
+/// `TCP_NODELAY` from <netinet/tcp.h>. Zig 0.15 exposes `std.c.TCP` for linux
+/// and macos but leaves it `void` on FreeBSD, so the value is written out here
+/// the same way `dns/resolver.zig` writes `TCP_KEEPINIT`.
+const TCP_NODELAY: u32 = 1;
+
+/// Set O_NONBLOCK on a descriptor.
+pub fn setNonBlocking(fd: posix.fd_t) !void {
+    const flags = try posix.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    // O_NONBLOCK = 0x0004 on FreeBSD
+    _ = try posix.fcntl(fd, posix.F.SETFL, flags | 0x0004);
+}
+
+/// Prepare a freshly accepted connection: non-blocking, and for TCP, no Nagle.
+///
+/// NAGLE IS WRONG FOR THIS PROTOCOL. Milter is strictly request/response -- the
+/// MTA sends a command and waits -- so coalescing small writes buys nothing and
+/// costs a delayed-ACK round trip wherever the daemon writes twice in a row. It
+/// writes twice at end-of-message: one packet per header modification, then the
+/// final action.
+///
+/// Measured with real Postfix on the production-emulating jails, capturing port
+/// 8891: the daemon wrote the 65-byte Authentication-Results modification, then
+/// sat 52.4 ms until Postfix's delayed ACK arrived before it could send the
+/// 5-byte accept, while its own log recorded elapsed=1-3ms. Postfix lists four
+/// milters and each stamps a header, so a message paid that four times.
+///
+/// Sendmail's libmilter does not set this (it sets only SO_REUSEADDR on the
+/// listener and SO_KEEPALIVE on the connection) and writes one packet per call
+/// exactly as this does, so OpenDKIM over TCP stalls the same way. That is not a
+/// reason to keep it: it is why the stall is rarely reported, because most
+/// deployments reach their milters over a unix socket, where Nagle never applies.
+///
+/// A failed setsockopt is ignored: the option cannot meaningfully fail on a TCP
+/// socket, and a lost optimisation must not cost a connection that works.
+pub fn prepareAccepted(addr: ListenAddress, fd: posix.fd_t) !void {
+    try setNonBlocking(fd);
+    switch (addr) {
+        // There is no Nagle on a unix socket and the option is not defined for one.
+        .unix => {},
+        .tcp => {
+            const one: u32 = 1;
+            posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_NODELAY, mem.asBytes(&one)) catch {};
+        },
+    }
+}
+
 /// Bind and listen on a parsed address.
 ///
 /// Uses SO_REUSEADDR + SO_REUSEPORT (for TCP), O_NONBLOCK.

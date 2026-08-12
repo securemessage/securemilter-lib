@@ -353,7 +353,8 @@ pub const Worker = struct {
                 continue;
             }
 
-            setNonBlocking(conn_fd) catch {
+            // Non-blocking, and Nagle off for TCP: see listener.prepareAccepted.
+            listener_mod.prepareAccepted(self.listeners.items[listener_index].address, conn_fd) catch {
                 posix.close(conn_fd);
                 continue;
             };
@@ -651,11 +652,9 @@ pub const Worker = struct {
     }
 };
 
-fn setNonBlocking(fd: posix.fd_t) !void {
-    const flags = try posix.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-    // O_NONBLOCK = 0x0004 on FreeBSD
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags | 0x0004);
-}
+/// Socket setup lives in listener.zig beside `bind`; the test pipes below need
+/// only the O_NONBLOCK half of it.
+const setNonBlocking = listener_mod.setNonBlocking;
 
 fn stripNull(data: []const u8) []const u8 {
     if (data.len > 0 and data[data.len - 1] == 0) {
@@ -804,4 +803,81 @@ test "worker init and deinit" {
 
     try std.testing.expect(worker.kq >= 0);
     try std.testing.expectEqual(@as(usize, 1), worker.listeners.items.len);
+}
+
+// --- Nagle on accepted TCP connections ---------------------------------------
+//
+// Asserted by reading the option back off a real accepted socket rather than by
+// checking that `disableNagle` was called, because the thing that matters is the
+// state of the connection the MTA is talking to. This defect cost ~52 ms per
+// modified message in the lab and was invisible to every existing probe: they
+// all measure verdicts, and the verdict was correct the whole time.
+
+test "an accepted TCP connection has Nagle disabled" {
+    var listener = try listener_mod.bind(.{ .tcp = .{ .host = "127.0.0.1", .port = 0 } });
+    defer listener.close();
+
+    // The bound port, so the client below can reach a listener on an
+    // OS-assigned port.
+    var addr: posix.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    try posix.getsockname(listener.fd, @ptrCast(&addr), &addr_len);
+
+    const client = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try posix.connect(client, @ptrCast(&addr), addr_len);
+
+    // `bind` forces the listener non-blocking, so the first accept can return
+    // WouldBlock before the completed connection reaches the accept queue.
+    const accepted = for (0..1000) |_| {
+        if (listener.accept()) |conn| break conn else |err| switch (err) {
+            error.WouldBlock => std.Thread.sleep(1 * std.time.ns_per_ms),
+            else => return err,
+        }
+    } else return error.TestUnexpectedResult;
+    defer accepted.stream.close();
+
+    // Exactly what the accept path calls.
+    try listener_mod.prepareAccepted(listener.address, accepted.stream.handle);
+
+    var value: u32 = 0;
+    try posix.getsockopt(
+        accepted.stream.handle,
+        posix.IPPROTO.TCP,
+        1, // TCP_NODELAY
+        mem.asBytes(&value),
+    );
+    try std.testing.expect(value != 0);
+
+    // The other half of prepareAccepted's contract, which the event loop
+    // depends on: a blocking connection fd would stall a whole worker thread.
+    const flags = try posix.fcntl(accepted.stream.handle, posix.F.GETFL, 0);
+    try std.testing.expect(flags & 0x0004 != 0);
+}
+
+test "prepareAccepted on a unix connection sets O_NONBLOCK and skips TCP_NODELAY" {
+    const path = "/tmp/securemilter-nodelay-test.sock";
+    std.fs.cwd().deleteFile(path) catch {};
+    var listener = try listener_mod.bind(.{ .unix = .{ .path = path } });
+    defer listener.close();
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    var un = try std.net.Address.initUnix(path);
+    try posix.connect(client, &un.any, un.getOsSockLen());
+
+    const accepted = for (0..1000) |_| {
+        if (listener.accept()) |conn| break conn else |err| switch (err) {
+            error.WouldBlock => std.Thread.sleep(1 * std.time.ns_per_ms),
+            else => return err,
+        }
+    } else return error.TestUnexpectedResult;
+    defer accepted.stream.close();
+
+    // Must not fail on a socket family that has no TCP_NODELAY.
+    try listener_mod.prepareAccepted(listener.address, accepted.stream.handle);
+
+    const flags = try posix.fcntl(accepted.stream.handle, posix.F.GETFL, 0);
+    try std.testing.expect(flags & 0x0004 != 0);
 }
