@@ -64,10 +64,19 @@ pub const Folder = struct {
     /// would not fit. `text` is never split; use `appendChunked` for a value
     /// that may exceed a whole line on its own.
     ///
-    /// `separator` is written before `text` on the same line when no fold
-    /// happens, and dropped when one does -- the fold supplies the whitespace.
+    /// `separator` precedes `text`. When a fold happens its WHITESPACE is
+    /// replaced by the fold, but any non-whitespace is still emitted first.
+    ///
+    /// That distinction is the whole correctness of this function. A separator
+    /// like "; " carries syntax, and an earlier version dropped it wholesale on
+    /// folding, which silently deleted the semicolon between two DKIM tags:
+    /// `d=example.com` and `s=sel` merged into one malformed tag, the b= value
+    /// parsed as empty, and every signature failed its own verification with
+    /// permerror. The fold supplies whitespace, never punctuation.
     pub fn append(self: *Folder, separator: []const u8, text: []const u8) !void {
         if (self.column + separator.len + text.len > self.limit and self.column > 1) {
+            const syntax = std.mem.trimRight(u8, separator, " \t");
+            try self.buf.appendSlice(self.allocator, syntax);
             try self.buf.appendSlice(self.allocator, CONTINUATION);
             self.column = 1; // the TAB
         } else {
@@ -201,6 +210,90 @@ test "unfolding a folded value restores one logical line" {
     try std.testing.expect(std.mem.indexOf(u8, unfolded.items, "v=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, unfolded.items, "b=") != null);
     try std.testing.expect(std.mem.indexOf(u8, unfolded.items, "bh=") != null);
+}
+
+/// RFC 5322 unfolding: remove a CRLF that precedes WSP.
+fn testUnfold(allocator: Allocator, folded: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < folded.len) {
+        if (i + 2 < folded.len and folded[i] == '\r' and folded[i + 1] == '\n' and
+            (folded[i + 2] == ' ' or folded[i + 2] == '\t'))
+        {
+            i += 2;
+            continue;
+        }
+        try out.append(allocator, folded[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "folding is lossless: unfolding restores the unfolded form exactly" {
+    // THE INVARIANT THAT MATTERS, and the one whose absence let a dropped
+    // semicolon reach the lab. Every earlier test here asserted line lengths and
+    // that a fold had occurred -- both of which a corrupted value satisfies.
+    const allocator = std.testing.allocator;
+
+    const tags = [_]struct { sep: []const u8, text: []const u8 }{
+        .{ .sep = " ", .text = "v=1" },
+        .{ .sep = "; ", .text = "a=rsa-sha256" },
+        .{ .sep = "; ", .text = "c=relaxed/relaxed" },
+        .{ .sep = "; ", .text = "d=a-domain-long-enough-to-force-a-fold.example.com" },
+        .{ .sep = "; ", .text = "s=test2026" },
+        .{ .sep = "; ", .text = "h=from:to:subject:date:message-id:reply-to:cc" },
+        .{ .sep = "; ", .text = "t=1786521741" },
+    };
+
+    var folded_buf: std.ArrayList(u8) = .{};
+    defer folded_buf.deinit(allocator);
+    var plain: std.ArrayList(u8) = .{};
+    defer plain.deinit(allocator);
+
+    var f = Folder.init(&folded_buf, allocator, "DKIM-Signature:".len);
+    for (tags) |t| {
+        try f.append(t.sep, t.text);
+        try plain.appendSlice(allocator, t.sep);
+        try plain.appendSlice(allocator, t.text);
+    }
+
+    // It must actually have folded, or the test proves nothing.
+    try std.testing.expect(std.mem.indexOf(u8, folded_buf.items, CONTINUATION) != null);
+
+    const unfolded = try testUnfold(allocator, folded_buf.items);
+    defer allocator.free(unfolded);
+
+    // Unfolding leaves the TAB the fold introduced where the separator's space
+    // used to be, so compare with whitespace runs normalised to one space.
+    const norm_a = try normalizeWsp(allocator, unfolded);
+    defer allocator.free(norm_a);
+    const norm_b = try normalizeWsp(allocator, plain.items);
+    defer allocator.free(norm_b);
+    try std.testing.expectEqualStrings(norm_b, norm_a);
+
+    // Specifically: every semicolon survived. Six separators, six semicolons.
+    var semicolons: usize = 0;
+    for (unfolded) |ch| {
+        if (ch == ';') semicolons += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), semicolons);
+}
+
+fn normalizeWsp(allocator: Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    var in_wsp = false;
+    for (text) |ch| {
+        const is_wsp = ch == ' ' or ch == '\t';
+        if (is_wsp) {
+            if (!in_wsp) try out.append(allocator, ' ');
+        } else {
+            try out.append(allocator, ch);
+        }
+        in_wsp = is_wsp;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 test "longestLine measures without the CRLF" {
