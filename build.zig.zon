@@ -1,6 +1,6 @@
 .{
     .name = .securemilter_lib,
-    .version = "0.5.3",
+    .version = "0.5.4",
     .fingerprint = 0x8088de3d2c2eb321,
     .minimum_zig_version = "0.15.0",
     .paths = .{
