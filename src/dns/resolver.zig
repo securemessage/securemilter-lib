@@ -144,7 +144,18 @@ pub const Resolver = struct {
         const query_start = std.time.nanoTimestamp();
         const response_data = self.sendAndReceive(query_pkt) catch |err| {
             const query_elapsed = @divFloor(std.time.nanoTimestamp() - query_start, 1_000_000);
-            log_mod.debug("dns: query {s} failed err={} elapsed={d}ms", .{ domain, err, query_elapsed });
+            // A monitor skip produced no wire traffic: nothing was learned
+            // about the domain, so there is nothing to cache. Negative-caching
+            // it once turned a seconds-long probe flap into a per-domain
+            // temperror for the whole negative TTL.
+            if (err == error.DnsNoHealthyServers) {
+                log_mod.warn("dns: {s} not queried, all nameservers marked down (monitor)", .{domain});
+                return err;
+            }
+            // Warn, not debug: every path through here defers real mail, and a
+            // failure class that only a debug build can see is invisible in
+            // exactly the environment that needs it.
+            log_mod.warn("dns: query {s} failed err={} elapsed={d}ms", .{ domain, err, query_elapsed });
             // Remember a timeout so a dead nameserver is not re-hammered for
             // every message, but remember it *as* a timeout: replaying it as a
             // generic failure would let one dropped packet look like an
@@ -201,6 +212,11 @@ pub const Resolver = struct {
                 .name_error
             else
                 .server_failure;
+            if (kind == .server_failure) {
+                // sendAndReceive already walked every configured server, so
+                // this answer is the *consensus*, not one server's mood.
+                log_mod.warn("dns: {s} refused, rcode={s} from all nameservers", .{ domain, @tagName(response.rcode) });
+            }
             self.cache.putNegative(domain, rtype, kind) catch {};
             return kind.toError();
         }
@@ -229,12 +245,24 @@ pub const Resolver = struct {
         const num_servers = self.addrs.len;
 
         // Fast path: if health monitor reports ALL servers down, fail immediately.
+        // Distinct from a wire timeout: no query was sent, so nothing was
+        // learned about the domain, and the caller must not cache this as the
+        // domain's answer.
         if (self.health_monitor) |monitor| {
-            if (monitor.healthyCount() == 0) return error.DnsTimeout;
+            if (monitor.healthyCount() == 0) return error.DnsNoHealthyServers;
         }
 
         // Try each server starting from round-robin index, skipping
         // servers the health monitor has marked unhealthy.
+        //
+        // SERVFAIL and REFUSED do not end the walk: one server's refusal says
+        // nothing about what the next would answer (a validating resolver's
+        // transient DNSSEC failure is the observed case). The first refusal is
+        // kept as the answer of last resort, so a single-server setup behaves
+        // exactly as before.
+        var refusal: ?[]u8 = null;
+        defer if (refusal) |f| self.allocator.free(f);
+
         var tried: usize = 0;
         while (tried < num_servers) : (tried += 1) {
             const idx = (self.rr_index + tried) % num_servers;
@@ -245,12 +273,24 @@ pub const Resolver = struct {
             }
 
             if (try self.udpServerQuery(self.addrs[idx], query)) |answer| {
+                const rcode = answer[3] & 0x0F;
+                if (rcode == 2 or rcode == 5) { // SERVFAIL, REFUSED
+                    log_mod.debug("dns: {s} returned rcode={d}, trying next server", .{ self.config.nameservers[idx], rcode });
+                    if (refusal) |old| self.allocator.free(old);
+                    refusal = answer;
+                    continue;
+                }
                 // Success — advance round-robin
                 self.rr_index = (idx + 1) % num_servers;
                 return answer;
             }
         }
 
+        if (refusal) |f| {
+            const kept = f;
+            refusal = null; // ownership moves to the caller
+            return kept;
+        }
         return error.DnsTimeout;
     }
 
@@ -476,6 +516,130 @@ test "resolver init and deinit" {
     defer r.deinit();
     try std.testing.expect(r.next_id != 0);
     try std.testing.expectEqual(@as(usize, 1), r.addrs.len);
+}
+
+// A minimal scripted UDP responder: answers each query with the rcode for
+// its ordinal (last entry repeats), counting what arrived so a test can tell
+// "the walk moved on" from "the wire was never touched".
+const TestResponder = struct {
+    sock: posix.socket_t,
+    rcodes: []const u8,
+    queries: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn run(self: *TestResponder) void {
+        const tv = posix.timeval{ .sec = 5, .usec = 0 };
+        posix.setsockopt(self.sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv)) catch return;
+        var qbuf: [512]u8 = undefined;
+        while (true) {
+            var src: posix.sockaddr.storage = undefined;
+            var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const n = posix.recvfrom(self.sock, &qbuf, 0, @ptrCast(&src), &src_len) catch return;
+            if (n < 12) continue;
+            const i = self.queries.fetchAdd(1, .seq_cst);
+            var rbuf: [600]u8 = undefined;
+            rbuf[0] = qbuf[0];
+            rbuf[1] = qbuf[1];
+            rbuf[2] = 0x85; // QR | RD
+            rbuf[3] = self.rcodes[@min(i, self.rcodes.len - 1)];
+            rbuf[4] = 0;
+            rbuf[5] = 1; // QDCOUNT
+            @memset(rbuf[6..12], 0);
+            const question = qbuf[12..n];
+            @memcpy(rbuf[12..][0..question.len], question);
+            _ = posix.sendto(self.sock, rbuf[0 .. 12 + question.len], 0, @ptrCast(&src), src_len) catch return;
+        }
+    }
+};
+
+fn bindV4Responder() !struct { sock: posix.socket_t, port: u16 } {
+    const srv = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    errdefer posix.close(srv);
+    const bind_addr = try net.Address.parseIp4("127.0.0.1", 0);
+    try posix.bind(srv, &bind_addr.any, bind_addr.getOsSockLen());
+    var bound = bind_addr;
+    var bound_len: posix.socklen_t = bound.getOsSockLen();
+    try posix.getsockname(srv, &bound.any, &bound_len);
+    return .{ .sock = srv, .port = bound.getPort() };
+}
+
+fn spawnResponder(sock: posix.socket_t, rcodes: []const u8) !*TestResponder {
+    const responder = try std.testing.allocator.create(TestResponder);
+    responder.* = .{ .sock = sock, .rcodes = rcodes };
+    const th = try std.Thread.spawn(.{}, TestResponder.run, .{responder});
+    th.detach();
+    return responder;
+}
+
+test "SERVFAIL from the first server falls over to the next" {
+    // A validating resolver's transient DNSSEC failure answers SERVFAIL fast;
+    // accepting it as final tempfailed real mail while a second configured
+    // server stood by. (Same address twice: the config format shares one port
+    // across servers, so the two entries are two walks over one responder.)
+    const srv = try bindV4Responder();
+    defer posix.close(srv.sock);
+    const responder = try spawnResponder(srv.sock, &.{ 2, 0 });
+    defer std.testing.allocator.destroy(responder);
+
+    var r = Resolver.init(std.testing.allocator, .{
+        .nameservers = &.{ "127.0.0.1", "127.0.0.1" },
+        .port = srv.port,
+        .timeout_ms = 2000,
+        .retries = 0,
+    });
+    defer r.deinit();
+
+    var result = try r.resolve("failover.test", .TXT);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), responder.queries.load(.seq_cst));
+}
+
+test "a lone server's SERVFAIL is still honoured, and cached as transient" {
+    const srv = try bindV4Responder();
+    defer posix.close(srv.sock);
+    const responder = try spawnResponder(srv.sock, &.{2});
+    defer std.testing.allocator.destroy(responder);
+
+    var r = Resolver.init(std.testing.allocator, .{
+        .nameservers = &.{"127.0.0.1"},
+        .port = srv.port,
+        .timeout_ms = 2000,
+        .retries = 0,
+    });
+    defer r.deinit();
+
+    try std.testing.expectError(error.DnsServerFailure, r.resolve("refused.test", .TXT));
+    // Cached: the repeat ask must not reach the wire.
+    try std.testing.expectError(error.DnsServerFailure, r.resolve("refused.test", .TXT));
+    try std.testing.expectEqual(@as(u32, 1), responder.queries.load(.seq_cst));
+}
+
+test "a monitor skip is not cached against the domain" {
+    // The skip path never sends a query, so nothing was learned about the
+    // domain; caching it once turned a probe flap into a per-domain outage
+    // for the whole negative TTL. The second ask must reach the wire.
+    const srv = try bindV4Responder();
+    defer posix.close(srv.sock);
+    const responder = try spawnResponder(srv.sock, &.{0});
+    defer std.testing.allocator.destroy(responder);
+
+    const monitor = try HealthMonitor.init(std.testing.allocator, &.{"127.0.0.1"}, srv.port, 5, 200);
+    defer monitor.deinit();
+
+    var r = Resolver.initWithMonitor(std.testing.allocator, .{
+        .nameservers = &.{"127.0.0.1"},
+        .port = srv.port,
+        .timeout_ms = 2000,
+        .retries = 0,
+    }, monitor);
+    defer r.deinit();
+
+    monitor.server_healthy[0].store(0, .release);
+    try std.testing.expectError(error.DnsNoHealthyServers, r.resolve("skipped.test", .TXT));
+
+    monitor.server_healthy[0].store(1, .release);
+    var result = try r.resolve("skipped.test", .TXT);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), responder.queries.load(.seq_cst));
 }
 
 test "resolver multi-server init" {

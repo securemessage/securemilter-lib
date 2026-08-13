@@ -17,6 +17,16 @@ const PROBE_PORT = 53;
 const PROBE_INTERVAL_S = 5;
 const PROBE_TIMEOUT_MS = 2000;
 
+/// Consecutive probe failures required before a server is marked down.
+///
+/// One dropped UDP probe is weather, not a verdict: the probe races whatever
+/// else the resolver is doing, and a recursive server mid-validation is the
+/// normal case, not a sick one. With a single configured server, condemning
+/// it on one packet gave every lookup a 0ms failure for up to a whole probe
+/// interval -- observed in production as sporadic temperror bursts against
+/// unrelated healthy domains, each succeeding on the sender's retry.
+const MARK_DOWN_AFTER = 2;
+
 /// Start the proactive monitor, or return null having said why.
 ///
 /// Null is a SUPPORTED MODE, not a failure: `Resolver.initWithMonitor(.., null)` falls
@@ -55,6 +65,9 @@ pub fn startMonitor(allocator: Allocator, nameservers: []const []const u8) ?*Hea
 pub const HealthMonitor = struct {
     /// Atomic health flags: 1 = healthy, 0 = unhealthy. Workers read, monitor writes.
     server_healthy: [MAX_SERVERS]std.atomic.Value(u8),
+    /// Consecutive probe failures per server; monitor thread only, never read
+    /// by workers, so plain bytes behind no lock.
+    fail_streak: [MAX_SERVERS]u8,
     addrs: []net.Address,
     num_servers: usize,
     probe_interval_s: u32,
@@ -81,6 +94,7 @@ pub const HealthMonitor = struct {
 
         monitor.* = .{
             .server_healthy = undefined,
+            .fail_streak = @splat(0),
             .addrs = addrs,
             .num_servers = nameservers.len,
             .probe_interval_s = probe_interval_s,
@@ -173,8 +187,16 @@ pub const HealthMonitor = struct {
 
     fn probeAll(self: *HealthMonitor) void {
         for (0..self.num_servers) |i| {
-            const healthy = self.probeServer(self.addrs[i]);
-            self.server_healthy[i].store(if (healthy) 1 else 0, .release);
+            if (self.probeServer(self.addrs[i])) {
+                // One success is proof of life; recovery is immediate.
+                self.fail_streak[i] = 0;
+                self.server_healthy[i].store(1, .release);
+            } else if (self.fail_streak[i] < 255) {
+                self.fail_streak[i] += 1;
+                if (self.fail_streak[i] >= MARK_DOWN_AFTER) {
+                    self.server_healthy[i].store(0, .release);
+                }
+            }
         }
     }
 
@@ -263,6 +285,20 @@ test "health monitor init and deinit" {
     try std.testing.expect(monitor.isHealthy(1));
     try std.testing.expect(!monitor.isHealthy(2));
     try std.testing.expectEqual(@as(usize, 2), monitor.healthyCount());
+}
+
+test "one failed probe does not condemn a server; two in a row do" {
+    // Nothing listens on the target port, so every probe fails after the
+    // (kept short) probe timeout. A single failure is weather; a streak is
+    // a verdict.
+    const monitor = try HealthMonitor.init(std.testing.allocator, &.{"127.0.0.1"}, 9, 5, 200);
+    defer monitor.deinit();
+
+    monitor.probeAll();
+    try std.testing.expect(monitor.isHealthy(0));
+
+    monitor.probeAll();
+    try std.testing.expect(!monitor.isHealthy(0));
 }
 
 test "build probe query" {
