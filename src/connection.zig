@@ -7,6 +7,7 @@ const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
 const header_mod = @import("header.zig");
 const config = @import("config.zig");
+const log_mod = @import("log.zig");
 
 /// Milter conversation state — tracks where we are in the SMTP lifecycle.
 pub const State = enum {
@@ -249,6 +250,28 @@ pub const Connection = struct {
         const ip = self.getPeerAddr();
         const name = self.macros.daemon_name orelse "unknown";
         return .{ .name = name, .ip = ip };
+    }
+
+    /// Note why a response write failed, at the level the cause deserves.
+    /// Called just before the connection is dropped for the failure.
+    ///
+    /// A peer that hung up mid-message is ordinary — scanners and MTA-side
+    /// timeouts do it constantly — so those stay at debug, where they cannot
+    /// drown the log in production. A full send buffer is the interesting
+    /// case: the MTA has stopped reading entirely, which deserves a warn
+    /// until per-connection output buffering exists to ride it out.
+    pub fn logWriteFailure(self: *const Connection, err: anyerror) void {
+        const peer = self.getPeerDisplay();
+        switch (err) {
+            error.WouldBlock => log_mod.warn(
+                "dropping connection from {s}[{s}]: send buffer full, peer not reading",
+                .{ peer.name, peer.ip },
+            ),
+            else => log_mod.debug(
+                "dropping connection from {s}[{s}]: response write failed: {s}",
+                .{ peer.name, peer.ip, @errorName(err) },
+            ),
+        }
     }
 
     pub fn deinit(self: *Connection) void {

@@ -1,3 +1,16 @@
+# 2026-08-13, worker.zig 463 -> 465, +2. Write-failure logging.
+#
+#   The two silent `catch { removeConnection }` sites (sendResponse and the
+#   OPTNEG reply) gained `conn.logWriteFailure(err)` each -- one statement per
+#   site, which is the whole raise. The logging itself lives in
+#   connection.zig precisely because this file is at ceiling: severity split
+#   (debug for ordinary peer hangups, warn for WouldBlock) and the peer
+#   formatting are there; worker.zig carries only the two calls.
+#
+#   NO OBLIGATION TO UNDO. The listener/accept seam recorded above remains
+#   the answer if this file grows for a structural reason; +2 of logging on
+#   the failure path is not that.
+#
 # 2026-08-05, EVERY NUMBER BELOW PREDATES A CHANGE TO WHAT IS COUNTED. Read the
 #   figures in the older notes as historical; they do not describe these files now.
 #
@@ -247,4 +260,4 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-463 src/worker.zig
+465 src/worker.zig

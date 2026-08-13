@@ -485,7 +485,8 @@ pub const Worker = struct {
             @as(u32, @bitCast(offer.protocol)) & @as(u32, @bitCast(self.callbacks.protocol_flags)),
         );
         const resp = negotiate.buildResponse(self.callbacks.required_actions, self.callbacks.protocol_flags, offer);
-        codec.writePacket(conn.fd, &resp) catch {
+        codec.writePacket(conn.fd, &resp) catch |err| {
+            conn.logWriteFailure(err);
             self.removeConnection(conn.fd);
             return;
         };
@@ -637,7 +638,8 @@ pub const Worker = struct {
     /// Caller must not touch `conn` after false. Bool return prevents the use-after-free
     /// that handleEom's resetMessage previously triggered (SIGBUS on early client close).
     fn sendResponse(self: *Worker, conn: *connection_mod.Connection, resp_code: u8) bool {
-        codec.writeSimpleResponse(conn.fd, resp_code) catch {
+        codec.writeSimpleResponse(conn.fd, resp_code) catch |err| {
+            conn.logWriteFailure(err);
             self.removeConnection(conn.fd);
             return false;
         };

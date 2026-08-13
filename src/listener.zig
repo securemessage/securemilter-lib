@@ -169,16 +169,23 @@ pub fn setNonBlocking(fd: posix.fd_t) !void {
 /// reason to keep it: it is why the stall is rarely reported, because most
 /// deployments reach their milters over a unix socket, where Nagle never applies.
 ///
+/// SO_KEEPALIVE matches libmilter's one connection-side option: the milters
+/// hold long-lived TCP connections from the MTA, and a silently dead peer
+/// (jail restart, NAT state drop) would otherwise occupy a connection slot
+/// until the next message write fails. Keepalive probes surface that in the
+/// background instead.
+///
 /// A failed setsockopt is ignored: the option cannot meaningfully fail on a TCP
 /// socket, and a lost optimisation must not cost a connection that works.
 pub fn prepareAccepted(addr: ListenAddress, fd: posix.fd_t) !void {
     try setNonBlocking(fd);
     switch (addr) {
-        // There is no Nagle on a unix socket and the option is not defined for one.
+        // Neither option is defined for a unix socket.
         .unix => {},
         .tcp => {
             const one: u32 = 1;
             posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_NODELAY, mem.asBytes(&one)) catch {};
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, mem.asBytes(&one)) catch {};
         },
     }
 }
