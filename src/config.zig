@@ -156,6 +156,75 @@ pub const Config = struct {
     }
 };
 
+/// Global keys the library itself consumes, for validateKeys tables. The
+/// daemons concatenate their own keys onto this at comptime.
+pub const base_global_keys = [_][]const u8{
+    // connection.Limits
+    "MaxHeaders",
+    "MaxHeaderBytes",
+    "MaxBodyBytes",
+    "MaxSignatures",
+    // log.LogConfig
+    "Syslog",
+    "SyslogFacility",
+    "LogLevel",
+};
+
+/// One offending key found by `validateKeys`.
+pub const KeyOffense = struct {
+    section: []const u8,
+    key: []const u8,
+    kind: Kind,
+
+    pub const Kind = enum {
+        /// No table knows this key -- almost certainly a typo.
+        unknown,
+        /// A known global key sitting in a listener section, where it has no
+        /// effect. The file's own layout hides the mistake from review.
+        misplaced,
+    };
+};
+
+/// Validate every key in every section against the daemon's known-key tables.
+///
+/// Silent acceptance is how a security control gets switched off invisibly:
+/// the daemon starts, the operator's intent is not in effect, and nothing says
+/// so. Twice in one day of live deployment work a key appended at end-of-file
+/// landed in the last listener section and did nothing. The operator must be
+/// told, so the caller is expected to refuse startup and name the offense.
+///
+/// Returns the first offense, or null when the file is clean.
+pub fn validateKeys(
+    cfg: *const Config,
+    global_keys: []const []const u8,
+    listener_keys: []const []const u8,
+) ?KeyOffense {
+    for (cfg.sectionNames()) |name| {
+        const sec = cfg.getSection(name) orelse continue;
+        const is_listener = mem.startsWith(u8, name, "listener:");
+        for (sec.entry_order.items) |key| {
+            if (is_listener) {
+                if (inSet(listener_keys, key)) continue;
+                return .{
+                    .section = name,
+                    .key = key,
+                    .kind = if (inSet(global_keys, key)) .misplaced else .unknown,
+                };
+            }
+            if (!inSet(global_keys, key))
+                return .{ .section = name, .key = key, .kind = .unknown };
+        }
+    }
+    return null;
+}
+
+fn inSet(set: []const []const u8, key: []const u8) bool {
+    for (set) |k| {
+        if (mem.eql(u8, k, key)) return true;
+    }
+    return false;
+}
+
 /// Parse an INI file from a byte slice.
 pub fn parse(allocator: Allocator, source: []const u8) !Config {
     var cfg = Config.init(allocator);
@@ -532,4 +601,65 @@ test "duplicate key overwrites" {
 
     const g = cfg.global().?;
     try std.testing.expectEqualStrings("second", g.get("Key").?);
+}
+
+test "validateKeys accepts a clean file" {
+    var cfg = try parse(std.testing.allocator,
+        \\AuthservID = mail.test
+        \\WorkerThreads = 0
+        \\[listener:inbound]
+        \\Socket = inet:8890@127.0.0.1
+        \\Mode = verify
+    );
+    defer cfg.deinit();
+
+    const global_keys = [_][]const u8{ "AuthservID", "WorkerThreads" };
+    const listener_keys = [_][]const u8{ "Socket", "Mode" };
+    try std.testing.expect(validateKeys(&cfg, &global_keys, &listener_keys) == null);
+}
+
+test "validateKeys names a typo in global" {
+    var cfg = try parse(std.testing.allocator,
+        \\AuthservID = mail.test
+        \\WhitelistFil = /tmp/x
+    );
+    defer cfg.deinit();
+
+    const global_keys = [_][]const u8{ "AuthservID", "WhitelistFile" };
+    const offense = validateKeys(&cfg, &global_keys, &.{}).?;
+    try std.testing.expectEqualStrings("global", offense.section);
+    try std.testing.expectEqualStrings("WhitelistFil", offense.key);
+    try std.testing.expectEqual(KeyOffense.Kind.unknown, offense.kind);
+}
+
+test "validateKeys names a global key misplaced in a listener section" {
+    // The trap seen twice in one day of live deployment: a key appended at
+    // end-of-file lands in the last listener section and silently does
+    // nothing.
+    var cfg = try parse(std.testing.allocator,
+        \\AuthservID = mail.test
+        \\[listener:inbound]
+        \\Socket = inet:8890@127.0.0.1
+        \\OverSignHeaders =
+    );
+    defer cfg.deinit();
+
+    const global_keys = [_][]const u8{ "AuthservID", "OverSignHeaders" };
+    const listener_keys = [_][]const u8{"Socket"};
+    const offense = validateKeys(&cfg, &global_keys, &listener_keys).?;
+    try std.testing.expectEqualStrings("listener:inbound", offense.section);
+    try std.testing.expectEqualStrings("OverSignHeaders", offense.key);
+    try std.testing.expectEqual(KeyOffense.Kind.misplaced, offense.kind);
+}
+
+test "validateKeys names an unknown key in a listener section" {
+    var cfg = try parse(std.testing.allocator,
+        \\[listener:inbound]
+        \\Sockt = inet:8890@127.0.0.1
+    );
+    defer cfg.deinit();
+
+    const offense = validateKeys(&cfg, &.{"Socket"}, &.{"Socket"}).?;
+    try std.testing.expectEqual(KeyOffense.Kind.unknown, offense.kind);
+    try std.testing.expectEqualStrings("Sockt", offense.key);
 }
