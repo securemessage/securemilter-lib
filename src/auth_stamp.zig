@@ -38,6 +38,19 @@ pub fn stamp(
     const value = try auth_results.build(allocator, authserv_id, results);
     defer allocator.free(value);
 
+    try stampValue(allocator, fd, value, leading_space);
+}
+
+/// The wire half of `stamp`, for a caller that built the value itself.
+/// securearc's combined verify+seal mode writes the verdict it just computed
+/// and then needs the same octets in the connection's header list, so the
+/// seal's AAR can carry it -- building twice would invite divergence.
+pub fn stampValue(
+    allocator: Allocator,
+    fd: posix.fd_t,
+    value: []const u8,
+    leading_space: bool,
+) !void {
     // The builder folds with CRLF, the canonical form; the milter protocol
     // carries folds as bare LF (smfi_addheader(3): the MTA adds the CR).
     const wire_value = try header_fold.toWire(allocator, value);
