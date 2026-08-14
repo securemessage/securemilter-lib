@@ -117,174 +117,20 @@ pub const PacketReader = struct {
     }
 };
 
-/// Advance an iovec array past `written` bytes, returning the unwritten tail.
-///
-/// Split out from `writePacket` so the arithmetic that a short write depends on
-/// is testable without a socket that can be persuaded to write short. Entries
-/// fully consumed are dropped; the first partly consumed entry is rebased.
-fn advanceIov(iov: []posix.iovec_const, written: usize) []posix.iovec_const {
-    var left = written;
-    var i: usize = 0;
-    while (i < iov.len) {
-        if (left < iov[i].len) {
-            iov[i].base += left;
-            iov[i].len -= left;
-            return iov[i..];
-        }
-        left -= iov[i].len;
-        i += 1;
-    }
-    return iov[i..];
-}
-
-/// Write a milter response packet to a file descriptor.
-///
-/// Encodes the 4-byte big-endian length prefix followed by the payload.
-/// The payload's first byte is the response command code.
-///
-/// ALL OR NOTHING, AND THAT IS THE CALLER'S CONTRACT. `writev` on a stream
-/// socket may accept fewer bytes than offered, and this used to be written as
-/// `_ = try posix.writev(fd, &iov)` -- the count discarded. A short write
-/// therefore put a truncated packet on the wire and returned success, leaving
-/// the MTA reading a length prefix whose bytes never arrived: the protocol
-/// desyncs and neither side can tell. libmilter has always looped here
-/// (`retry_writev` in comm.c); this is that loop.
-///
-/// On failure the packet is PARTLY WRITTEN and the connection is no longer
-/// usable -- the caller must close it, never retry, because a retry would
-/// duplicate the bytes that did land. Every caller already propagates the error
-/// to a path that removes the connection.
-///
-/// A full send buffer surfaces as `error.WouldBlock` and is treated the same
-/// way. Deliberate, and the reason is worth recording: the alternative is a
-/// per-connection output buffer plus EVFILT_WRITE re-arming, which is real
-/// event-loop machinery in the exact area that has already produced one
-/// use-after-free (see the "dead peer at EOM" fix), traded against a case that
-/// needs an MTA which has stopped reading altogether while our largest packet
-/// is roughly 1 KB against a 32 KB default send buffer. The MTA sees the closed
-/// connection and applies `milter_default_action`, so the message is deferred
-/// rather than mishandled. If that trade ever stops being right, the buffer is
-/// the fix, not a blocking retry: this runs on a thread shared with up to
-/// MaxConnections other connections.
-pub fn writePacket(fd: posix.fd_t, payload: []const u8) !void {
-    var hdr: [4]u8 = undefined;
-    mem.writeInt(u32, &hdr, @intCast(payload.len), .big);
-
-    var iov = [_]posix.iovec_const{
-        .{ .base = &hdr, .len = hdr.len },
-        .{ .base = payload.ptr, .len = payload.len },
-    };
-
-    var rest: []posix.iovec_const = &iov;
-    while (rest.len > 0) {
-        const n = try posix.writev(fd, rest);
-        // A stream socket returns 0 only with nothing offered, which cannot
-        // happen here: rest is non-empty and every entry has a non-zero length
-        // after advanceIov. Guarding anyway, because the alternative is a loop
-        // that never terminates.
-        if (n == 0) return error.BrokenPipe;
-        rest = advanceIov(rest, n);
-    }
-}
-
-/// Convenience: write a simple single-byte response.
-pub fn writeSimpleResponse(fd: posix.fd_t, code: u8) !void {
-    const payload = [_]u8{code};
-    try writePacket(fd, &payload);
-}
-
-// --- short writes -------------------------------------------------------------
+// --- the write half lives in outbuf.zig ---------------------------------------
 //
-// `writePacket` discarded the writev return value until 2026-08-12, so a short
-// write shipped a truncated packet and reported success. These test the
-// arithmetic that fixes it directly, because a socket cannot be reliably
-// persuaded to write short on demand -- doing it through a real fd would need a
-// full send buffer and a peer draining it, which is a race, and a racy test in a
-// gate is worse than no test.
-
-/// The two-entry shape `writePacket` builds: a 4-byte header and a payload.
-fn testIov(hdr: []const u8, payload: []const u8) [2]posix.iovec_const {
-    return .{
-        .{ .base = hdr.ptr, .len = hdr.len },
-        .{ .base = payload.ptr, .len = payload.len },
-    };
-}
-
-fn iovTotal(iov: []const posix.iovec_const) usize {
-    var n: usize = 0;
-    for (iov) |v| n += v.len;
-    return n;
-}
-
-test "advanceIov: nothing written leaves the vector untouched" {
-    var iov = testIov("LLLL", "payload");
-    const rest = advanceIov(&iov, 0);
-    try std.testing.expectEqual(@as(usize, 2), rest.len);
-    try std.testing.expectEqual(@as(usize, 11), iovTotal(rest));
-}
-
-test "advanceIov: a write inside the header rebases only the header" {
-    var iov = testIov("LLLL", "payload");
-    const rest = advanceIov(&iov, 3);
-    try std.testing.expectEqual(@as(usize, 2), rest.len);
-    // One header byte left, plus the whole payload.
-    try std.testing.expectEqual(@as(usize, 1), rest[0].len);
-    try std.testing.expectEqual(@as(usize, 8), iovTotal(rest));
-    try std.testing.expectEqual(@as(u8, 'L'), rest[0].base[0]);
-}
-
-test "advanceIov: a write of exactly the header drops it" {
-    var iov = testIov("LLLL", "payload");
-    const rest = advanceIov(&iov, 4);
-    try std.testing.expectEqual(@as(usize, 1), rest.len);
-    try std.testing.expectEqual(@as(usize, 7), iovTotal(rest));
-    try std.testing.expectEqual(@as(u8, 'p'), rest[0].base[0]);
-}
-
-test "advanceIov: a write into the payload drops the header and rebases it" {
-    var iov = testIov("LLLL", "payload");
-    // Header plus "pay".
-    const rest = advanceIov(&iov, 7);
-    try std.testing.expectEqual(@as(usize, 1), rest.len);
-    try std.testing.expectEqual(@as(usize, 4), iovTotal(rest));
-    try std.testing.expectEqualStrings("load", rest[0].base[0..rest[0].len]);
-}
-
-test "advanceIov: a complete write leaves nothing, which is the loop's exit" {
-    var iov = testIov("LLLL", "payload");
-    const rest = advanceIov(&iov, 11);
-    try std.testing.expectEqual(@as(usize, 0), rest.len);
-    try std.testing.expectEqual(@as(usize, 0), iovTotal(rest));
-}
-
-test "advanceIov: repeated single-byte progress reassembles the whole packet" {
-    // What the loop does against a socket accepting one byte at a time: every
-    // byte must be delivered exactly once, in order.
-    var iov = testIov("ABCD", "payload");
-    var seen: std.ArrayList(u8) = .{};
-    defer seen.deinit(std.testing.allocator);
-
-    var rest: []posix.iovec_const = &iov;
-    while (rest.len > 0) {
-        try seen.append(std.testing.allocator, rest[0].base[0]);
-        rest = advanceIov(rest, 1);
-    }
-    try std.testing.expectEqualStrings("ABCDpayload", seen.items);
-}
-
-test "writePacket delivers the length prefix and payload byte-exact" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    try writePacket(fds[1], "Hheader-value");
-
-    var buf: [64]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    try std.testing.expectEqual(@as(usize, 4 + 13), n);
-    try std.testing.expectEqual(@as(u32, 13), mem.readInt(u32, buf[0..4], .big));
-    try std.testing.expectEqualStrings("Hheader-value", buf[4..n]);
-}
+// This file used to carry `writePacket(fd, payload)` and `writeSimpleResponse`.
+// They are gone, deliberately, rather than kept beside the queue: once a
+// connection holds queued bytes, a direct write to the same fd puts a later
+// packet in front of an earlier one, and the protocol desyncs with nothing in
+// either process saying so. An fd-taking writer is not wrong to call -- it is
+// wrong to call *second*, which is not a property a reader of a call site can
+// see. Removing it makes every reply go through `Connection.sendPacket`, and
+// makes a bypass a compile error instead of an intermittent field failure.
+//
+// The short-write contract that used to be documented here moved with it: the
+// unwritten tail is now retained and retried from the exact offset the kernel
+// stopped at, so a short write is ordinary rather than fatal.
 
 test "packet reader decode" {
     var reader = PacketReader.init(std.testing.allocator);

@@ -3,8 +3,8 @@ const mem = std.mem;
 const posix = std.posix;
 const Allocator = mem.Allocator;
 const auth_results = @import("auth_results.zig");
+const connection_mod = @import("connection.zig");
 const header_fold = @import("header_fold.zig");
-const codec = @import("milter/codec.zig");
 const responses = @import("milter/responses.zig");
 const log = @import("log.zig");
 
@@ -28,29 +28,29 @@ const log = @import("log.zig");
 /// before this change. The defect is trace ordering and RFC compliance, not
 /// body corruption -- with four milters appending, the oldest result ends up
 /// nearest the body and a consumer cannot tell which hop ran last.
+///
+/// Takes the connection rather than its fd and its allocator: the reply is
+/// queued on the connection now that ordering against every other packet is
+/// the wire's invariant, and `leading_space` was the negotiated flag off this
+/// same connection at all six call sites.
 pub fn stamp(
-    allocator: Allocator,
-    fd: posix.fd_t,
+    conn: *connection_mod.Connection,
     authserv_id: []const u8,
     results: []const auth_results.MethodResult,
-    leading_space: bool,
 ) !void {
-    const value = try auth_results.build(allocator, authserv_id, results);
-    defer allocator.free(value);
+    const value = try auth_results.build(conn.allocator, authserv_id, results);
+    defer conn.allocator.free(value);
 
-    try stampValue(allocator, fd, value, leading_space);
+    try stampValue(conn, value);
 }
 
 /// The wire half of `stamp`, for a caller that built the value itself.
 /// securearc's combined verify+seal mode writes the verdict it just computed
 /// and then needs the same octets in the connection's header list, so the
 /// seal's AAR can carry it -- building twice would invite divergence.
-pub fn stampValue(
-    allocator: Allocator,
-    fd: posix.fd_t,
-    value: []const u8,
-    leading_space: bool,
-) !void {
+pub fn stampValue(conn: *connection_mod.Connection, value: []const u8) !void {
+    const allocator = conn.allocator;
+
     // The builder folds with CRLF, the canonical form; the milter protocol
     // carries folds as bare LF (smfi_addheader(3): the MTA adds the CR).
     const wire_value = try header_fold.toWire(allocator, value);
@@ -59,10 +59,16 @@ pub fn stampValue(
     // Index 0: above every header the MTA has shown us. Any A-R this daemon
     // was going to remove has already been removed by `header_scrub`, which
     // addresses fields by per-name occurrence and so is unaffected by this.
-    const payload = try responses.insertHeader(allocator, 0, "Authentication-Results", wire_value, leading_space);
+    const payload = try responses.insertHeader(
+        allocator,
+        0,
+        "Authentication-Results",
+        wire_value,
+        conn.negotiated_protocol.header_leading_space,
+    );
     defer allocator.free(payload);
 
-    try codec.writePacket(fd, payload);
+    try conn.sendPacket(payload);
 }
 
 /// Return a temporary failure when `stamp` fails and log the missing method.
@@ -80,12 +86,45 @@ pub fn deferCode(err: anyerror, method: []const u8) u8 {
 
 // --- tests -------------------------------------------------------------------
 
-test "stamp writes one complete Authentication-Results field" {
-    const fds = try posix.pipe2(.{ .NONBLOCK = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+/// A connection whose replies land in a pipe, so a test can assert the bytes
+/// the MTA would read. Replies are queued, not written, so `wire` flushes.
+const StampPipe = struct {
+    read_fd: posix.fd_t,
+    conn: connection_mod.Connection,
 
-    try stamp(std.testing.allocator, fds[1], "mail.test", &.{
+    fn init(allocator: Allocator, leading_space: bool) !StampPipe {
+        const fds = try posix.pipe2(.{ .NONBLOCK = true });
+        var self = StampPipe{
+            .read_fd = fds[0],
+            // Owns the write end: `deinit` closes it.
+            .conn = connection_mod.Connection.init(allocator, fds[1], 0, .{}),
+        };
+        self.conn.negotiated_protocol.header_leading_space = leading_space;
+        return self;
+    }
+
+    fn deinit(self: *StampPipe) void {
+        self.conn.deinit();
+        posix.close(self.read_fd);
+    }
+
+    /// Everything queued so far, as the peer sees it. Empty when nothing was
+    /// queued, which is what an aborted stamp must leave behind.
+    fn wire(self: *StampPipe, buf: []u8) ![]u8 {
+        _ = try self.conn.flushOut();
+        const n = posix.read(self.read_fd, buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        return buf[0..n];
+    }
+};
+
+test "stamp writes one complete Authentication-Results field" {
+    var p = try StampPipe.init(std.testing.allocator, false);
+    defer p.deinit();
+
+    try stamp(&p.conn, "mail.test", &.{
         .{
             .method = "spf",
             .result = "pass",
@@ -93,11 +132,10 @@ test "stamp writes one complete Authentication-Results field" {
                 .{ .ptype = "smtp", .property = "mailfrom", .value = "example.com" },
             },
         },
-    }, false);
+    });
 
     var buf: [512]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    const packet = buf[0..n];
+    const packet = try p.wire(&buf);
 
     try std.testing.expect(mem.indexOf(u8, packet, "Authentication-Results") != null);
     try std.testing.expect(mem.indexOf(u8, packet, "spf=pass") != null);
@@ -114,17 +152,15 @@ test "under SMFIP_HDR_LEADSPC the value carries the space, otherwise it does not
     // The negotiated flag transfers ownership of this separator to the milter.
     // Assert the packet bytes, which are the part this module owns.
     for ([_]bool{ false, true }) |leading_space| {
-        const fds = try posix.pipe2(.{ .NONBLOCK = true });
-        defer posix.close(fds[0]);
-        defer posix.close(fds[1]);
+        var p = try StampPipe.init(std.testing.allocator, leading_space);
+        defer p.deinit();
 
-        try stamp(std.testing.allocator, fds[1], "mail.test", &.{
+        try stamp(&p.conn, "mail.test", &.{
             .{ .method = "dkim", .result = "pass" },
-        }, leading_space);
+        });
 
         var buf: [512]u8 = undefined;
-        const n = try posix.read(fds[0], &buf);
-        const packet = buf[0..n];
+        const packet = try p.wire(&buf);
 
         // Packet layout: length prefix, `i`, index(4), name NUL, then value NUL.
         const name = "Authentication-Results";
@@ -147,31 +183,30 @@ test "stamp writes nothing at all when it cannot build the header" {
     var fail_index: usize = 0;
     var saw_success = false;
     var saw_failure = false;
-    while (fail_index < 12) : (fail_index += 1) {
-        const fds = try posix.pipe2(.{ .NONBLOCK = true });
-        defer posix.close(fds[0]);
-        defer posix.close(fds[1]);
-
+    while (fail_index < 14) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(
             std.testing.allocator,
             .{ .fail_index = fail_index },
         );
-        const res = stamp(failing.allocator(), fds[1], "mail.test", &.{
+        // The connection carries the allocator now, so the queue itself is
+        // one of the allocations being failed -- which is the point: a packet
+        // that could not be queued must leave nothing on the wire either.
+        var p = try StampPipe.init(failing.allocator(), false);
+        defer p.deinit();
+
+        const res = stamp(&p.conn, "mail.test", &.{
             .{ .method = "dkim", .result = "pass" },
-        }, false);
+        });
 
         var buf: [512]u8 = undefined;
-        const n = posix.read(fds[0], &buf) catch |err| switch (err) {
-            error.WouldBlock => 0,
-            else => return err,
-        };
+        const packet = try p.wire(&buf);
 
         if (res) |_| {
             saw_success = true;
-            try std.testing.expect(mem.indexOf(u8, buf[0..n], "dkim=pass") != null);
+            try std.testing.expect(mem.indexOf(u8, packet, "dkim=pass") != null);
         } else |_| {
             saw_failure = true;
-            try std.testing.expectEqual(@as(usize, 0), n);
+            try std.testing.expectEqual(@as(usize, 0), packet.len);
         }
     }
 
@@ -184,11 +219,10 @@ test "a folded value reaches the wire with LF folds and no carriage return" {
     // the milter protocol carries folds as bare LF, or the MTA's own LF-to-CRLF
     // pass doubles every fold into a blank line and the field ends early for
     // every downstream parser.
-    const fds = try posix.pipe2(.{ .NONBLOCK = true });
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    var p = try StampPipe.init(std.testing.allocator, false);
+    defer p.deinit();
 
-    try stamp(std.testing.allocator, fds[1], "mail.test", &.{
+    try stamp(&p.conn, "mail.test", &.{
         .{
             .method = "spf",
             .result = "pass",
@@ -198,11 +232,10 @@ test "a folded value reaches the wire with LF folds and no carriage return" {
                 .{ .ptype = "smtp", .property = "client-ip", .value = "192.0.2.123" },
             },
         },
-    }, false);
+    });
 
     var buf: [1024]u8 = undefined;
-    const n = try posix.read(fds[0], &buf);
-    const packet = buf[0..n];
+    const packet = try p.wire(&buf);
 
     try std.testing.expect(mem.indexOfScalar(u8, packet, '\r') == null);
     try std.testing.expect(mem.indexOf(u8, packet, "\n\t") != null);

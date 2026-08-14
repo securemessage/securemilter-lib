@@ -11,6 +11,7 @@ const escape = @import("escape.zig");
 const codec = @import("milter/codec.zig");
 const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
+const outbuf = @import("milter/outbuf.zig");
 const responses = @import("milter/responses.zig");
 const reload_mod = @import("reload.zig");
 const log_mod = @import("log.zig");
@@ -232,8 +233,18 @@ pub const Worker = struct {
             for (events[0..n]) |ev| {
                 const fd: posix.fd_t = @intCast(ev.ident);
 
-                // Shutdown pipe EOF (write-end closed) = begin drain
-                if (fd == self.shutdown_pipe) {
+                // A rejected changelist entry, reported in the eventlist rather
+                // than by failing the call. The one that can reach here is an
+                // EVFILT_WRITE arm for a connection removed between staging and
+                // this kevent(): the fd is closed, so the registration is EBADF.
+                // Treating it as an event for `fd` would dispatch on a
+                // descriptor this worker no longer owns.
+                if (ev.flags & c.EV.ERROR != 0) {
+                    continue;
+                } else if (ev.filter == c.EVFILT.WRITE) {
+                    self.handleWritable(fd);
+                } else if (fd == self.shutdown_pipe) {
+                    // Shutdown pipe EOF (write-end closed) = begin drain
                     if (!self.draining) {
                         self.beginDrain();
                         drain_deadline = std.time.milliTimestamp() + @as(i64, @intCast(DRAIN_TIMEOUT_MS));
@@ -255,15 +266,15 @@ pub const Worker = struct {
         }
     }
 
-    /// Stage a READ registration for the next kevent() call.
+    /// Stage a registration for the next kevent() call.
     /// If the buffer is full, flush immediately (rare — only under
     /// extreme accept bursts exceeding 128 simultaneous new connections).
-    fn stageRead(self: *Worker, fd: posix.fd_t) void {
+    fn stage(self: *Worker, fd: posix.fd_t, filter: i16, flags: u16) void {
         if (self.pending_len >= MAX_PENDING) self.flushPending();
         self.pending[self.pending_len] = .{
             .ident = @intCast(fd),
-            .filter = c.EVFILT.READ,
-            .flags = c.EV.ADD | c.EV.CLEAR, // edge-triggered
+            .filter = filter,
+            .flags = flags,
             .fflags = 0,
             .data = 0,
             .udata = 0,
@@ -272,9 +283,34 @@ pub const Worker = struct {
         self.pending_len += 1;
     }
 
+    /// Readability, edge-triggered: the read path drains the socket fully.
+    fn stageRead(self: *Worker, fd: posix.fd_t) void {
+        self.stage(fd, c.EVFILT.READ, c.EV.ADD | c.EV.CLEAR);
+    }
+
+    /// Writability, one-shot: interest exists only while a reply is stuck, so
+    /// a persistent registration would report an idle socket writable forever.
+    /// EV_ONESHOT deregisters on delivery, which also means there is no filter
+    /// left behind to leak if the connection goes away before it fires.
+    fn stageWrite(self: *Worker, fd: posix.fd_t) void {
+        self.stage(fd, c.EVFILT.WRITE, c.EV.ADD | c.EV.ONESHOT);
+    }
+
     /// Emergency flush when pending buffer is full (standalone syscall).
+    ///
+    /// Collects into a real eventlist with a zero timeout rather than passing
+    /// none. With no eventlist, a changelist entry the kernel rejects makes
+    /// kevent() return an error AND ABANDON THE REST OF THE CHANGELIST -- so one
+    /// bad descriptor in a burst of 128 would silently leave the connections
+    /// behind it unregistered, waiting for a readability event that was never
+    /// asked for. With an eventlist the rejection is reported as an EV_ERROR
+    /// entry and the remaining changes are still applied; the entries are
+    /// discarded here because a change flush is not an event dispatch. The zero
+    /// timeout is what keeps this from blocking on the empty eventlist.
     fn flushPending(self: *Worker) void {
-        _ = posix.kevent(self.kq, self.pending[0..self.pending_len], &.{}, null) catch {};
+        var errors: [MAX_PENDING]Kevent = undefined;
+        const zero = posix.timespec{ .sec = 0, .nsec = 0 };
+        _ = posix.kevent(self.kq, self.pending[0..self.pending_len], &errors, &zero) catch {};
         self.pending_len = 0;
     }
 
@@ -485,11 +521,7 @@ pub const Worker = struct {
             @as(u32, @bitCast(offer.protocol)) & @as(u32, @bitCast(self.callbacks.protocol_flags)),
         );
         const resp = negotiate.buildResponse(self.callbacks.required_actions, self.callbacks.protocol_flags, offer);
-        codec.writePacket(conn.fd, &resp) catch |err| {
-            conn.logWriteFailure(err);
-            self.removeConnection(conn.fd);
-            return;
-        };
+        if (!self.send(conn, &resp)) return;
         conn.state = .connected;
     }
 
@@ -634,18 +666,66 @@ pub const Worker = struct {
         conn.resetMessage();
     }
 
-    /// Write response. Returns false if write failed and connection was removed/freed.
-    /// Caller must not touch `conn` after false. Bool return prevents the use-after-free
-    /// that handleEom's resetMessage previously triggered (SIGBUS on early client close).
-    fn sendResponse(self: *Worker, conn: *connection_mod.Connection, resp_code: u8) bool {
-        codec.writeSimpleResponse(conn.fd, resp_code) catch |err| {
+    /// Queue a reply and put everything queued on the wire.
+    ///
+    /// Returns false if the connection was removed/freed; the caller must not
+    /// touch `conn` after that. The bool return prevents the use-after-free
+    /// that handleEom's resetMessage previously triggered (SIGBUS on early
+    /// client close).
+    ///
+    /// One flush per reply is also what coalesces the end-of-message packets:
+    /// the product callback queues its header modifications and returns a
+    /// verdict, so the modifications and the final action are already sitting
+    /// in the queue together when this runs, and leave in one write.
+    fn send(self: *Worker, conn: *connection_mod.Connection, payload: []const u8) bool {
+        conn.sendPacket(payload) catch |err| {
             conn.logWriteFailure(err);
             self.removeConnection(conn.fd);
             return false;
         };
+        return self.flushOutput(conn, conn.fd);
+    }
+
+    fn sendResponse(self: *Worker, conn: *connection_mod.Connection, resp_code: u8) bool {
+        return self.send(conn, &[_]u8{resp_code});
+    }
+
+    /// Drain the connection's output queue, arming EVFILT_WRITE for whatever
+    /// the socket could not take.
+    ///
+    /// A full send buffer used to end the connection here, which deferred the
+    /// message. It now costs one registration and a later flush; only a real
+    /// write error, or a peer that lets the queue reach its ceiling, still
+    /// closes. Returns false if the connection was removed/freed.
+    fn flushOutput(self: *Worker, conn: *connection_mod.Connection, fd: posix.fd_t) bool {
+        const status = conn.flushOut() catch |err| {
+            conn.logWriteFailure(err);
+            self.removeConnection(fd);
+            return false;
+        };
+        if (status == .pending and !conn.write_armed) {
+            conn.write_armed = true;
+            self.stageWrite(fd);
+            conn.logOutputHeld();
+        }
         return true;
     }
 
+    /// The socket has room again. EV_ONESHOT already removed the registration,
+    /// so `write_armed` is cleared before the flush that may re-arm it.
+    fn handleWritable(self: *Worker, fd: posix.fd_t) void {
+        const conn = self.connections.get(fd) orelse return;
+        conn.write_armed = false;
+        _ = self.flushOutput(conn, fd);
+    }
+
+    /// Close a connection and free it, discarding anything still queued for it.
+    ///
+    /// Discarding is right for every caller: a write error means the bytes have
+    /// nowhere to go, and QUIT means the peer has finished reading -- Postfix
+    /// waits for each reply before sending the next command, so a queue that is
+    /// non-empty at QUIT belongs to a peer that stopped reading and then said
+    /// goodbye. Nothing here should wait for a socket the MTA is done with.
     fn removeConnection(self: *Worker, fd: posix.fd_t) void {
         if (self.connections.fetchRemove(fd)) |kv| {
             kv.value.deinit();
@@ -790,6 +870,368 @@ test "a dead peer at EOM must not leave handleEom touching the freed connection"
 
     // Connection removed by failed write; process still alive (the actual defect).
     try std.testing.expect(!worker.alive(worker_end));
+}
+
+// --- output buffering ----------------------------------------------------------
+//
+// These drive the handlers directly rather than the event loop, for the same
+// reason the dead-peer test above does: a kqueue edge is delivered by the
+// kernel on its own schedule, and a test that waits for one is a test that can
+// hang a gate. What the loop adds is `handleWritable` being called when the
+// socket is writable again; the tests call it at the point the loop would, and
+// the registration it depends on is asserted separately in `write_armed`.
+//
+// Every one of these was a dropped connection and a deferred message before
+// 2026-08-14.
+
+// Each of these holds one connection over a socketpair whose send buffer is far
+// smaller than the replies, so a stalled peer is deterministic rather than a
+// race. Helpers are declared inside the test blocks: a top-level one would
+// count against this file's ceiling, which is the accounting the lint rule
+// exists to prevent.
+test "a reply too large for the send buffer is held, not dropped, and completes" {
+    var sigs = std.mem.zeroes(std.c.sigset_t);
+    _ = std.c.sigaddset(&sigs, 13); // SIGPIPE
+    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigs, null);
+
+    const Probe = struct {
+        /// Queues a header modification far larger than the send buffer, then
+        /// accepts -- the shape of every signing and stamping daemon at EOM.
+        fn onEom(conn: *connection_mod.Connection) u8 {
+            const big = conn.allocator.alloc(u8, 200 * 1024) catch return 't';
+            defer conn.allocator.free(big);
+            @memset(big, 'x');
+            big[0] = 'i'; // SMFIR_INSHEADER, so the payload is a plausible packet
+            conn.sendPacket(big) catch return @intFromEnum(responses.Code.tempfail);
+            return @intFromEnum(responses.Code.accept);
+        }
+    };
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &fds,
+    ));
+    const worker_end = fds[0];
+    const peer_end = fds[1];
+    defer posix.close(peer_end);
+    try setNonBlocking(worker_end);
+    try setNonBlocking(peer_end);
+
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(worker_end, posix.SOL.SOCKET, posix.SO.SNDBUF, &small, @sizeOf(c_int));
+    _ = std.c.setsockopt(peer_end, posix.SOL.SOCKET, posix.SO.RCVBUF, &small, @sizeOf(c_int));
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{ .on_eom = Probe.onEom },
+        .shutdown_pipe = pipe[0],
+    });
+    defer worker.deinit();
+
+    const conn = try std.testing.allocator.create(connection_mod.Connection);
+    conn.* = connection_mod.Connection.init(std.testing.allocator, worker_end, 0, .{});
+    try worker.connections.put(worker_end, conn);
+
+    worker.dispatchPacket(conn, .{ .cmd = @intFromEnum(commands.Code.body_eob), .data = &.{} });
+
+    // THE DEFECT THIS FIXES: the connection survived, and the unsent tail is
+    // held with a writability registration owing.
+    try std.testing.expect(worker.alive(worker_end));
+    try std.testing.expect(conn.write_armed);
+    try std.testing.expect(conn.out.pending() > 0);
+
+    // The peer starts reading. Each pass is what the loop does on an
+    // EVFILT_WRITE event.
+    var got: std.ArrayListUnmanaged(u8) = .{};
+    defer got.deinit(std.testing.allocator);
+    var buf: [8192]u8 = undefined;
+    for (0..10_000) |_| {
+        while (posix.read(peer_end, &buf)) |n| {
+            if (n == 0) break;
+            try got.appendSlice(std.testing.allocator, buf[0..n]);
+        } else |_| {}
+        if (conn.out.pending() == 0) break;
+        worker.handleWritable(worker_end);
+        try std.testing.expect(worker.alive(worker_end));
+    } else return error.TestUnexpectedResult;
+
+    // Byte-exact and in order: the 200 KiB modification, then the accept.
+    try std.testing.expectEqual(@as(usize, 4 + 200 * 1024 + 4 + 1), got.items.len);
+    try std.testing.expectEqual(@as(u32, 200 * 1024), mem.readInt(u32, got.items[0..4], .big));
+    try std.testing.expectEqual(@as(u8, 'i'), got.items[4]);
+    const tail = got.items[4 + 200 * 1024 ..];
+    try std.testing.expectEqual(@as(u32, 1), mem.readInt(u32, tail[0..4], .big));
+    try std.testing.expectEqual(@intFromEnum(responses.Code.accept), tail[4]);
+    // Re-armed only while stuck.
+    try std.testing.expect(!conn.write_armed);
+}
+
+test "the end-of-message modification and the final action leave in one write" {
+    // Coalescing, asserted from the peer's side of a socketpair: while the
+    // callback is running, its modification must NOT yet be on the wire. That
+    // is the difference between this and the two-write shape that made Nagle
+    // observable -- and it cannot be faked by reading twice at the end, since
+    // the kernel would coalesce two writes into one readable buffer anyway.
+    const Probe = struct {
+        var peer_fd: posix.fd_t = -1;
+        var saw_early_bytes = true;
+        const modification = "i\x00\x00\x00\x00Authentication-Results\x00mail.test; spf=pass\x00";
+
+        fn onEom(conn: *connection_mod.Connection) u8 {
+            conn.sendPacket(modification) catch {};
+            var buf: [64]u8 = undefined;
+            saw_early_bytes = if (posix.read(peer_fd, &buf)) |n| n > 0 else |_| false;
+            return @intFromEnum(responses.Code.accept);
+        }
+    };
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &fds,
+    ));
+    defer posix.close(fds[1]);
+    try setNonBlocking(fds[0]);
+    try setNonBlocking(fds[1]);
+    Probe.peer_fd = fds[1];
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{ .on_eom = Probe.onEom },
+        .shutdown_pipe = pipe[0],
+    });
+    defer worker.deinit();
+
+    const conn = try std.testing.allocator.create(connection_mod.Connection);
+    conn.* = connection_mod.Connection.init(std.testing.allocator, fds[0], 0, .{});
+    try worker.connections.put(fds[0], conn);
+
+    worker.dispatchPacket(conn, .{ .cmd = @intFromEnum(commands.Code.body_eob), .data = &.{} });
+
+    try std.testing.expect(!Probe.saw_early_bytes);
+
+    // Both packets, together, after the dispatch.
+    var buf: [256]u8 = undefined;
+    const n = try posix.read(fds[1], &buf);
+    try std.testing.expectEqual(@as(usize, 4 + Probe.modification.len + 4 + 1), n);
+    try std.testing.expectEqual(@as(u8, 'i'), buf[4]);
+    try std.testing.expectEqual(@intFromEnum(responses.Code.accept), buf[n - 1]);
+}
+
+test "a peer that vanishes with a reply held closes the connection rather than waiting" {
+    // `.pending` means "retry when writable". A dead peer must not be reported
+    // that way: the connection would sit armed for an edge that never comes.
+    var sigs = std.mem.zeroes(std.c.sigset_t);
+    _ = std.c.sigaddset(&sigs, 13);
+    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigs, null);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &fds,
+    ));
+    try setNonBlocking(fds[0]);
+
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, &small, @sizeOf(c_int));
+    _ = std.c.setsockopt(fds[1], posix.SOL.SOCKET, posix.SO.RCVBUF, &small, @sizeOf(c_int));
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{},
+        .shutdown_pipe = pipe[0],
+    });
+    defer worker.deinit();
+
+    const conn = try std.testing.allocator.create(connection_mod.Connection);
+    conn.* = connection_mod.Connection.init(std.testing.allocator, fds[0], 0, .{});
+    try worker.connections.put(fds[0], conn);
+
+    // Fill the send buffer so the reply is held.
+    const big = try std.testing.allocator.alloc(u8, 200 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try conn.sendPacket(big);
+    try std.testing.expect(worker.flushOutput(conn, fds[0]));
+    try std.testing.expect(conn.write_armed);
+
+    // Peer disappears. The next writability event finds a broken pipe.
+    posix.close(fds[1]);
+    worker.handleWritable(fds[0]);
+
+    try std.testing.expect(!worker.alive(fds[0]));
+}
+
+test "a queue that reaches its ceiling closes the connection instead of growing" {
+    // The bound that keeps "the MTA stopped reading" from becoming unbounded
+    // resident memory. Reaching it is fatal to the connection exactly as a
+    // failed write always was.
+    var sigs = std.mem.zeroes(std.c.sigset_t);
+    _ = std.c.sigaddset(&sigs, 13);
+    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigs, null);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &fds,
+    ));
+    defer posix.close(fds[1]);
+    try setNonBlocking(fds[0]);
+
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, &small, @sizeOf(c_int));
+    _ = std.c.setsockopt(fds[1], posix.SOL.SOCKET, posix.SO.RCVBUF, &small, @sizeOf(c_int));
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{},
+        .shutdown_pipe = pipe[0],
+    });
+    defer worker.deinit();
+
+    const conn = try std.testing.allocator.create(connection_mod.Connection);
+    conn.* = connection_mod.Connection.init(std.testing.allocator, fds[0], 0, .{});
+    try worker.connections.put(fds[0], conn);
+
+    const chunk = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 'x');
+
+    // A peer reading nothing, and a daemon that keeps answering.
+    var alive_after: bool = true;
+    for (0..64) |_| {
+        conn.sendPacket(chunk) catch break;
+        if (!worker.flushOutput(conn, fds[0])) {
+            alive_after = false;
+            break;
+        }
+        try std.testing.expect(conn.out.pending() <= outbuf.MAX_QUEUED_BYTES);
+    }
+    // The ceiling is reached through `send`, which is the path a reply takes.
+    if (alive_after) {
+        while (worker.alive(fds[0])) {
+            if (!worker.send(conn, chunk)) break;
+        }
+    }
+    try std.testing.expect(!worker.alive(fds[0]));
+}
+
+test "the running event loop resumes a held reply when the socket drains" {
+    // The one test that goes through kqueue rather than calling the handlers.
+    // Everything above asserts what the worker does when told the socket is
+    // writable; only this asserts that it is ever told -- which is the whole
+    // EVFILT_WRITE registration, the EV_ONESHOT re-arm and the dispatch branch
+    // that routes a write event away from the read path.
+    //
+    // Bounded everywhere: the client always keeps reading, so the worker always
+    // makes progress, and every wait loop has a finite trip count.
+    var sigs = std.mem.zeroes(std.c.sigset_t);
+    _ = std.c.sigaddset(&sigs, 13);
+    _ = std.c.sigprocmask(std.c.SIG.BLOCK, &sigs, null);
+
+    const reply_len = 200 * 1024;
+    const Probe = struct {
+        fn onEom(conn: *connection_mod.Connection) u8 {
+            const big = conn.allocator.alloc(u8, 200 * 1024) catch
+                return @intFromEnum(responses.Code.tempfail);
+            defer conn.allocator.free(big);
+            @memset(big, 'x');
+            big[0] = 'i';
+            conn.sendPacket(big) catch return @intFromEnum(responses.Code.tempfail);
+            return @intFromEnum(responses.Code.accept);
+        }
+        fn run(w: *Worker) void {
+            w.run();
+        }
+    };
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+
+    var worker = try Worker.init(std.testing.allocator, .{
+        .addresses = &.{listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } }},
+        .callbacks = .{ .on_eom = Probe.onEom },
+        .shutdown_pipe = pipe[0],
+    });
+    defer worker.deinit();
+
+    var addr: posix.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    try posix.getsockname(worker.listeners.items[0].fd, @ptrCast(&addr), &addr_len);
+
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&worker});
+
+    const client = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    // A receive window far smaller than the reply, so the daemon's send buffer
+    // fills and the reply genuinely has to be held.
+    const small: c_int = 4096;
+    _ = std.c.setsockopt(client, posix.SOL.SOCKET, posix.SO.RCVBUF, &small, @sizeOf(c_int));
+    try posix.connect(client, @ptrCast(&addr), addr_len);
+
+    var eom: [5]u8 = undefined;
+    mem.writeInt(u32, eom[0..4], 1, .big);
+    eom[4] = @intFromEnum(commands.Code.body_eob);
+    try std.testing.expectEqual(@as(usize, 5), try posix.write(client, &eom));
+
+    // Let the reply stall before reading a byte of it: the daemon must arm
+    // instead of dropping us.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Non-blocking with a bounded budget on purpose. A regression here means
+    // the reply never resumes, and a blocking read would turn that into a hung
+    // gate instead of a failing test.
+    try setNonBlocking(client);
+    var got: usize = 0;
+    var first: [16]u8 = undefined;
+    var buf: [8192]u8 = undefined;
+    const want = 4 + reply_len + 4 + 1;
+    var idle: usize = 0;
+    while (got < want and idle < 5000) {
+        const n = posix.read(client, &buf) catch |err| switch (err) {
+            error.WouldBlock => {
+                idle += 1;
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+                continue;
+            },
+            else => break,
+        };
+        if (n == 0) break;
+        if (got == 0) @memcpy(&first, buf[0..16]);
+        got += n;
+    }
+
+    try std.testing.expectEqual(want, got);
+    try std.testing.expectEqual(@as(u32, reply_len), mem.readInt(u32, first[0..4], .big));
+    try std.testing.expectEqual(@as(u8, 'i'), first[4]);
+
+    posix.close(client);
+    posix.close(pipe[1]); // EOF on the shutdown pipe begins the drain
+    thread.join();
 }
 
 test "worker init and deinit" {

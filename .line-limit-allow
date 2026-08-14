@@ -1,3 +1,33 @@
+# 2026-08-14, worker.zig 465 -> 495, +30. Per-connection output buffering with
+#   EVFILT_WRITE re-arming. RAISED DELIBERATELY, and this is the structural
+#   reason the 2026-08-13 note said would justify one.
+#
+#   The event loop gained a second interest to manage. That is not decoration:
+#   until now a worker registered readability once per fd and never changed a
+#   registration again, so "which filters does this connection want" was not a
+#   question the file had to answer. It is now, and the lines are that answer --
+#   `stageWrite` (one-shot, because interest exists only while a reply is
+#   stuck), `handleWritable` (the resume), `flushOutput` (the one place that
+#   decides between drained, armed, and fatal), and the EV_ERROR arm in the
+#   dispatch loop, which exists because a staged write registration is the
+#   first change this worker can stage for an fd that may already be closed.
+#   Two of the thirty lines are `flushPending` collecting into a real
+#   eventlist: the same rejected-entry case, on the path where kevent() would
+#   otherwise abandon the rest of a 128-change burst.
+#
+#   WHAT WAS KEPT OUT. The queue itself, its ceiling, its compaction and its
+#   short-write arithmetic are all in `milter/outbuf.zig` (new, 62 counted
+#   lines) -- worker.zig holds no bytes and no offsets. Both log
+#   messages are in connection.zig, following the precedent set directly
+#   below: formatting is not what earns a raise. `sendResponse` shrank to one
+#   line on top of a shared `send`, and `stageRead` became a two-line wrapper
+#   over a `stage` that takes the filter, so the raise is smaller than the
+#   feature.
+#
+#   THE SEAM RECORDED BELOW IS STILL THE ANSWER IF THIS GROWS AGAIN. This file
+#   is now one worker's event loop and nothing else, which is the shape it
+#   should keep; the next structural addition should split rather than raise.
+#
 # 2026-08-13, worker.zig 463 -> 465, +2. Write-failure logging.
 #
 #   The two silent `catch { removeConnection }` sites (sendResponse and the
@@ -260,4 +290,4 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-465 src/worker.zig
+495 src/worker.zig

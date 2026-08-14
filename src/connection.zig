@@ -3,6 +3,7 @@ const mem = std.mem;
 const posix = std.posix;
 const Allocator = mem.Allocator;
 const codec = @import("milter/codec.zig");
+const outbuf = @import("milter/outbuf.zig");
 const commands = @import("milter/commands.zig");
 const negotiate = @import("milter/negotiate.zig");
 const header_mod = @import("header.zig");
@@ -201,6 +202,12 @@ pub const Connection = struct {
     /// Address family from SMFIC_CONNECT. Distinguishes "no IP (local/unix
     /// submission)" from "IP present but unparseable" (none vs permerror).
     connect_family: commands.Family = .unknown,
+    /// Replies waiting to go out on `fd`. See `sendPacket`.
+    out: outbuf.OutputBuffer = .{},
+    /// EVFILT_WRITE is registered for this connection because `out` did not
+    /// drain. Owned by the worker: only it can arm or clear the registration,
+    /// and it clears this when the one-shot event is delivered.
+    write_armed: bool = false,
 
     pub fn init(allocator: Allocator, fd: posix.fd_t, listener_index: usize, limits: Limits) Connection {
         return .{
@@ -252,23 +259,80 @@ pub const Connection = struct {
         return .{ .name = name, .ip = ip };
     }
 
-    /// Note why a response write failed, at the level the cause deserves.
-    /// Called just before the connection is dropped for the failure.
+    /// Queue one milter packet for this connection. Nothing reaches the socket
+    /// until the worker flushes, which is what lets an end-of-message reply --
+    /// header modifications plus the final action -- leave in a single write.
     ///
-    /// A peer that hung up mid-message is ordinary — scanners and MTA-side
-    /// timeouts do it constantly — so those stay at debug, where they cannot
-    /// drown the log in production. A full send buffer is the interesting
-    /// case: the MTA has stopped reading entirely, which deserves a warn
-    /// until per-connection output buffering exists to ride it out.
+    /// EVERY reply goes through here. There is no fd-taking writer beside it:
+    /// see the note at the foot of `codec.zig` for why a direct write would
+    /// reorder packets the moment anything is queued.
+    ///
+    /// Failure means the packet was not queued at all (allocation, or the
+    /// per-connection ceiling in `outbuf`), so the caller must treat the
+    /// message as unhandled -- exactly as it treated a failed write before.
+    pub fn sendPacket(self: *Connection, payload: []const u8) !void {
+        try self.out.queuePacket(self.allocator, payload);
+    }
+
+    /// Queue several packets as one indivisible unit -- all or none. Use this
+    /// wherever a partial group would be worse than nothing on the wire (the
+    /// three headers of an ARC set, audit X-8).
+    pub fn sendPackets(self: *Connection, payloads: []const []const u8) !void {
+        try self.out.queuePackets(self.allocator, payloads);
+    }
+
+    /// Queue a single-byte response (continue, accept, tempfail, ...).
+    pub fn sendCode(self: *Connection, code: u8) !void {
+        try self.sendPacket(&[_]u8{code});
+    }
+
+    /// Push queued replies at the socket. `.pending` means the send buffer
+    /// filled and the caller must arm EVFILT_WRITE; it is not a failure.
+    pub fn flushOut(self: *Connection) !outbuf.Status {
+        return self.out.flush(self.allocator, self.fd);
+    }
+
+    /// Note that a reply did not fit and is being held for a later flush.
+    ///
+    /// THIS IS THE TRIPWIRE the deferred design asked for. Every one of these
+    /// lines is a case that used to be a dropped connection and a deferred
+    /// message: the MTA stopped reading with a reply half-written. It is the
+    /// only signal that the buffering is doing anything, so it is logged once
+    /// per stall (on the transition into "held") rather than per flush.
+    ///
+    /// Lives here rather than in `worker.zig` for the reason recorded when
+    /// `logWriteFailure` was added: that file is at its recorded ceiling, and
+    /// message formatting is not what earns a raise.
+    pub fn logOutputHeld(self: *const Connection) void {
+        const peer = self.getPeerDisplay();
+        log_mod.info(
+            "holding {d} bytes of replies for {s}[{s}]: peer is not reading, will resume when it does",
+            .{ self.out.pending(), peer.name, peer.ip },
+        );
+    }
+
+    /// Note why a reply could not be delivered, at the level the cause
+    /// deserves. Called just before the connection is dropped for it.
+    ///
+    /// A peer that hung up mid-message is ordinary -- scanners and MTA-side
+    /// timeouts do it constantly -- so those stay at debug, where they cannot
+    /// drown the log in production.
+    ///
+    /// `error.OutputQueueFull` is the interesting one, and it is now a much
+    /// stronger statement than the `error.WouldBlock` it replaced: WouldBlock
+    /// meant only that one write did not fit, which buffering now rides out,
+    /// while this means the peer has read nothing for long enough to fill a
+    /// quarter-megabyte queue behind a 32 KiB socket buffer. That MTA is not
+    /// coming back.
     pub fn logWriteFailure(self: *const Connection, err: anyerror) void {
         const peer = self.getPeerDisplay();
         switch (err) {
-            error.WouldBlock => log_mod.warn(
-                "dropping connection from {s}[{s}]: send buffer full, peer not reading",
-                .{ peer.name, peer.ip },
+            error.OutputQueueFull => log_mod.warn(
+                "dropping connection from {s}[{s}]: {d} bytes of replies unread, output queue full",
+                .{ peer.name, peer.ip, self.out.pending() },
             ),
             else => log_mod.debug(
-                "dropping connection from {s}[{s}]: response write failed: {s}",
+                "dropping connection from {s}[{s}]: reply write failed: {s}",
                 .{ peer.name, peer.ip, @errorName(err) },
             ),
         }
@@ -276,6 +340,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         posix.close(self.fd);
+        self.out.deinit(self.allocator);
         self.reader.deinit();
         self.macros.deinit(self.allocator);
         self.freeHeaders();

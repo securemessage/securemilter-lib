@@ -2,7 +2,6 @@ const std = @import("std");
 const mem = std.mem;
 const auth_results = @import("auth_results.zig");
 const connection_mod = @import("connection.zig");
-const codec = @import("milter/codec.zig");
 const responses = @import("milter/responses.zig");
 const log = @import("log.zig");
 
@@ -65,7 +64,7 @@ pub fn stripAuthResults(
         const v = victims.items[i];
         const payload = responses.changeHeader(conn.allocator, v.ar_index, HEADER_NAME, "") catch continue;
         defer conn.allocator.free(payload);
-        codec.writePacket(conn.fd, payload) catch continue;
+        conn.sendPacket(payload) catch continue;
         conn.removeHeader(v.list_pos);
         removed += 1;
     }
