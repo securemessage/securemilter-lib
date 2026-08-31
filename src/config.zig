@@ -185,6 +185,24 @@ pub const KeyOffense = struct {
     };
 };
 
+/// One class of configuration section: which sections it covers, and the only
+/// keys legal inside them.
+///
+/// `listener:*` was the sole non-global class for as long as every daemon in
+/// the suite had exactly one kind of repeated section. SecureSCAN does not: its
+/// module set is open-ended by design, so its configuration grows a family of
+/// sections per module, and a validator that recognises two fixed shapes cannot
+/// express that. Rather than teach this file about modules, the caller now
+/// describes its own section classes.
+pub const SectionKind = struct {
+    /// The section name to match. With `prefix` set this is matched against the
+    /// START of the name and should carry its own separator ("listener:",
+    /// "modules."); otherwise it must equal the whole name.
+    name: []const u8,
+    prefix: bool = false,
+    keys: []const []const u8,
+};
+
 /// Validate every key in every section against the daemon's known-key tables.
 ///
 /// Silent acceptance is how a security control gets switched off invisibly:
@@ -199,12 +217,33 @@ pub fn validateKeys(
     global_keys: []const []const u8,
     listener_keys: []const []const u8,
 ) ?KeyOffense {
+    return validateSections(cfg, global_keys, &.{
+        .{ .name = "listener:", .prefix = true, .keys = listener_keys },
+    });
+}
+
+/// `validateKeys` generalised to any set of section classes.
+///
+/// A section matching no kind is checked against `global_keys`, which is what
+/// this function did for everything except `listener:*` before the kinds table
+/// existed. That is deliberately unchanged: tightening it to "an unrecognised
+/// section is itself an offense" would be the stricter rule, and arguably the
+/// right one, but it can refuse a config that starts a daemon today -- so it
+/// is a decision for whoever wants it, not a side effect of this one.
+///
+/// Kinds are tried in order and the first match wins, so an exact name may be
+/// listed ahead of a prefix that would also cover it.
+pub fn validateSections(
+    cfg: *const Config,
+    global_keys: []const []const u8,
+    kinds: []const SectionKind,
+) ?KeyOffense {
     for (cfg.sectionNames()) |name| {
         const sec = cfg.getSection(name) orelse continue;
-        const is_listener = mem.startsWith(u8, name, "listener:");
+        const matched = matchKind(kinds, name);
         for (sec.entry_order.items) |key| {
-            if (is_listener) {
-                if (inSet(listener_keys, key)) continue;
+            if (matched) |kind| {
+                if (inSet(kind.keys, key)) continue;
                 return .{
                     .section = name,
                     .key = key,
@@ -214,6 +253,17 @@ pub fn validateKeys(
             if (!inSet(global_keys, key))
                 return .{ .section = name, .key = key, .kind = .unknown };
         }
+    }
+    return null;
+}
+
+fn matchKind(kinds: []const SectionKind, name: []const u8) ?SectionKind {
+    for (kinds) |kind| {
+        const hit = if (kind.prefix)
+            mem.startsWith(u8, name, kind.name)
+        else
+            mem.eql(u8, name, kind.name);
+        if (hit) return kind;
     }
     return null;
 }
@@ -662,4 +712,108 @@ test "validateKeys names an unknown key in a listener section" {
     const offense = validateKeys(&cfg, &.{"Socket"}, &.{"Socket"}).?;
     try std.testing.expectEqual(KeyOffense.Kind.unknown, offense.kind);
     try std.testing.expectEqualStrings("Sockt", offense.key);
+}
+
+test "validateSections gives each section family its own key table" {
+    var cfg = try parse(std.testing.allocator,
+        \\[global]
+        \\WorkerThreads = 4
+        \\[listener:inbound]
+        \\Socket = inet:8897@127.0.0.1
+        \\[modules.url_dnsbl]
+        \\Weight = 6.0
+        \\[modules.clamav]
+        \\BudgetMs = 2000
+    );
+    defer cfg.deinit();
+
+    const kinds = [_]SectionKind{
+        .{ .name = "listener:", .prefix = true, .keys = &.{"Socket"} },
+        .{ .name = "modules.", .prefix = true, .keys = &.{ "Weight", "BudgetMs" } },
+    };
+    try std.testing.expect(validateSections(&cfg, &.{"WorkerThreads"}, &kinds) == null);
+}
+
+test "validateSections still names a typo inside a module section" {
+    // The point of the whole mechanism: a per-module section must not become a
+    // place where a misspelt key is silently accepted, which is exactly what
+    // happened before `validateKeys` existed at all.
+    var cfg = try parse(std.testing.allocator,
+        \\[modules.url_dnsbl]
+        \\Wieght = 6.0
+    );
+    defer cfg.deinit();
+
+    const kinds = [_]SectionKind{
+        .{ .name = "modules.", .prefix = true, .keys = &.{"Weight"} },
+    };
+    const offense = validateSections(&cfg, &.{}, &kinds).?;
+    try std.testing.expectEqualStrings("modules.url_dnsbl", offense.section);
+    try std.testing.expectEqualStrings("Wieght", offense.key);
+    try std.testing.expectEqual(KeyOffense.Kind.unknown, offense.kind);
+}
+
+test "validateSections reports a global key misplaced in any family, not just listeners" {
+    var cfg = try parse(std.testing.allocator,
+        \\[modules.clamav]
+        \\WorkerThreads = 4
+    );
+    defer cfg.deinit();
+
+    const kinds = [_]SectionKind{
+        .{ .name = "modules.", .prefix = true, .keys = &.{"BudgetMs"} },
+    };
+    const offense = validateSections(&cfg, &.{"WorkerThreads"}, &kinds).?;
+    try std.testing.expectEqual(KeyOffense.Kind.misplaced, offense.kind);
+}
+
+test "an exact-name kind listed first wins over a prefix that also covers it" {
+    // Ordering is the only way to express "this one section is special", so it
+    // is a documented property rather than an accident of the loop.
+    var cfg = try parse(std.testing.allocator,
+        \\[modules.bayes]
+        \\DbPath = /var/db/securescan/bayes
+    );
+    defer cfg.deinit();
+
+    const kinds = [_]SectionKind{
+        .{ .name = "modules.bayes", .keys = &.{"DbPath"} },
+        .{ .name = "modules.", .prefix = true, .keys = &.{"Weight"} },
+    };
+    try std.testing.expect(validateSections(&cfg, &.{}, &kinds) == null);
+}
+
+test "validateKeys is validateSections with one listener kind" {
+    // The four shipped daemons call `validateKeys`; if the wrapper ever stopped
+    // agreeing with the general form, they would silently get a different rule
+    // from the one this file documents.
+    var cfg = try parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.example.com
+        \\[listener:inbound]
+        \\Sockt = inet:8890@127.0.0.1
+    );
+    defer cfg.deinit();
+
+    const via_wrapper = validateKeys(&cfg, &.{"AuthservID"}, &.{"Socket"}).?;
+    const via_general = validateSections(&cfg, &.{"AuthservID"}, &.{
+        .{ .name = "listener:", .prefix = true, .keys = &.{"Socket"} },
+    }).?;
+
+    try std.testing.expectEqualStrings(via_wrapper.section, via_general.section);
+    try std.testing.expectEqualStrings(via_wrapper.key, via_general.key);
+    try std.testing.expectEqual(via_wrapper.kind, via_general.kind);
+}
+
+test "a section matching no kind is still checked against the global table" {
+    // Documented, unchanged behaviour -- not an endorsement of it. See the note
+    // on `validateSections` about why tightening this is a separate decision.
+    var cfg = try parse(std.testing.allocator,
+        \\[providers]
+        \\WorkerThreads = 4
+    );
+    defer cfg.deinit();
+
+    try std.testing.expect(validateSections(&cfg, &.{"WorkerThreads"}, &.{}) == null);
+    try std.testing.expect(validateSections(&cfg, &.{"Nope"}, &.{}) != null);
 }
