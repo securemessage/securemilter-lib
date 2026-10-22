@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
 const mem = std.mem;
+const assert = std.debug.assert;
+const Allocator = mem.Allocator;
 const log_mod = @import("log.zig");
 const escape = @import("escape.zig");
 const ip = @import("ip.zig");
@@ -113,28 +115,119 @@ pub const BoundListener = struct {
     server: net.Server,
     address: ListenAddress,
     fd: posix.fd_t,
+    /// Set on a worker's handle to a `SharedListener`. Closing such a handle
+    /// releases the worker's hold; the socket and path belong to the shared
+    /// listener.
+    shared: ?*SharedListener = null,
 
     /// Get the file descriptor for kqueue registration.
     pub fn getFd(self: *const BoundListener) posix.fd_t {
         return self.fd;
     }
 
-    /// Close the listening socket. Idempotent: the drain path closes
-    /// listeners before Worker.deinit() runs, and a second close would
-    /// hit EBADF in posix.close (unreachable → abort).
+    /// Close the listening socket, or release the hold on a shared one.
+    /// Idempotent: the drain path closes listeners before Worker.deinit()
+    /// runs, and a second close would hit EBADF in posix.close
+    /// (unreachable → abort) or release a hold twice.
     pub fn close(self: *BoundListener) void {
         if (self.fd < 0) return;
+        self.fd = -1;
+        if (self.shared) |shared| {
+            shared.release();
+            return;
+        }
         switch (self.address) {
             .unix => |ux| std.fs.cwd().deleteFile(ux.path) catch {},
             .tcp => {},
         }
         self.server.stream.close();
-        self.fd = -1;
     }
 
     /// Accept a connection (non-blocking).
     pub fn accept(self: *BoundListener) !net.Server.Connection {
         return self.server.accept();
+    }
+};
+
+/// Index of the open listener whose descriptor is `fd`, or null. A closed
+/// listener (fd -1) never matches.
+pub fn indexOfFd(listeners: []const BoundListener, fd: posix.fd_t) ?usize {
+    assert(fd >= 0);
+    for (listeners, 0..) |lst, index| {
+        if (lst.fd == fd) return index;
+    }
+    return null;
+}
+
+/// One Unix listener that every worker of a pool accepts on.
+///
+/// A Unix path names one socket, so it cannot be bound once per worker the
+/// way a TCP address is: each `bind` would unlink the path and leave the
+/// previous worker's socket unreachable. The pool binds the path once and each
+/// worker registers the same descriptor in its own kqueue. Every worker woken
+/// by a new connection accepts until EAGAIN, and the kernel hands each pending
+/// connection to exactly one of them.
+///
+/// `holders` counts the creator and every handle from `acquire`. The last
+/// `release` closes the descriptor, unlinks the path and frees this struct,
+/// so each happens exactly once and only when no worker can accept on the
+/// descriptor any more.
+pub const SharedListener = struct {
+    allocator: Allocator,
+    bound: BoundListener,
+    holders: std.atomic.Value(u32),
+
+    /// Bind the Unix path `addr` once for `worker_count` workers. The caller
+    /// holds the first reference and must `release` it. Allocates with
+    /// `allocator`, which must be thread-safe: the last holder frees from its
+    /// own thread.
+    ///
+    /// The backlog is one worker's backlog per worker, so the path absorbs
+    /// the same burst as a TCP address with one listener per worker. The
+    /// kernel clamps it to kern.ipc.soacceptqueue (somaxconn on Linux).
+    pub fn create(allocator: Allocator, addr: ListenAddress, worker_count: u32) !*SharedListener {
+        assert(addr == .unix);
+        assert(worker_count > 0);
+        const self = try allocator.create(SharedListener);
+        errdefer allocator.destroy(self);
+
+        const backlog: u31 = @intCast(@min(
+            @as(u64, listen_backlog) * worker_count,
+            std.math.maxInt(u31),
+        ));
+        self.* = .{
+            .allocator = allocator,
+            .bound = try bindUnix(addr, backlog),
+            .holders = .init(1),
+        };
+        assert(self.bound.shared == null);
+        return self;
+    }
+
+    /// A worker's handle on the shared socket. Closing the handle releases
+    /// this hold. Only a current holder may acquire, so the count cannot have
+    /// reached zero and freed the struct.
+    pub fn acquire(self: *SharedListener) BoundListener {
+        // Monotonic: the caller's own hold keeps the struct alive, and the
+        // handle reaches its worker thread through thread spawn.
+        const previous = self.holders.fetchAdd(1, .monotonic);
+        assert(previous > 0);
+
+        var handle = self.bound;
+        handle.shared = self;
+        return handle;
+    }
+
+    /// Drop one hold. The last one closes the socket and unlinks the path.
+    pub fn release(self: *SharedListener) void {
+        // Acq_rel: each holder's last accept happens before its release, and
+        // the final release must see all of them before closing the socket.
+        const previous = self.holders.fetchSub(1, .acq_rel);
+        assert(previous > 0);
+        if (previous > 1) return;
+
+        self.bound.close();
+        self.allocator.destroy(self);
     }
 };
 
@@ -219,13 +312,15 @@ const listen_backlog: u31 = 256;
 
 /// Bind and listen on a parsed address. The socket is non-blocking.
 ///
-/// Each worker calls this for every configured address, so a TCP address gets
-/// one listening socket per worker. Those sockets set SO_REUSEADDR and
+/// Each worker calls this for every TCP address, so a TCP address gets one
+/// listening socket per worker. Those sockets set SO_REUSEADDR and
 /// `balanced_reuse_port`, and the kernel spreads connections across them by
 /// connection hash.
 ///
-/// A Unix path is unlinked and rebound by each worker in turn, so only the
-/// socket bound last stays reachable and it receives every connection.
+/// A Unix path is unlinked first and then bound, so binding the same path
+/// again leaves the earlier socket unreachable. A pool therefore binds each
+/// path once, through `SharedListener`, and every worker accepts on that one
+/// socket.
 pub fn bind(addr: ListenAddress) !BoundListener {
     switch (addr) {
         .tcp => |tcp| {
@@ -237,22 +332,26 @@ pub fn bind(addr: ListenAddress) !BoundListener {
                 .fd = server.stream.handle,
             };
         },
-        .unix => |ux| {
-            std.fs.cwd().deleteFile(ux.path) catch {};
-
-            const un_addr = try net.Address.initUnix(ux.path);
-            const server = try un_addr.listen(.{
-                .reuse_address = true,
-                .force_nonblocking = true,
-                .kernel_backlog = listen_backlog,
-            });
-            return .{
-                .server = server,
-                .address = addr,
-                .fd = server.stream.handle,
-            };
-        },
+        .unix => return bindUnix(addr, listen_backlog),
     }
+}
+
+/// Unlink the Unix path `addr`, then bind and listen on it with `backlog`.
+fn bindUnix(addr: ListenAddress, backlog: u31) !BoundListener {
+    const path = addr.unix.path;
+    std.fs.cwd().deleteFile(path) catch {};
+
+    const un_addr = try net.Address.initUnix(path);
+    const server = try un_addr.listen(.{
+        .reuse_address = true,
+        .force_nonblocking = true,
+        .kernel_backlog = backlog,
+    });
+    return .{
+        .server = server,
+        .address = addr,
+        .fd = server.stream.handle,
+    };
 }
 
 /// Open a non-blocking TCP listener on `address` that joins the kernel's
@@ -474,6 +573,32 @@ test "connections to a shared TCP address reach every listener" {
         if (count == 0) std.debug.print("per-listener accepts: {any}\n", .{accepted});
         try std.testing.expect(count > 0);
     }
+}
+
+// Goal: a shared Unix listener stays reachable until its last holder lets go,
+// then its path is unlinked and its memory freed exactly once. Method: take
+// two handles, drop the creator's hold and one handle, check that a client
+// still connects, then drop the last handle and check that the path is gone.
+// The testing allocator reports a leak or a double free.
+test "a shared unix listener is closed and unlinked by its last holder" {
+    const path = "/tmp/securemilter-test-shared.sock";
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const addr: ListenAddress = .{ .unix = .{ .path = path } };
+    const shared = try SharedListener.create(std.testing.allocator, addr, 2);
+    var first = shared.acquire();
+    var second = shared.acquire();
+    try std.testing.expectEqual(first.fd, second.fd);
+
+    shared.release();
+    first.close();
+    first.close(); // idempotent: must not release a second hold
+
+    const client = try net.connectUnixSocket(path);
+    client.close();
+
+    second.close();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(path, .{}));
 }
 
 test "bind and close unix" {

@@ -71,11 +71,13 @@ const REFUSED_LOG_INTERVAL_MS: i64 = 1000;
 
 /// A single worker thread's state.
 ///
-/// Each worker owns its own kqueue, its own listener sockets, and its
-/// own connection pool. Workers share nothing with each other: no locks,
-/// no contention. TCP listeners join one kernel balancing group per
+/// Each worker owns its own kqueue, its own TCP listener sockets, and its
+/// own connection pool. TCP listeners join one kernel balancing group per
 /// address (SO_REUSEPORT_LB on FreeBSD), which spreads connections
-/// across the workers; see `listener.bind`.
+/// across the workers; see `listener.bind`. A Unix path is one socket
+/// bound by the pool and registered in every worker's kqueue; see
+/// `listener.SharedListener`. Nothing else is shared: no locks, no
+/// contention.
 pub const Worker = struct {
     allocator: Allocator,
     kq: i32,
@@ -117,6 +119,10 @@ pub const Worker = struct {
         /// Read end of this worker's wakeup pipe, or -1 for none. Owned by the
         /// worker once `init` returns: `deinit` closes it.
         wakeup_fd: posix.fd_t = -1,
+        /// Pool-bound listeners, parallel to `addresses`, or empty. A non-null
+        /// entry is accepted on through a handle that `init` acquires and
+        /// `deinit` or the drain releases; the others are bound by this worker.
+        shared_listeners: []const ?*listener_mod.SharedListener = &.{},
     };
 
     /// On failure nothing is retained: the kqueue descriptor and any listeners
@@ -158,10 +164,17 @@ pub const Worker = struct {
         self.stageRead(opts.shutdown_pipe);
         if (opts.wakeup_fd >= 0) self.stageRead(opts.wakeup_fd);
 
-        for (opts.addresses) |addr| {
-            const bound = try listener_mod.bind(addr);
+        const shared = opts.shared_listeners;
+        if (shared.len != 0) std.debug.assert(shared.len == opts.addresses.len);
+        try self.listeners.ensureTotalCapacityPrecise(allocator, opts.addresses.len);
+
+        for (opts.addresses, 0..) |addr, index| {
+            const bound = if (shared.len != 0 and shared[index] != null) bound: {
+                std.debug.assert(addr == .unix);
+                break :bound shared[index].?.acquire();
+            } else try listener_mod.bind(addr);
+            self.listeners.appendAssumeCapacity(bound);
             self.stageRead(bound.fd);
-            try self.listeners.append(allocator, bound);
         }
 
         return self;
@@ -257,8 +270,8 @@ pub const Worker = struct {
                     while (posix.read(self.wakeup_fd, &sink)) |got| {
                         if (got < sink.len) break;
                     } else |_| {}
-                } else if (self.isListenFd(fd)) {
-                    if (!self.draining) self.handleAccept(fd);
+                } else if (listener_mod.indexOfFd(self.listeners.items, fd)) |index| {
+                    if (!self.draining) self.handleAccept(index);
                 } else if (ev.flags & 0x8000 != 0) { // EV_EOF = 0x8000 on FreeBSD
                     self.removeConnection(fd);
                 } else {
@@ -318,9 +331,17 @@ pub const Worker = struct {
 
     /// Begin graceful drain: close all listener sockets so no new
     /// connections are accepted, then let in-flight messages complete.
+    ///
+    /// A shared Unix socket stays open until its last holder releases it, so
+    /// this worker's read filter on it is deleted explicitly; closing an own
+    /// socket removes its filter. The delete is applied by the next kevent(),
+    /// possibly after the last holder closed the socket, and is then reported
+    /// as an EV_ERROR entry and skipped. A recycled descriptor number cannot
+    /// match a filter of this worker: a draining worker accepts nothing new.
     fn beginDrain(self: *Worker) void {
         self.draining = true;
         for (self.listeners.items) |*lst| {
+            if (lst.shared != null and lst.fd >= 0) self.stage(lst.fd, c.EVFILT.READ, c.EV.DELETE);
             lst.close();
         }
     }
@@ -358,23 +379,7 @@ pub const Worker = struct {
         self.refused_pending = 0;
     }
 
-    fn isListenFd(self: *const Worker, fd: posix.fd_t) bool {
-        for (self.listeners.items) |lst| {
-            if (lst.fd == fd) return true;
-        }
-        return false;
-    }
-
-    fn listenerIndexForFd(self: *const Worker, fd: posix.fd_t) usize {
-        for (self.listeners.items, 0..) |lst, i| {
-            if (lst.fd == fd) return i;
-        }
-        return 0;
-    }
-
-    fn handleAccept(self: *Worker, listen_fd: posix.fd_t) void {
-        const listener_index = self.listenerIndexForFd(listen_fd);
-
+    fn handleAccept(self: *Worker, listener_index: usize) void {
         while (true) {
             const conn_result = self.listeners.items[listener_index].accept() catch |err| {
                 if (err == error.WouldBlock) break;

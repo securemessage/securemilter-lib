@@ -5,12 +5,16 @@
 
 const std = @import("std");
 const posix = std.posix;
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const listener_mod = @import("listener.zig");
 const reload_mod = @import("reload.zig");
 const log_mod = @import("log.zig");
 const worker_mod = @import("worker.zig");
+const connection_mod = @import("connection.zig");
+const commands = @import("milter/commands.zig");
+const responses = @import("milter/responses.zig");
 
 const Worker = worker_mod.Worker;
 const Callbacks = worker_mod.Callbacks;
@@ -69,16 +73,32 @@ pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread)
         wakeup_rd = try cg.initWakeup(allocator, count);
     }
 
+    // Bind each Unix path once, here, so its failures are reported like every
+    // other bind failure below. The pool's hold on each shared listener is
+    // released on every return path; after a successful spawn the workers
+    // hold the only references, and the last one to drain closes the socket
+    // and unlinks the path.
+    const shared = try allocator.alloc(?*listener_mod.SharedListener, addresses.len);
+    defer allocator.free(shared);
+    @memset(shared, null);
+    defer for (shared) |slot| {
+        if (slot) |s| s.release();
+    };
+    for (addresses, shared) |addr, *slot| switch (addr) {
+        .unix => slot.* = try listener_mod.SharedListener.create(allocator, addr, count),
+        .tcp => {},
+    };
+
     // Phase 1: build every worker here, on the calling thread, where a failure
     // can still be reported to the caller.
     //
     // This is the fix for X-15 and it is deliberately a relocation rather than
-    // a barrier. Each worker binds its own sockets (see listener.bind), so this is
-    // where EADDRINUSE from a foreign process, an unwritable unix socket path
-    // or fd exhaustion surfaces. Performed inside the spawned thread the only
-    // available response was to log and return, leaving a daemon that had
-    // reported a successful start with fewer workers than it claimed -- or
-    // none at all -- and a quiescent-state slot frozen forever.
+    // a barrier. Each worker binds its own TCP sockets (see listener.bind), so
+    // this is where EADDRINUSE from a foreign process or fd exhaustion
+    // surfaces. Performed inside the spawned thread the only available
+    // response was to log and return, leaving a daemon that had reported a
+    // successful start with fewer workers than it claimed -- or none at all --
+    // and a quiescent-state slot frozen forever.
     const workers = try allocator.alloc(?*Worker, count);
     defer allocator.free(workers);
     @memset(workers, null);
@@ -110,6 +130,7 @@ pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread)
             .max_connections = max_connections,
             .worker_index = built,
             .wakeup_fd = wake_fd,
+            .shared_listeners = shared,
         });
         workers[built] = w;
     }
@@ -253,4 +274,132 @@ test "a TCP pool larger than one balancing group is refused" {
     const auto = try workerCount(0, &.{tcp});
     try std.testing.expect(auto >= 1);
     try std.testing.expect(auto <= listener_mod.balanced_listeners_max);
+}
+
+// Goal: connections to one Unix path reach every worker of a pool, and the
+// last worker to drain unlinks the path. Method: a four-worker pool on one
+// Unix address; `on_connect` holds each worker until four distinct worker
+// threads have entered it. Each client connects only after the previous one's
+// `on_connect` has run, so every earlier worker is blocked and only a free
+// worker can accept. With the path rebound per worker, every connection
+// reaches the last worker bound, the second client is never served, and the
+// wait times out with one thread counted.
+test "connections to a unix address reach every worker of the pool" {
+    const worker_count = 4;
+    const path = "/tmp/securemilter-test-pool-unix.sock";
+
+    const Probe = struct {
+        var mutex: std.Thread.Mutex = .{};
+        var cond: std.Thread.Condition = .{};
+        var threads: [worker_count]std.Thread.Id = undefined;
+        var entered: usize = 0;
+
+        fn onConnect(_: *connection_mod.Connection, _: commands.ConnectInfo) u8 {
+            mutex.lock();
+            defer mutex.unlock();
+            if (entered < worker_count) threads[entered] = std.Thread.getCurrentId();
+            entered += 1;
+            cond.broadcast();
+            waitLocked(worker_count);
+            return @intFromEnum(responses.Code.@"continue");
+        }
+
+        /// Wait with `mutex` held until `count` workers have entered.
+        /// Bounded, so a regression fails the assertions instead of hanging
+        /// the gate.
+        fn waitLocked(count: usize) void {
+            const deadline_ms = std.time.milliTimestamp() + 5_000;
+            while (entered < count) {
+                const now_ms = std.time.milliTimestamp();
+                if (now_ms >= deadline_ms) return;
+                const wait_ns: u64 = @intCast((deadline_ms - now_ms) * std.time.ns_per_ms);
+                cond.timedWait(&mutex, wait_ns) catch |err| switch (err) {
+                    error.Timeout => {},
+                };
+            }
+        }
+
+        fn waitEntered(count: usize) usize {
+            mutex.lock();
+            defer mutex.unlock();
+            waitLocked(count);
+            return entered;
+        }
+    };
+    Probe.entered = 0;
+
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    var pipe_wr: posix.fd_t = pipe[1];
+
+    var threads = spawnPool(std.testing.allocator, .{
+        .num_workers = worker_count,
+        .addresses = &.{.{ .unix = .{ .path = path } }},
+        .callbacks = .{ .on_connect = Probe.onConnect },
+        .shutdown_pipe_rd = pipe[0],
+    }) catch |err| {
+        posix.close(pipe_wr);
+        return err;
+    };
+    defer threads.deinit(std.testing.allocator);
+
+    // Clients close first (the drain waits for them), then EOF on the
+    // shutdown pipe begins the drain, then the workers are joined.
+    defer if (pipe_wr >= 0) {
+        posix.close(pipe_wr);
+        for (threads.items) |thread| thread.join();
+    };
+
+    var clients: [worker_count]std.net.Stream = undefined;
+    var connected: usize = 0;
+    defer for (clients[0..connected]) |client| client.close();
+
+    // SMFIC_CONNECT: host "h", family unknown, port 0, empty address.
+    const packet = [_]u8{ 0, 0, 0, 7, 'C', 'h', 0, 'U', 0, 0, 0 };
+    comptime assert(std.mem.readInt(u32, packet[0..4], .big) == packet.len - 4);
+
+    const receive_timeout = posix.timeval{ .sec = 10, .usec = 0 };
+    while (connected < worker_count) : (connected += 1) {
+        const client = try std.net.connectUnixSocket(path);
+        clients[connected] = client;
+        try posix.setsockopt(
+            client.handle,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            std.mem.asBytes(&receive_timeout),
+        );
+        try client.writeAll(&packet);
+        try std.testing.expectEqual(connected + 1, Probe.waitEntered(connected + 1));
+    }
+
+    // Each reply follows its on_connect, so every count is final once all
+    // four replies have arrived.
+    for (clients[0..connected]) |client| {
+        var reply: [5]u8 = undefined;
+        var got: usize = 0;
+        while (got < reply.len) {
+            const n = try posix.read(client.handle, reply[got..]);
+            if (n == 0) return error.EndOfStream;
+            got += n;
+        }
+        try std.testing.expectEqual(@intFromEnum(responses.Code.@"continue"), reply[4]);
+    }
+
+    Probe.mutex.lock();
+    const entered = Probe.entered;
+    const served_by = Probe.threads;
+    Probe.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, worker_count), entered);
+    for (served_by, 0..) |id, index| {
+        for (served_by[0..index]) |earlier| try std.testing.expect(id != earlier);
+    }
+
+    for (clients[0..connected]) |client| client.close();
+    connected = 0;
+    posix.close(pipe_wr);
+    pipe_wr = -1;
+    for (threads.items) |thread| thread.join();
+
+    // The last worker to drain released the final hold.
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(path, .{}));
 }
