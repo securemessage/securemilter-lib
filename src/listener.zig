@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
 const mem = std.mem;
@@ -190,19 +191,46 @@ pub fn prepareAccepted(addr: ListenAddress, fd: posix.fd_t) !void {
     }
 }
 
-/// Bind and listen on a parsed address.
+/// The socket option under which the kernel spreads incoming TCP connections
+/// across every listener bound to the same address and port.
 ///
-/// Uses SO_REUSEADDR + SO_REUSEPORT (for TCP), O_NONBLOCK.
-/// Each worker thread calls this independently for SO_REUSEPORT.
+/// On FreeBSD plain SO_REUSEPORT only lets the sockets share the port, and
+/// every connection goes to one of them; balancing is SO_REUSEPORT_LB
+/// (FreeBSD 12+). Linux balances under SO_REUSEPORT. Other kernels share
+/// without balancing, so the build refuses them rather than run N workers of
+/// which one does all the work.
+const balanced_reuse_port: u32 = switch (builtin.os.tag) {
+    .freebsd => posix.SO.REUSEPORT_LB,
+    .linux => posix.SO.REUSEPORT,
+    else => @compileError("no kernel-balanced TCP listener option on this OS"),
+};
+
+/// Most listeners one balancing group holds. On FreeBSD this is
+/// INPCBLBGROUP_SIZMAX (sys/netinet/in_pcb.c): a socket bound past it binds
+/// successfully but never joins the group, so it is never handed a connection.
+/// Linux counts group members in a u16.
+pub const balanced_listeners_max: u32 = switch (builtin.os.tag) {
+    .freebsd => 256,
+    .linux => std.math.maxInt(u16),
+    else => @compileError("no kernel-balanced TCP listener option on this OS"),
+};
+
+const listen_backlog: u31 = 256;
+
+/// Bind and listen on a parsed address. The socket is non-blocking.
+///
+/// Each worker calls this for every configured address, so a TCP address gets
+/// one listening socket per worker. Those sockets set SO_REUSEADDR and
+/// `balanced_reuse_port`, and the kernel spreads connections across them by
+/// connection hash.
+///
+/// A Unix path is unlinked and rebound by each worker in turn, so only the
+/// socket bound last stays reachable and it receives every connection.
 pub fn bind(addr: ListenAddress) !BoundListener {
     switch (addr) {
         .tcp => |tcp| {
             const net_addr = try parseIpAddress(tcp.host, tcp.port);
-            const server = try net_addr.listen(.{
-                .reuse_address = true,
-                .force_nonblocking = true,
-                .kernel_backlog = 256,
-            });
+            const server = try listenBalanced(net_addr);
             return .{
                 .server = server,
                 .address = addr,
@@ -216,7 +244,7 @@ pub fn bind(addr: ListenAddress) !BoundListener {
             const server = try un_addr.listen(.{
                 .reuse_address = true,
                 .force_nonblocking = true,
-                .kernel_backlog = 256,
+                .kernel_backlog = listen_backlog,
             });
             return .{
                 .server = server,
@@ -225,6 +253,26 @@ pub fn bind(addr: ListenAddress) !BoundListener {
             };
         },
     }
+}
+
+/// Open a non-blocking TCP listener on `address` that joins the kernel's
+/// balancing group for that address and port. Built by hand because
+/// `std.net.Address.listen` sets SO_REUSEPORT, never SO_REUSEPORT_LB.
+fn listenBalanced(address: net.Address) !net.Server {
+    const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const fd = try posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP);
+    errdefer posix.close(fd);
+
+    const one: c_int = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, mem.asBytes(&one));
+    try posix.setsockopt(fd, posix.SOL.SOCKET, balanced_reuse_port, mem.asBytes(&one));
+
+    var server: net.Server = .{ .listen_address = undefined, .stream = .{ .handle = fd } };
+    var socklen = address.getOsSockLen();
+    try posix.bind(fd, &address.any, socklen);
+    try posix.listen(fd, listen_backlog);
+    try posix.getsockname(fd, &server.listen_address.any, &socklen);
+    return server;
 }
 
 /// Parse an IP address string into a net.Address without using resolveIp
@@ -372,6 +420,60 @@ test "bind and close tcp" {
     var listener = try bind(.{ .tcp = .{ .host = "127.0.0.1", .port = 0 } });
     defer listener.close();
     try std.testing.expect(listener.fd >= 0);
+}
+
+// Goal: a TCP address bound once per worker spreads connections across every
+// worker's listener. Method: bind four listeners on one port, open 128
+// connections, then count what each listener's accept queue received. With
+// plain SO_REUSEPORT on FreeBSD all 128 land on one listener. Under hashing,
+// the chance that any of the four receives none is about 4 * 0.75^128.
+test "connections to a shared TCP address reach every listener" {
+    const listener_count = 4;
+    const connection_count = 128;
+
+    var listeners: [listener_count]BoundListener = undefined;
+    var bound: usize = 0;
+    defer for (listeners[0..bound]) |*lst| lst.close();
+
+    listeners[0] = try bind(.{ .tcp = .{ .host = "127.0.0.1", .port = 0 } });
+    bound = 1;
+    const port = listeners[0].server.listen_address.getPort();
+    while (bound < listener_count) : (bound += 1) {
+        listeners[bound] = try bind(.{ .tcp = .{ .host = "127.0.0.1", .port = port } });
+    }
+
+    var clients: [connection_count]net.Stream = undefined;
+    var connected: usize = 0;
+    defer for (clients[0..connected]) |client| client.close();
+
+    const target = try net.Address.parseIp4("127.0.0.1", port);
+    while (connected < connection_count) : (connected += 1) {
+        clients[connected] = try net.tcpConnectToAddress(target);
+    }
+
+    // A connect can return before the server side of the handshake reaches an
+    // accept queue, so sweep the listeners until every connection is counted.
+    var accepted: [listener_count]usize = @splat(0);
+    var total: usize = 0;
+    var sweeps: usize = 0;
+    while (total < connection_count and sweeps < 10_000) : (sweeps += 1) {
+        for (&listeners, &accepted) |*lst, *count| {
+            while (lst.accept()) |conn| {
+                conn.stream.close();
+                count.* += 1;
+                total += 1;
+            } else |err| switch (err) {
+                error.WouldBlock => {},
+                else => return err,
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, connection_count), total);
+    for (accepted) |count| {
+        if (count == 0) std.debug.print("per-listener accepts: {any}\n", .{accepted});
+        try std.testing.expect(count > 0);
+    }
 }
 
 test "bind and close unix" {

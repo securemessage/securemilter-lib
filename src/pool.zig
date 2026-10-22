@@ -17,7 +17,7 @@ const Callbacks = worker_mod.Callbacks;
 
 /// What a pool needs. Only the three without defaults must be supplied.
 pub const Options = struct {
-    /// 0 means one thread per CPU.
+    /// 0 means one thread per CPU, at most `listener.balanced_listeners_max`.
     num_workers: u32 = 0,
     addresses: []const listener_mod.ListenAddress,
     callbacks: Callbacks,
@@ -52,7 +52,7 @@ pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread)
     var threads: std.ArrayList(std.Thread) = .{};
     errdefer threads.deinit(allocator);
 
-    const count = if (num_workers == 0) @as(u32, @intCast(std.Thread.getCpuCount() catch 4)) else num_workers;
+    const count = try workerCount(num_workers, addresses);
 
     // If anything below fails there are no workers, so there must be no slots
     // either. A slot with no thread behind it is never written again, and
@@ -73,7 +73,7 @@ pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread)
     // can still be reported to the caller.
     //
     // This is the fix for X-15 and it is deliberately a relocation rather than
-    // a barrier. Each worker binds its own socket (SO_REUSEPORT), so this is
+    // a barrier. Each worker binds its own sockets (see listener.bind), so this is
     // where EADDRINUSE from a foreign process, an unwritable unix socket path
     // or fd exhaustion surfaces. Performed inside the spawned thread the only
     // available response was to log and return, leaving a daemon that had
@@ -127,6 +127,33 @@ pub fn spawnPool(allocator: Allocator, opts: Options) !std.ArrayList(std.Thread)
     }
 
     return threads;
+}
+
+/// Resolve the configured worker count (0 means one per CPU).
+///
+/// Every worker binds each TCP address into one kernel balancing group, which
+/// holds at most `listener.balanced_listeners_max` sockets; a worker past that
+/// would bind but never be handed a TCP connection. The per-CPU default is
+/// capped there, and an explicit count above it is refused.
+fn workerCount(num_workers: u32, addresses: []const listener_mod.ListenAddress) !u32 {
+    const max = listener_mod.balanced_listeners_max;
+    if (num_workers == 0) {
+        const cpus: u32 = @intCast(std.Thread.getCpuCount() catch 4);
+        return @min(cpus, max);
+    }
+    if (num_workers <= max) return num_workers;
+
+    for (addresses) |addr| switch (addr) {
+        .tcp => {
+            log_mod.err(
+                "{d} workers exceed the {d} listeners one TCP port can balance across",
+                .{ num_workers, max },
+            );
+            return error.TooManyWorkers;
+        },
+        .unix => {},
+    };
+    return num_workers;
 }
 
 /// Run one worker until shutdown, then free it.
@@ -203,4 +230,27 @@ test "X-15: a failed spawn leaves the generation counter clean" {
     // here is the leak this finding is about: it would pin `minObserved` at the
     // spawn-time generation for the life of the process.
     try std.testing.expectEqual(@as(usize, 0), gen.workerCount());
+}
+
+// Goal: a pool larger than one balancing group refuses to start on TCP instead
+// of running workers that never receive a connection. Method: ask for one
+// worker past the limit and expect the refusal before anything is bound.
+test "a TCP pool larger than one balancing group is refused" {
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
+
+    const tcp = listener_mod.ListenAddress{ .tcp = .{ .host = "127.0.0.1", .port = 0 } };
+    const result = spawnPool(std.testing.allocator, .{
+        .num_workers = listener_mod.balanced_listeners_max + 1,
+        .addresses = &.{tcp},
+        .callbacks = .{},
+        .shutdown_pipe_rd = pipe[0],
+    });
+    try std.testing.expectError(error.TooManyWorkers, result);
+
+    // The per-CPU default is capped rather than refused.
+    const auto = try workerCount(0, &.{tcp});
+    try std.testing.expect(auto >= 1);
+    try std.testing.expect(auto <= listener_mod.balanced_listeners_max);
 }

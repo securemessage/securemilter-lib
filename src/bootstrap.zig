@@ -110,8 +110,9 @@ pub const Ops = struct {
 /// 6. Set the umask first (it only filters mode at file-creation time).
 ///
 /// A failed PID file write is logged and non-fatal. A failed `daemonize` or
-/// privilege drop is fatal, as is a confirmed running instance (`SO_REUSEPORT`
-/// would let a second copy bind and split mail between two configurations).
+/// privilege drop is fatal, as is a confirmed running instance (a second copy
+/// running as the same user binds into the same `SO_REUSEPORT_LB` group and
+/// splits mail between two configurations).
 /// The readiness pipe (`Bootstrap.notifyReady`) reports startup failure back
 /// to the parent/`service start`.
 pub fn run(opts: Options) !Bootstrap {
@@ -130,9 +131,10 @@ pub fn runWithOps(opts: Options, ops: Ops) !Bootstrap {
     // ancestor's pid into the file, and the double fork has orphaned us to
     // init (see `checkNotAlreadyRunning`).
     //
-    // Fatal rather than a warning: `SO_REUSEPORT` lets a second instance
-    // bind successfully, and two daemons would then split mail between two
-    // configurations. The caller's readiness pipe reports this failure
+    // Fatal rather than a warning: a second instance running as the same
+    // user binds successfully into the same `SO_REUSEPORT_LB` group, and the
+    // kernel then splits mail between two configurations. This PID-file
+    // check is the only guard. The caller's readiness pipe reports this failure
     // back to `service start`.
     try ops.check_not_running(opts.pid_file);
 

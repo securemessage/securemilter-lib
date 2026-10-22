@@ -71,9 +71,11 @@ const REFUSED_LOG_INTERVAL_MS: i64 = 1000;
 
 /// A single worker thread's state.
 ///
-/// Each worker owns its own kqueue, its own set of SO_REUSEPORT
-/// listener sockets, and its own connection pool. Workers share
-/// nothing with each other — no locks, no contention.
+/// Each worker owns its own kqueue, its own listener sockets, and its
+/// own connection pool. Workers share nothing with each other: no locks,
+/// no contention. TCP listeners join one kernel balancing group per
+/// address (SO_REUSEPORT_LB on FreeBSD), which spreads connections
+/// across the workers; see `listener.bind`.
 pub const Worker = struct {
     allocator: Allocator,
     kq: i32,
